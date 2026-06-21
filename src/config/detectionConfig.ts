@@ -1,0 +1,65 @@
+export type DetectionConfig = {
+  requiredContinuousMs: number;
+  longPresenceMs: number;
+  candidateTimeoutMs: number;
+  cooldownMs: number;
+  facePaddingRatio: number;
+  presenceResetGraceMs: number;
+  sampleWindowMs: number;
+  minFaceMsForPickupTransition: number;
+  pickupTransitionMinMs: number;
+  returnFaceMs: number;
+  completionAwayMs: number;
+  minVisitedZones: number;
+  minHandPointsInsideFace: number;
+  maxHandCentroidDistanceRatio: number;
+  contactZoneInsetRatio: number;
+  minFingerTipsInsideContactZone: number;
+  offscreenPickupMinMs: number;
+  offscreenReturnWindowMs: number;
+  screenEdgePickupRatio: number;
+  minPathDistanceRatio: number;
+  maxNetDisplacementRatio: number;
+  minDirectionChanges: number;
+  minAverageStepRatio: number;
+  maxAverageStepRatio: number;
+  maxLogs: number;
+  handDetectionConfidence: number;
+  handPresenceConfidence: number;
+  faceDetectionConfidence: number;
+  facePresenceConfidence: number;
+  faceTrackingConfidence: number;
+};
+
+export const detectionConfig: DetectionConfig = {
+  requiredContinuousMs: 3000,
+  longPresenceMs: 10000,
+  candidateTimeoutMs: 9000,
+  cooldownMs: 15000,
+  facePaddingRatio: 0.35,
+  presenceResetGraceMs: 900,
+  sampleWindowMs: 3000,
+  minFaceMsForPickupTransition: 1200,
+  pickupTransitionMinMs: 700,
+  returnFaceMs: 1800,
+  completionAwayMs: 3500,
+  minVisitedZones: 2,
+  minHandPointsInsideFace: 5,
+  maxHandCentroidDistanceRatio: 0.38,
+  contactZoneInsetRatio: 0.18,
+  minFingerTipsInsideContactZone: 2,
+  offscreenPickupMinMs: 900,
+  offscreenReturnWindowMs: 5000,
+  screenEdgePickupRatio: 0.08,
+  minPathDistanceRatio: 0.2,
+  maxNetDisplacementRatio: 0.16,
+  minDirectionChanges: 4,
+  minAverageStepRatio: 0.0025,
+  maxAverageStepRatio: 0.03,
+  maxLogs: 14,
+  handDetectionConfidence: 0.45,
+  handPresenceConfidence: 0.45,
+  faceDetectionConfidence: 0.45,
+  facePresenceConfidence: 0.45,
+  faceTrackingConfidence: 0.45
+};
