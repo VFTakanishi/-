@@ -1,0 +1,70 @@
+{
+  "expo": {
+    "name": "夢の記録",
+    "slug": "dream-recorder",
+    "scheme": "dreamrecorder",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#000000",
+    "primaryColor": "#000000",
+    "newArchEnabled": true,
+    "splash": {
+      "backgroundColor": "#000000"
+    },
+    "ios": {
+      "bundleIdentifier": "com.dreamrecorder.app",
+      "supportsTablet": false,
+      "requireFullScreen": true,
+      "backgroundColor": "#000000",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "夜中に見た夢を録音して記録するためにマイクを使用します。",
+        "NSSpeechRecognitionUsageDescription": "録音した夢をiPhone内で文字に変換するために音声認識を使用します（任意機能・端末内処理）。録音の保存自体には使用しません。",
+        "UIBackgroundModes": ["audio"],
+        "UIRequiresFullScreen": true,
+        "UIUserInterfaceStyle": "Dark"
+      }
+    },
+    "android": {
+      "package": "com.dreamrecorder.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#000000"
+      },
+      "permissions": ["RECORD_AUDIO"],
+      "predictiveBackGestureEnabled": false
+    },
+    "plugins": [
+      "expo-router",
+      "expo-sqlite",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "夜中に見た夢を録音して記録するためにマイクを使用します。"
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "夜中に見た夢を録音して記録するためにマイクを使用します。",
+          "speechRecognitionPermission": "録音した夢をiPhone内で文字に変換するために音声認識を使用します（任意機能）。",
+          "androidSpeechServicePackages": []
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "deploymentTarget": "16.4"
+          }
+        }
+      ],
+      "expo-dev-client"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {}
+    }
+  }
+}
