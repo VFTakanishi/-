@@ -8,6 +8,7 @@ export const JUDGEMENT_ALIASES: Array<{ status: JudgementStatus; alias: string }
   { status: "ng", alias: "ダメ" },
   { status: "ng", alias: "車検NG" },
   { status: "ng", alias: "NG" },
+  { status: "ng", alias: "エヌジー" },
 
   { status: "replace_strong", alias: "交換推奨" },
   { status: "replace_strong", alias: "交換必要" },
@@ -31,6 +32,7 @@ export const JUDGEMENT_ALIASES: Array<{ status: JudgementStatus; alias: string }
   { status: "customer_request", alias: "お客さん要望" },
   { status: "customer_request", alias: "依頼あり" },
   { status: "customer_request", alias: "ご要望" },
+  { status: "customer_request", alias: "要望" },
 
   { status: "customer_declined", alias: "不要とのこと" },
   { status: "customer_declined", alias: "お客様不要" },

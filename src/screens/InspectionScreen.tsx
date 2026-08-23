@@ -4,6 +4,7 @@ import { InspectionItemRow } from "../components/InspectionItemRow";
 import { RecognitionResult, type RecognitionResultData } from "../components/RecognitionResult";
 import { VoiceButton } from "../components/VoiceButton";
 import { VoiceErrorBanner } from "../components/VoiceErrorBanner";
+import { VoiceWordHint } from "../components/VoiceWordHint";
 import { useVoiceRecognition } from "../hooks/useVoiceRecognition";
 import { itemSummaryLine, statusLabel } from "../lib/format";
 import { parseVoiceInspection, type ParsedUnmatched } from "../lib/parseVoiceInspection";
@@ -158,6 +159,7 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
       </div>
 
       <VoiceButton state={voiceState} isListening={isListening} onClick={toggle} />
+      <VoiceWordHint />
       <VoiceErrorBanner error={lastError} />
 
       <RecognitionResult result={lastRecognition} onConfirmAdd={handleConfirmAdd} onDiscard={handleDiscardUnmatched} />

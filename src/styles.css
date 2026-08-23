@@ -217,6 +217,17 @@ button {
   text-align: center;
 }
 
+/* Voice word hint */
+.voice-word-hint {
+  text-align: center;
+  color: #94a3b8;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  padding: 0 8px;
+  word-break: keep-all;
+  overflow-wrap: break-word;
+}
+
 /* Voice error banner */
 .voice-error-banner {
   background: #fef2f2;
