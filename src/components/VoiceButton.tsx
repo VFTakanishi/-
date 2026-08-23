@@ -4,7 +4,7 @@ const STATE_LABEL: Record<VoiceRecognitionState, string> = {
   idle: "音声入力停止中",
   listening: "認識中…",
   processing: "解析中…",
-  error: "認識失敗（タップで再開）",
+  error: "認識失敗（下のエラー内容を確認してください）",
   unsupported: "この端末では音声入力を利用できません",
 };
 

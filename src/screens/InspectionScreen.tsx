@@ -3,6 +3,7 @@ import { EditInspectionItem } from "../components/EditInspectionItem";
 import { InspectionItemRow } from "../components/InspectionItemRow";
 import { RecognitionResult, type RecognitionResultData } from "../components/RecognitionResult";
 import { VoiceButton } from "../components/VoiceButton";
+import { VoiceErrorBanner } from "../components/VoiceErrorBanner";
 import { useVoiceRecognition } from "../hooks/useVoiceRecognition";
 import { itemSummaryLine, statusLabel } from "../lib/format";
 import { parseVoiceInspection, type ParsedUnmatched } from "../lib/parseVoiceInspection";
@@ -66,7 +67,7 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
     }
   };
 
-  const { state: voiceState, isListening, toggle } = useVoiceRecognition({ onResult: handleVoiceResult });
+  const { state: voiceState, isListening, lastError, toggle } = useVoiceRecognition({ onResult: handleVoiceResult });
 
   const handleConfirmAdd = () => {
     if (!pendingUnmatched) return;
@@ -157,6 +158,7 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
       </div>
 
       <VoiceButton state={voiceState} isListening={isListening} onClick={toggle} />
+      <VoiceErrorBanner error={lastError} />
 
       <RecognitionResult result={lastRecognition} onConfirmAdd={handleConfirmAdd} onDiscard={handleDiscardUnmatched} />
 

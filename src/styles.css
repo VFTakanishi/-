@@ -217,6 +217,42 @@ button {
   text-align: center;
 }
 
+/* Voice error banner */
+.voice-error-banner {
+  background: #fef2f2;
+  border: 2px solid #fecaca;
+  border-radius: 16px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.voice-error-banner-title {
+  font-size: 1rem;
+  font-weight: 800;
+  color: #b91c1c;
+}
+
+.voice-error-banner-desc {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: #7f1d1d;
+}
+
+.voice-error-banner-code {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 0.95rem;
+  color: #991b1b;
+}
+
+.voice-error-banner-message {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 0.85rem;
+  color: #b91c1c;
+  word-break: break-word;
+}
+
 /* Recognition result */
 .recognition-result {
   background: #fff;
