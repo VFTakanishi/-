@@ -1,81 +1,88 @@
-# YouTube Live Skincare Analyzer MVP
+# 車検整備 音声点検メモツール
 
-YouTubeライブを視聴しているPCブラウザの映像を、視聴者側の画面共有経由で解析し、顔付近での反復的な「塗布動作」からスキンケア工程数を推定する React + TypeScript の MVP です。
+車検整備の入庫車両を点検する際、グローブを外してボールペンでメモする手間を減らすための、音声入力対応の点検メモアプリです。
 
-## できること
+お客様へ提出する正式な点検記録簿ではなく、**フロント担当者が見積書を作成するための社内向け下書きメモ**を素早く残すことを目的としています。主な利用端末は **iPhone / iPad の Safari** です。
 
-- `getDisplayMedia()` で YouTube ライブのタブ共有映像を取得
-- MediaPipe の Face Landmarker / Hand Landmarker で顔と手を検出
-- 手が顔付近に 3 秒以上あり、小刻みに往復しているときに「1工程」としてカウント
-- 検出後は 15 秒クールダウン
-- 4工程の進捗表示
-- 手動の `1つ戻す` `1つ進める` `リセット`
-- YouTube コメント文のコピー
+## 最重要のUX
 
-## セットアップ
+- **点検順はアプリ側が指定しません。** 整備士が実際に点検した順番で自由に発話すると、アプリがその内容を解析して該当項目へ記録します（1項目ずつ質問していく順送り方式ではありません）。
+- **判定を推測しません。** 「ブーツ破れ」のように異常内容だけを発話した場合は判定が「未確認」のまま残ります。「ブーツ破れ不合格」のように判定語（不合格・要交換・おすすめ・該当なし・良好・ご要望・お客様不要）が明示された場合のみ、その判定が記録されます。
 
-Node.js が必要です。
+例えば、以下のように自由な順番で話しかけると、それぞれ該当する項目へ記録されます。
 
-- 推奨: Node.js `20.19+` もしくは `22.12+`
+```text
+タイヤ良好
+フロントブレーキパッド5ミリ良好
+リアブレーキパッド3ミリ要交換
+エンジンオイルおすすめ
+リアドライブシャフトインナーブーツ破れ不合格
+エアコンフィルターご要望
+ブレーキフルードお客様不要
+CO 0.02 HC 15
+```
 
-インストール後、プロジェクト直下で以下を実行してください。
+## できること（Phase 1 / MVP）
+
+- 新規点検の開始（お客様名・車種、共に任意入力）
+- 自由な順番での音声入力（Web Speech API）による項目・判定・前後/インナーアウター・数値の記録
+- ブレーキパッド／ブレーキライニング／タイヤ残量（フロント・リア単位、mm）、CO・HCの数値記録
+- 左右差や特記事項は自由コメントとして記録
+- 基本点検項目にない異常も「未登録項目」として確認のうえ追加可能
+- 音声認識結果はすべてタップで手動修正可能（音声が使えない環境でもタップ操作のみで利用可能）
+- `localStorage` への自動保存、過去の点検一覧・再開・削除
+- 不合格／要交換／おすすめ／ご要望／お客様不要をまとめたサマリー画面とクリップボードコピー
+
+含まないもの: クラウド同期、ログイン、複数ユーザー、PDF出力、正式な点検記録簿、AI APIによる自然言語解析、サーバーサイドDB、PWA化、車検基準からの自動合否判定。
+
+## セットアップ・起動
+
+Node.js `20.19+` もしくは `22.12+` が必要です。
 
 ```bash
 npm install
-```
-
-## 起動方法
-
-```bash
 npm run dev
 ```
 
-ブラウザで表示されたローカル URL を開き、`画面共有開始` を押してください。
+ブラウザで表示されたローカルURLを開いてください。スマホ実機で試す場合は、同一ネットワーク内から `http://<PCのIPアドレス>:5173` にアクセスしてください（`vite.config.ts` で `host: "0.0.0.0"` を設定済み）。
 
-## 他の人へ共有する方法
+```bash
+npm run build   # 本番ビルド（型チェック含む）
+```
 
-ローカルの `localhost` URL は自分の PC だけで使えます。別の人にも使ってもらう場合は、Vercel などへ公開してください。
+## 音声認識について（重要な制約）
 
-- 公開用設定ファイル: [vercel.json](C:/Users/USER/Documents/Codex/2026-06-18/pc-youtube-web-pc-youtube-youtube/vercel.json)
-- 手順メモ: [DEPLOY_VERCEL.txt](C:/Users/USER/Documents/Codex/2026-06-18/pc-youtube-web-pc-youtube-youtube/DEPLOY_VERCEL.txt)
+iOS Safari の `webkitSpeechRecognition`（Web Speech API）を利用しています。iOS Safariでは長時間の連続認識（`continuous: true`）が不安定なため、短い非連続セッションを認識終了のたびに自動的に再開する「疑似連続リスニング」方式を採用しています。
 
-## 使い方
+- マイク使用には **HTTPS**（またはlocalhost）が必須です。
+- 自動再開がうまく働かない場合に備え、グローブを装着していても押しやすい大きな手動マイクボタンを用意しています。
+- **iOS Safari実機固有の挙動（自動再開の安定性など）は開発環境での実機検証が済んでいません。** 実際の運用前に、必ずiPhone/iPad実機のSafariで動作確認してください。
+- 音声認識自体が使えない・不安定な環境でも、全項目をタップ操作だけで入力・修正できます。
 
-1. PCブラウザで YouTube ライブを開く
-2. このアプリで `画面共有開始` を押す
-3. YouTube ライブのタブ、またはライブ再生中ウィンドウを共有する
-4. アプリが共有映像を解析し、塗布動作を工程としてカウントする
+## データの保存について
 
-## 判定ロジック
+点検記録はすべてブラウザの `localStorage` に保存されます。サーバーには送信されません。同じブラウザ・同じ端末でのみ記録を参照できます（複数端末間の同期はありません）。
 
-- 顔ランドマークから顔領域の外接矩形を作成
-- その領域を少し広げた近接範囲を判定対象にする
-- 手ランドマーク群の重心、または手の点が顔近接範囲に入れば候補開始
-- 候補状態が `3秒` 以上続く
-- その間の手の移動が「小刻みで往復的」なら塗布動作とみなす
-- 1回の確定で 1工程カウント
-- その後 `15秒` は再検出しない
+## ディレクトリ構成
 
-## 閾値の変更
-
-調整用の設定は以下にまとめています。
-
-- [src/config/detectionConfig.ts](C:/Users/USER/Documents/Codex/2026-06-18/pc-youtube-web-pc-youtube-youtube/src/config/detectionConfig.ts)
-
-主な項目:
-
-- `requiredContinuousMs`: 顔付近に手が必要な連続時間
-- `cooldownMs`: 1工程検出後の待機時間
-- `facePaddingRatio`: 顔近接範囲の広げ幅
-- `minPathDistanceRatio`: 候補期間中の最小移動距離
-- `maxNetDisplacementRatio`: 始点終点の最大ずれ量
-- `minDirectionChanges`: 往復動作とみなす最小方向転換数
-- `minAverageStepRatio`, `maxAverageStepRatio`: 小刻み動作の1ステップ幅
-
-## 注意点
-
-- 初回起動時は MediaPipe の WASM とモデル読み込みのため、少し待つことがあります
-- YouTube の映像品質、手の写り方、顔の角度で検出精度は変わります
-- この MVP は「商品名」「音声」ではなく、顔付近への手の塗布動作だけを使って推定します
-- `1つ戻す` `1つ進める` `リセット` の手動修正は、同じブラウザ内に学習データとして保存され、翌日以降の判定調整にも使われます
-- ローカル環境に Node.js が未導入だと `npm install` と `npm run dev` は実行できません
+```text
+src/
+  types.ts                 型定義（Inspection / InspectionItem / JudgementStatus）
+  data/
+    defaultChecklist.ts     初期点検項目テンプレート
+    voiceAliases.ts          判定語・位置語の同義語辞書
+  hooks/
+    useVoiceRecognition.ts   Web Speech API ラッパー（疑似連続リスニング）
+  lib/
+    parseVoiceInspection.ts  発話テキストの解析（項目・位置・数値・判定・コメント抽出）
+    matchInspectionItem.ts   項目名のあいまいマッチング
+    matchJudgement.ts        判定語のマッチング
+    storage.ts                localStorage への保存・読込
+    format.ts                 表示用フォーマット・サマリーテキスト生成
+  screens/
+    StartScreen.tsx           点検開始・過去点検一覧
+    InspectionScreen.tsx      メイン点検画面（音声入力＋全項目一覧）
+    SummaryScreen.tsx         結果サマリー・コピー
+  components/
+    VoiceButton.tsx, InspectionItemRow.tsx, RecognitionResult.tsx, EditInspectionItem.tsx
+```
