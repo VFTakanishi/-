@@ -7,7 +7,7 @@ import { VoiceErrorBanner } from "../components/VoiceErrorBanner";
 import { VoiceWordHint } from "../components/VoiceWordHint";
 import { useVoiceRecognition } from "../hooks/useVoiceRecognition";
 import { itemSummaryLine, statusLabel } from "../lib/format";
-import { parseVoiceInspection, type ParsedUnmatched } from "../lib/parseVoiceInspection";
+import { parseVoiceInspections, type ParsedMatched, type ParsedUnmatched } from "../lib/parseVoiceInspection";
 import { getInspection, makeItemId, saveInspection } from "../lib/storage";
 import type { Inspection, InspectionItem } from "../types";
 
@@ -25,76 +25,88 @@ function buildRecordLines(item: InspectionItem): string[] {
   return lines;
 }
 
+function applyParsedToItem(item: InspectionItem, parsed: ParsedMatched, now: string): InspectionItem {
+  return {
+    ...item,
+    status: parsed.status ?? item.status,
+    position: parsed.position ?? item.position,
+    measurement: parsed.measurement ?? item.measurement,
+    measurements: parsed.measurements ?? item.measurements,
+    note: parsed.note ?? item.note,
+    updatedAt: now,
+  };
+}
+
 export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }: InspectionScreenProps) {
   const [inspection, setInspection] = useState<Inspection | null>(() => getInspection(inspectionId) ?? null);
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
   const [lastRecognition, setLastRecognition] = useState<RecognitionResultData | null>(null);
-  const [pendingUnmatched, setPendingUnmatched] = useState<ParsedUnmatched | null>(null);
+  const [pendingUnmatchedQueue, setPendingUnmatchedQueue] = useState<ParsedUnmatched[]>([]);
+  const pendingUnmatched = pendingUnmatchedQueue[0] ?? null;
 
   useEffect(() => {
     if (inspection) saveInspection(inspection);
   }, [inspection]);
 
   const handleVoiceResult = (transcript: string) => {
-    const parsed = parseVoiceInspection(transcript);
+    const parsedList = parseVoiceInspections(transcript);
+    const matchedList = parsedList.filter((p): p is ParsedMatched => p.matched);
+    const unmatchedList = parsedList.filter((p): p is ParsedUnmatched => !p.matched);
+    const now = new Date().toISOString();
 
-    if (parsed.matched) {
-      setPendingUnmatched(null);
+    if (matchedList.length > 0) {
       setInspection((prev) => {
         if (!prev) return prev;
-        const now = new Date().toISOString();
-        const items = prev.items.map((item) => {
-          if (item.id !== parsed.itemId) return item;
-          const updated: InspectionItem = {
-            ...item,
-            status: parsed.status ?? item.status,
-            position: parsed.position ?? item.position,
-            measurement: parsed.measurement ?? item.measurement,
-            measurements: parsed.measurements ?? item.measurements,
-            note: parsed.note ?? item.note,
-            updatedAt: now,
-          };
-          setLastRecognition({ transcript, matchedCategory: item.category, lines: buildRecordLines(updated) });
-          return updated;
-        });
+        let items = prev.items;
+        for (const parsed of matchedList) {
+          items = items.map((item) => (item.id === parsed.itemId ? applyParsedToItem(item, parsed, now) : item));
+        }
         return { ...prev, items, updatedAt: now };
       });
-    } else {
-      setPendingUnmatched(parsed);
-      setLastRecognition({
-        transcript,
-        unmatched: { customCategoryName: parsed.customCategoryName, status: parsed.status },
-      });
     }
+
+    if (unmatchedList.length > 0) {
+      setPendingUnmatchedQueue((prev) => [...prev, ...unmatchedList]);
+    }
+
+    // 表示用のサマリーは現在のスナップショットから算出する（保存処理とは独立した副作用のない計算）
+    const matchedItems = inspection
+      ? matchedList.flatMap((parsed) => {
+          const current = inspection.items.find((i) => i.id === parsed.itemId);
+          if (!current) return [];
+          const updated = applyParsedToItem(current, parsed, now);
+          return [{ category: updated.category, lines: buildRecordLines(updated) }];
+        })
+      : [];
+
+    setLastRecognition({ transcript, matchedItems: matchedItems.length > 0 ? matchedItems : undefined });
   };
 
   const { state: voiceState, isListening, lastError, toggle } = useVoiceRecognition({ onResult: handleVoiceResult });
 
   const handleConfirmAdd = () => {
     if (!pendingUnmatched) return;
+    const now = new Date().toISOString();
+    const newItem: InspectionItem = {
+      id: makeItemId(),
+      category: pendingUnmatched.customCategoryName,
+      status: pendingUnmatched.status ?? "unset",
+      isCustom: true,
+      updatedAt: now,
+    };
     setInspection((prev) => {
       if (!prev) return prev;
-      const now = new Date().toISOString();
-      const newItem: InspectionItem = {
-        id: makeItemId(),
-        category: pendingUnmatched.customCategoryName,
-        status: pendingUnmatched.status ?? "unset",
-        isCustom: true,
-        updatedAt: now,
-      };
-      setLastRecognition({
-        transcript: pendingUnmatched.rawText,
-        matchedCategory: newItem.category,
-        lines: buildRecordLines(newItem),
-      });
       return { ...prev, items: [...prev.items, newItem], updatedAt: now };
     });
-    setPendingUnmatched(null);
+    setLastRecognition({
+      transcript: pendingUnmatched.rawText,
+      matchedItems: [{ category: newItem.category, lines: buildRecordLines(newItem) }],
+    });
+    setPendingUnmatchedQueue((prev) => prev.slice(1));
   };
 
   const handleDiscardUnmatched = () => {
-    setPendingUnmatched(null);
-    setLastRecognition(null);
+    setPendingUnmatchedQueue((prev) => prev.slice(1));
   };
 
   const recentItems = useMemo(() => {
@@ -162,7 +174,13 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
       <VoiceWordHint />
       <VoiceErrorBanner error={lastError} />
 
-      <RecognitionResult result={lastRecognition} onConfirmAdd={handleConfirmAdd} onDiscard={handleDiscardUnmatched} />
+      <RecognitionResult
+        result={lastRecognition}
+        pendingUnmatched={pendingUnmatched}
+        pendingUnmatchedCount={pendingUnmatchedQueue.length}
+        onConfirmAdd={handleConfirmAdd}
+        onDiscard={handleDiscardUnmatched}
+      />
 
       {recentItems.length > 0 && (
         <>

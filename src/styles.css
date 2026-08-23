@@ -298,6 +298,14 @@ button {
   padding: 12px;
   font-size: 1.15rem;
   font-weight: 700;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.recognition-result-record-item + .recognition-result-record-item {
+  padding-top: 10px;
+  border-top: 1px solid rgba(21, 128, 61, 0.2);
 }
 
 .recognition-result-unmatched {

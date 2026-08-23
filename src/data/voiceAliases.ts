@@ -25,6 +25,7 @@ export const JUDGEMENT_ALIASES: Array<{ status: JudgementStatus; alias: string }
 
   { status: "good", alias: "問題なし" },
   { status: "good", alias: "オーケー" },
+  { status: "good", alias: "オッケー" },
   { status: "good", alias: "良好" },
   { status: "good", alias: "OK" },
 
