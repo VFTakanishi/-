@@ -219,13 +219,25 @@ button {
 
 /* Voice word hint */
 .voice-word-hint {
-  text-align: center;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 4px 10px;
   color: #94a3b8;
   font-size: 0.85rem;
   line-height: 1.5;
   padding: 0 8px;
-  word-break: keep-all;
-  overflow-wrap: break-word;
+}
+
+.voice-word-hint-item {
+  white-space: nowrap;
+}
+
+.voice-word-hint-item:not(:last-child)::after {
+  content: "｜";
+  margin-left: 10px;
+  color: #cbd5e1;
 }
 
 /* Voice error banner */

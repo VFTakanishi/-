@@ -16,6 +16,8 @@ export const JUDGEMENT_ALIASES: Array<{ status: JudgementStatus; alias: string }
   { status: "replace_strong", alias: "交換" },
 
   { status: "recommend", alias: "おすすめ" },
+  { status: "recommend", alias: "オススメ" },
+  { status: "recommend", alias: "お勧め" },
   { status: "recommend", alias: "推奨" },
 
   { status: "na", alias: "該当なし" },

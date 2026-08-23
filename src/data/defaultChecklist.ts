@@ -4,10 +4,10 @@ export const DEFAULT_CHECKLIST: ChecklistItemDef[] = [
   // 油脂・エンジン関連
   { id: "engine_oil", category: "エンジンオイル", group: "油脂・エンジン関連", aliases: ["エンジンオイル"] },
   { id: "oil_element", category: "オイルエレメント", group: "油脂・エンジン関連", aliases: ["オイルエレメント", "オイルフィルター"] },
-  { id: "air_element", category: "エアエレメント", group: "油脂・エンジン関連", aliases: ["エアエレメント", "エアクリーナーエレメント", "エアクリーナー"] },
+  { id: "air_element", category: "エアエレメント（清掃）", group: "油脂・エンジン関連", aliases: ["エアエレメント", "エアクリーナーエレメント", "エアクリーナー"] },
   { id: "power_steering_oil", category: "パワステオイル", group: "油脂・エンジン関連", aliases: ["パワステオイル", "パワーステアリングオイル"] },
-  { id: "coolant", category: "クーラント", group: "油脂・エンジン関連", aliases: ["クーラント", "冷却水"] },
-  { id: "accessory_belt", category: "補機ベルト", group: "油脂・エンジン関連", aliases: ["補機ベルト", "ファンベルト", "エアコンベルト"] },
+  { id: "coolant", category: "クーラント", group: "油脂・エンジン関連", aliases: ["クーラント", "冷却水", "空欄と", "空欄ト", "クーランド"] },
+  { id: "accessory_belt", category: "補機ベルト", group: "油脂・エンジン関連", aliases: ["補機ベルト", "ファンベルト", "エアコンベルト", "補器ベルト", "ホキベルト", "ほきベルト"] },
   { id: "timing_belt", category: "タイミングベルト", group: "油脂・エンジン関連", aliases: ["タイミングベルト"] },
   { id: "spark_plug", category: "スパークプラグ", group: "油脂・エンジン関連", aliases: ["スパークプラグ"] },
   { id: "battery", category: "バッテリー", group: "油脂・エンジン関連", aliases: ["バッテリー"] },

@@ -56,6 +56,11 @@ function getSpeechRecognitionCtor(): (new () => SpeechRecognitionLike) | undefin
  * no-speech 以外のエラー（not-allowed / service-not-allowed / audio-capture /
  * network / aborted / 未知のコード）では、再試行しても回復しないか無意味なため
  * 自動再開ループを止め、isListening を false に戻す。
+ *
+ * ただし、ユーザー自身がマイクボタンで stop() した結果として Safari が
+ * aborted / no-speech 等を返すことがあるため、manualStopRef で
+ * 「意図的な停止」と「予期しないエラー」を区別し、意図的な停止では
+ * エラー表示をしない。
  */
 export function useVoiceRecognition({ onResult, lang = "ja-JP" }: UseVoiceRecognitionOptions): UseVoiceRecognitionResult {
   const [state, setState] = useState<VoiceRecognitionState>(() => (getSpeechRecognitionCtor() ? "idle" : "unsupported"));
@@ -64,6 +69,7 @@ export function useVoiceRecognition({ onResult, lang = "ja-JP" }: UseVoiceRecogn
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const wantsListeningRef = useRef(false);
   const endedByFatalErrorRef = useRef(false);
+  const manualStopRef = useRef(false);
   const onResultRef = useRef(onResult);
   onResultRef.current = onResult;
 
@@ -71,6 +77,12 @@ export function useVoiceRecognition({ onResult, lang = "ja-JP" }: UseVoiceRecogn
     const Ctor = getSpeechRecognitionCtor();
     if (!Ctor) {
       setState("unsupported");
+      return;
+    }
+
+    // 直前のセッションがまだ動いている場合、同一インスタンスへの二重start等を
+    // 避けるため新規セッションは開始しない（onendで確実にnullへ戻る）。
+    if (recognitionRef.current) {
       return;
     }
 
@@ -93,6 +105,11 @@ export function useVoiceRecognition({ onResult, lang = "ja-JP" }: UseVoiceRecogn
     };
 
     recognition.onerror = (event) => {
+      if (manualStopRef.current) {
+        // ユーザーによる意図的な停止に伴うエラー（aborted/no-speech等）は無視する
+        return;
+      }
+
       const code = event.error || "unknown";
       const message = event.message || "";
       setLastError({ code, message });
@@ -107,6 +124,13 @@ export function useVoiceRecognition({ onResult, lang = "ja-JP" }: UseVoiceRecogn
 
     recognition.onend = () => {
       recognitionRef.current = null;
+
+      if (manualStopRef.current) {
+        manualStopRef.current = false;
+        setState("idle");
+        return;
+      }
+
       if (wantsListeningRef.current) {
         setTimeout(() => {
           if (wantsListeningRef.current) startSession();
@@ -123,6 +147,7 @@ export function useVoiceRecognition({ onResult, lang = "ja-JP" }: UseVoiceRecogn
     try {
       recognition.start();
     } catch (err) {
+      recognitionRef.current = null;
       const message = err instanceof Error ? err.message : String(err);
       setLastError({ code: "start-failed", message });
       setState("error");
@@ -136,16 +161,24 @@ export function useVoiceRecognition({ onResult, lang = "ja-JP" }: UseVoiceRecogn
       setState("unsupported");
       return;
     }
+    if (recognitionRef.current) {
+      // 既にセッションが動作中（二重タップ等）: 何もしない
+      return;
+    }
+    manualStopRef.current = false;
+    setLastError(null);
     wantsListeningRef.current = true;
     setIsListening(true);
     startSession();
   }, [startSession]);
 
   const stop = useCallback(() => {
+    manualStopRef.current = true;
     wantsListeningRef.current = false;
     setIsListening(false);
-    recognitionRef.current?.stop();
+    setLastError(null);
     setState("idle");
+    recognitionRef.current?.stop();
   }, []);
 
   const toggle = useCallback(() => {
