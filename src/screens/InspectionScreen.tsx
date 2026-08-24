@@ -25,6 +25,22 @@ function buildRecordLines(item: InspectionItem): string[] {
   return lines;
 }
 
+const ELECTRICAL_NOTE_SEPARATOR = " / ";
+
+/**
+ * 電気回りは1台の車で複数箇所の灯火不具合等が同時に存在しうるため、
+ * noteを上書きせず区切り文字で追記する。同一内容の重複追加は避ける。
+ */
+function appendElectricalNote(existingNote: string | undefined, newDefect: string): string | undefined {
+  const trimmed = newDefect.trim();
+  if (!trimmed) return existingNote;
+  const existingList = existingNote
+    ? existingNote.split(ELECTRICAL_NOTE_SEPARATOR).map((s) => s.trim()).filter(Boolean)
+    : [];
+  if (existingList.includes(trimmed)) return existingNote;
+  return [...existingList, trimmed].join(ELECTRICAL_NOTE_SEPARATOR);
+}
+
 function applyParsedToItem(item: InspectionItem, parsed: ParsedMatched, now: string): InspectionItem {
   return {
     ...item,
@@ -32,7 +48,10 @@ function applyParsedToItem(item: InspectionItem, parsed: ParsedMatched, now: str
     position: parsed.position ?? item.position,
     measurement: parsed.measurement ?? item.measurement,
     measurements: parsed.measurements ? { ...item.measurements, ...parsed.measurements } : item.measurements,
-    note: parsed.note ?? item.note,
+    note:
+      item.id === "electrical" && parsed.note
+        ? appendElectricalNote(item.note, parsed.note)
+        : parsed.note ?? item.note,
     updatedAt: now,
   };
 }

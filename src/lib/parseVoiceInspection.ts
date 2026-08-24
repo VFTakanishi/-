@@ -190,21 +190,39 @@ function tryParseCoHc(text: string): ParsedMatched | null {
 }
 
 /**
- * CO・HCは "CO" と "HC" の2つのエイリアスに分かれて検出されるため、
- * 連続するco_hcトークンは1つのセグメントにまとめる
- * （間に別項目のトークンが挟まれば、そこで区切る）。
+ * 同じ項目が隣接して複数回検出された場合（間に他の項目が挟まらない場合）は
+ * 1つのセグメントにまとめる。CO・HCが "CO" と "HC" の2エイリアスに分かれて
+ * 検出されるケースや、電気回りで「電気回り」＋「ストップランプ」のように
+ * 総称語と具体的な灯火名が同じ発話内で連続するケースに対応するため。
  */
-function mergeCoHcTokens(tokens: CategoryToken[]): CategoryToken[] {
+function mergeAdjacentSameItemTokens(tokens: CategoryToken[]): CategoryToken[] {
   const merged: CategoryToken[] = [];
   for (const token of tokens) {
     const last = merged[merged.length - 1];
-    if (token.itemId === "co_hc" && last?.itemId === "co_hc") {
-      continue; // 直前のco_hcセグメントに吸収させる（区間は次トークンのstartまで自動的に伸びる）
+    if (last?.itemId === token.itemId) {
+      continue; // 直前の同項目セグメントに吸収させる（区間は次トークンのstartまで自動的に伸びる）
     }
     merged.push(token);
   }
   return merged;
 }
+
+// 電気回りのうち、これらのエイリアスは「灯火名」そのものが不具合内容の一部
+// なので、項目名として消費せずnoteにそのまま残す（「電気回り」「電装」は
+// 総称ラベルなので通常どおり取り除く）。
+const ELECTRICAL_DESCRIPTIVE_ALIASES = new Set([
+  "ストップランプ",
+  "ブレーキランプ",
+  "テールランプ",
+  "ウインカー",
+  "ウィンカー",
+  "ヘッドライト",
+  "ヘッドランプ",
+  "スモールランプ",
+  "バックランプ",
+  "ナンバー灯",
+  "ライセンスランプ",
+]);
 
 function parseUnmatchedSegment(rawText: string, text: string): ParsedUnmatched {
   const judgement = matchJudgement(text);
@@ -231,7 +249,7 @@ function parseUnmatchedSegment(rawText: string, text: string): ParsedUnmatched {
  */
 export function parseVoiceInspections(rawText: string): ParsedVoiceInspection[] {
   const text = normalize(rawText);
-  const tokens = mergeCoHcTokens(findCategoryOccurrences(text));
+  const tokens = mergeAdjacentSameItemTokens(findCategoryOccurrences(text));
 
   if (tokens.length === 0) {
     // 登録済み項目が1つも見つからない: 未登録項目候補として扱う
@@ -249,12 +267,16 @@ export function parseVoiceInspections(rawText: string): ParsedVoiceInspection[] 
 
   // 各隙間の「末尾」にある位置語（例:「…リヤ」）は、直後のトークン（項目名の前に
   // 置かれた位置語）に属するとみなし、直前のトークンの内容からは取り除く。
+  // 電気回りだけは位置語を構造化せず生テキストのままnoteに残すため、
+  // 剥がした文字列そのもの（leadingRawTextForToken）も別途保持しておく。
   const leadingPositionForToken: Array<ItemPosition | undefined> = [];
+  const leadingRawTextForToken: string[] = [];
   const trimmedGap: string[] = new Array(gaps.length);
   trimmedGap[gaps.length - 1] = gaps[gaps.length - 1]; // 最後の隙間（末尾）は次の項目が無いのでそのまま
   for (let i = 0; i < tokens.length; i++) {
     const { position, consumedLength } = extractTrailingPositionWords(gaps[i]);
     leadingPositionForToken[i] = position;
+    leadingRawTextForToken[i] = consumedLength > 0 ? gaps[i].slice(gaps[i].length - consumedLength) : "";
     trimmedGap[i] = gaps[i].slice(0, gaps[i].length - consumedLength);
   }
 
@@ -273,6 +295,28 @@ export function parseVoiceInspections(rawText: string): ParsedVoiceInspection[] 
         continue;
       }
       // CO/HCの数値が取れなければ通常の項目として処理を続ける（fall through）
+    }
+
+    if (token.itemId === "electrical") {
+      // 電気回りは複数箇所の灯火不具合等を自由記述で記録するfree-form項目。
+      // 前後・左右等の位置語は構造化せず、発話どおりの文言としてnoteに残す。
+      // 「電気回り」「電装」という総称ラベルは取り除くが、「ストップランプ」等の
+      // 具体的な灯火名は不具合内容そのものなのでnoteに残す。
+      const keepAliasInNote = ELECTRICAL_DESCRIPTIVE_ALIASES.has(token.alias);
+      let trailing = ownContent;
+      const judgement = matchJudgement(trailing);
+      if (judgement) trailing = removeJudgementAlias(trailing, judgement.alias);
+
+      const noteText = leadingRawTextForToken[i] + (keepAliasInNote ? token.alias : "") + trailing;
+
+      results.push({
+        matched: true,
+        itemId: "electrical",
+        status: judgement?.status,
+        note: cleanNote(noteText),
+        rawText,
+      });
+      continue;
     }
 
     let remaining = ownContent;

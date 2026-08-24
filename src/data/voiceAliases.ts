@@ -43,6 +43,8 @@ export const JUDGEMENT_ALIASES: Array<{ status: JudgementStatus; alias: string }
   { status: "customer_declined", alias: "いらない" },
   { status: "customer_declined", alias: "やらない" },
   { status: "customer_declined", alias: "不要" },
+
+  { status: "maintenance", alias: "整備" },
 ];
 
 export const FRONT_REAR_ALIASES: Array<{ value: "front" | "rear"; alias: string }> = [
@@ -71,5 +73,6 @@ export const STATUS_LABELS: Record<JudgementStatus, string> = {
   good: "良好",
   customer_request: "ご要望",
   customer_declined: "お客様不要",
+  maintenance: "整備",
   unset: "未確認",
 };

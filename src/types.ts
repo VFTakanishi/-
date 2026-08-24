@@ -6,6 +6,7 @@ export type JudgementStatus =
   | "good"
   | "customer_request"
   | "customer_declined"
+  | "maintenance"
   | "unset";
 
 export interface ItemPosition {

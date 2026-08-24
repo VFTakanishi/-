@@ -5,6 +5,7 @@ export const STATUS_ORDER: JudgementStatus[] = [
   "ng",
   "replace_strong",
   "recommend",
+  "maintenance",
   "customer_request",
   "customer_declined",
   "na",
@@ -20,6 +21,7 @@ export const STATUS_COLOR_CLASS: Record<JudgementStatus, string> = {
   good: "status-good",
   customer_request: "status-request",
   customer_declined: "status-declined",
+  maintenance: "status-maintenance",
   unset: "status-unset",
 };
 
@@ -64,6 +66,7 @@ const SUMMARY_GROUPS: Array<{ status: JudgementStatus; title: string }> = [
   { status: "ng", title: "不合格" },
   { status: "replace_strong", title: "要交換" },
   { status: "recommend", title: "おすすめ" },
+  { status: "maintenance", title: "整備" },
   { status: "customer_request", title: "ご要望" },
   { status: "customer_declined", title: "お客様不要" },
 ];

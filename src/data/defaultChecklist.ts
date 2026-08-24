@@ -20,7 +20,6 @@ export const DEFAULT_CHECKLIST: ChecklistItemDef[] = [
   // ブレーキ・足回り
   { id: "driveshaft_boot", category: "ドライブシャフトブーツ", group: "ブレーキ・足回り", aliases: ["ドライブシャフトブーツ", "ドライブシャフト"] },
   { id: "steering_boot", category: "ステアリングブーツ", group: "ブレーキ・足回り", aliases: ["ステアリングブーツ"] },
-  { id: "steering_rack_boot", category: "ステアリングラックブーツ", group: "ブレーキ・足回り", aliases: ["ステアリングラックブーツ", "ラックブーツ"] },
   { id: "lower_boot", category: "ロアブーツ", group: "ブレーキ・足回り", aliases: ["ロアブーツ", "ロアアームブーツ", "ロワブーツ", "ロアーブール", "ロワーブーツ"] },
   { id: "tie_rod_end_boot", category: "タイロッドエンドブーツ", group: "ブレーキ・足回り", aliases: ["タイロッドエンドブーツ", "タイロットエンドブーツ"] },
   { id: "stabilizer_link_boot", category: "スタビリンクブーツ", group: "ブレーキ・足回り", aliases: ["スタビリンクブーツ", "スタビライザーリンクブーツ"] },
@@ -35,12 +34,30 @@ export const DEFAULT_CHECKLIST: ChecklistItemDef[] = [
 
   // 保安・車検関連
   { id: "shift_indicator", category: "シフト表示", group: "保安・車検関連", aliases: ["シフト表示"] },
-  { id: "electrical", category: "電気回り", group: "保安・車検関連", aliases: ["電気回り", "電装"] },
+  {
+    id: "electrical",
+    category: "電気回り",
+    group: "保安・車検関連",
+    aliases: [
+      "電気回り",
+      "電装",
+      "ストップランプ",
+      "ブレーキランプ",
+      "テールランプ",
+      "ウインカー",
+      "ウィンカー",
+      "ヘッドライト",
+      "ヘッドランプ",
+      "スモールランプ",
+      "バックランプ",
+      "ナンバー灯",
+      "ライセンスランプ",
+    ],
+  },
   { id: "wiper_blade", category: "ワイパーゴム", group: "保安・車検関連", aliases: ["ワイパーゴム", "ワイパー"] },
   { id: "catalyst", category: "触媒", group: "保安・車検関連", aliases: ["触媒", "マフラー触媒"] },
   { id: "seatbelt_warning", category: "シートベルト警告灯", group: "保安・車検関連", aliases: ["シートベルト警告灯", "シートベルトランプ"] },
   { id: "flare", category: "発煙筒", group: "保安・車検関連", aliases: ["発煙筒"] },
   { id: "window_operation", category: "ウインドウ作動", group: "保安・車検関連", aliases: ["ウインドウ作動", "パワーウインドウ"] },
   { id: "co_hc", category: "CO・HC", group: "保安・車検関連", aliases: ["CO", "HC"] },
-  { id: "maintenance_note", category: "（整備）", group: "保安・車検関連", aliases: ["整備"] },
 ];

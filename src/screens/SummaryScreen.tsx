@@ -9,7 +9,7 @@ interface SummaryScreenProps {
   onBackToStart: () => void;
 }
 
-const PROBLEM_STATUSES = new Set(["ng", "replace_strong", "recommend", "customer_request", "customer_declined"]);
+const PROBLEM_STATUSES = new Set(["ng", "replace_strong", "recommend", "maintenance", "customer_request", "customer_declined"]);
 
 export function SummaryScreen({ inspection, onBack, onBackToStart }: SummaryScreenProps) {
   const [copied, setCopied] = useState(false);

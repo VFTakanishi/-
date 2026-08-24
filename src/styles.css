@@ -434,6 +434,11 @@ button {
   color: #7e22ce;
 }
 
+.status-maintenance {
+  background: #ccfbf1;
+  color: #0f766e;
+}
+
 .status-unset {
   background: #f1f5f9;
   color: #94a3b8;
