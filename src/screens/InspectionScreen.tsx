@@ -179,6 +179,7 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
       <div className="empty-note">
         {inspection.customerName || "お客様名未入力"}
         {inspection.vehicleModel ? ` / ${inspection.vehicleModel}` : ""}
+        {inspection.mileage ? ` / ${inspection.mileage}km` : ""}
       </div>
 
       <VoiceButton state={voiceState} isListening={isListening} onClick={toggle} />

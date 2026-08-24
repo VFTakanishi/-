@@ -95,12 +95,19 @@ export function createDefaultItems(): InspectionItem[] {
   }));
 }
 
-export function createInspection(customerName: string, vehicleModel: string): Inspection {
+/** 「123,456」等の入力でも壊れないよう数字だけを残して保存する（number型にはしない） */
+function sanitizeMileage(raw: string): string | undefined {
+  const digitsOnly = raw.replace(/[^0-9]/g, "");
+  return digitsOnly.length > 0 ? digitsOnly : undefined;
+}
+
+export function createInspection(customerName: string, vehicleModel: string, mileage = ""): Inspection {
   const now = new Date().toISOString();
   const inspection: Inspection = {
     id: makeId(),
     customerName: customerName.trim() || undefined,
     vehicleModel: vehicleModel.trim() || undefined,
+    mileage: sanitizeMileage(mileage),
     createdAt: now,
     updatedAt: now,
     items: createDefaultItems(),

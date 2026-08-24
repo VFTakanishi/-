@@ -112,6 +112,19 @@ button {
   font-size: 1rem;
 }
 
+.brand-image-wrap {
+  display: flex;
+  justify-content: center;
+}
+
+.brand-image {
+  width: clamp(180px, 55vw, 260px);
+  height: auto;
+  object-fit: contain;
+  border-radius: 10px;
+  opacity: 0.94;
+}
+
 .past-list {
   display: flex;
   flex-direction: column;

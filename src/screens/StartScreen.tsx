@@ -1,4 +1,5 @@
 import { useState } from "react";
+import brandImage from "../assets/vf-takanishi-brand.jpg";
 import { createInspection, deleteInspection, listInspections } from "../lib/storage";
 import type { Inspection } from "../types";
 
@@ -14,10 +15,11 @@ function formatDate(iso: string): string {
 export function StartScreen({ onOpenInspection }: StartScreenProps) {
   const [customerName, setCustomerName] = useState("");
   const [vehicleModel, setVehicleModel] = useState("");
+  const [mileage, setMileage] = useState("");
   const [inspections, setInspections] = useState<Inspection[]>(() => listInspections());
 
   const handleStart = () => {
-    const inspection = createInspection(customerName, vehicleModel);
+    const inspection = createInspection(customerName, vehicleModel, mileage);
     onOpenInspection(inspection.id);
   };
 
@@ -45,9 +47,20 @@ export function StartScreen({ onOpenInspection }: StartScreenProps) {
           value={vehicleModel}
           onChange={(e) => setVehicleModel(e.target.value)}
         />
+        <input
+          className="text-input"
+          placeholder="走行距離（任意）"
+          inputMode="numeric"
+          value={mileage}
+          onChange={(e) => setMileage(e.target.value)}
+        />
         <button type="button" className="big-button big-button--primary" onClick={handleStart}>
           点検を開始
         </button>
+      </div>
+
+      <div className="brand-image-wrap">
+        <img className="brand-image" src={brandImage} alt="VF高西" />
       </div>
 
       <div className="modal-section-title">過去の点検</div>

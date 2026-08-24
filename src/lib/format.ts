@@ -76,6 +76,7 @@ export function buildSummaryText(inspection: Inspection): string {
   const headerParts: string[] = [];
   if (inspection.customerName) headerParts.push(`お客様名: ${inspection.customerName}`);
   if (inspection.vehicleModel) headerParts.push(`車種: ${inspection.vehicleModel}`);
+  if (inspection.mileage) headerParts.push(`走行距離: ${inspection.mileage}km`);
   if (headerParts.length > 0) {
     lines.push(headerParts.join(" / "));
     lines.push("");

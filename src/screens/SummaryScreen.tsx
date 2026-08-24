@@ -39,6 +39,7 @@ export function SummaryScreen({ inspection, onBack, onBackToStart }: SummaryScre
       <div className="empty-note">
         {inspection.customerName || "お客様名未入力"}
         {inspection.vehicleModel ? ` / ${inspection.vehicleModel}` : ""}
+        {inspection.mileage ? ` / ${inspection.mileage}km` : ""}
       </div>
 
       <div className="card">

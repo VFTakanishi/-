@@ -36,6 +36,7 @@ export interface Inspection {
   id: string;
   customerName?: string;
   vehicleModel?: string;
+  mileage?: string;
   createdAt: string;
   updatedAt: string;
   items: InspectionItem[];
