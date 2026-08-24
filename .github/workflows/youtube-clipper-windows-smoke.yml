@@ -1,0 +1,136 @@
+name: youtube-clipper Windows smoke test
+
+# Diagnostic-only workflow for the youtube-clipper tool (not part of the
+# product itself). Verifies, on a real Windows runner with normal internet
+# access, the things the cloud Linux sandbox used for development could not:
+# ffmpeg/ffprobe availability, the Windows Japanese font path, faster-whisper
+# fetching its model from Hugging Face, and yt-dlp reaching YouTube.
+# No product code or the 14 absolute conditions are touched by this file.
+
+on:
+  push:
+    branches:
+      - claude/youtube-podcast-clip-tool-1qwqlh
+    paths:
+      - "youtube-clipper/**"
+      - ".github/workflows/youtube-clipper-windows-smoke.yml"
+  workflow_dispatch: {}
+
+jobs:
+  windows-smoke:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: youtube-clipper
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # --- 3. ffmpeg / ffprobe -------------------------------------------
+      - name: Check / install ffmpeg
+        id: ffmpeg_check
+        if: always()
+        continue-on-error: true
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg -y
+          }
+          ffmpeg -version
+          if ($LASTEXITCODE -ne 0) { throw "ffmpeg -version failed" }
+          ffprobe -version
+          if ($LASTEXITCODE -ne 0) { throw "ffprobe -version failed" }
+
+      # --- 4. Python dependencies -----------------------------------------
+      - name: Install Python dependencies
+        id: pip_install
+        if: always()
+        continue-on-error: true
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          if ($LASTEXITCODE -ne 0) { throw "pip install -e . failed" }
+          pip install -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "pip install -r requirements.txt failed" }
+          pip install pytest httpx
+          if ($LASTEXITCODE -ne 0) { throw "pip install pytest httpx failed" }
+
+      # --- 5. Japanese font (meiryo.ttc) -----------------------------------
+      - name: Check Japanese font (C:/Windows/Fonts/meiryo.ttc)
+        id: font_check
+        if: always()
+        continue-on-error: true
+        run: |
+          $path = "C:/Windows/Fonts/meiryo.ttc"
+          $exists = Test-Path $path
+          Write-Host "meiryo.ttc exists at ${path}: $exists"
+          if (-not $exists) {
+            throw "meiryo.ttc not found at $path -- an alternative Japanese font path will need to be configured via PODCAST_CLIPPER_FONT_PATH"
+          }
+
+      # --- 6. faster-whisper large-v3 / cpu / int8, real Hugging Face fetch
+      - name: faster-whisper large-v3 model download (Hugging Face)
+        id: whisper_check
+        if: always()
+        continue-on-error: true
+        run: |
+          python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3', device='cpu', compute_type='int8'); print('WHISPER_MODEL_OK')"
+          if ($LASTEXITCODE -ne 0) { throw "faster-whisper large-v3 model download/init failed" }
+
+      # --- 7. yt-dlp -> YouTube reachability (metadata only) ---------------
+      - name: yt-dlp YouTube reachability (metadata only)
+        id: ytdlp_check
+        if: always()
+        continue-on-error: true
+        run: |
+          python -c "import yt_dlp; ydl = yt_dlp.YoutubeDL({'quiet': True}); info = ydl.extract_info('https://www.youtube.com/watch?v=dQw4w9WgXcQ', download=False); print('YTDLP_METADATA_OK title=' + info.get('title', ''))"
+          if ($LASTEXITCODE -ne 0) { throw "yt-dlp could not reach/extract YouTube metadata" }
+
+      # --- 8. pytest tests/ (expect 51 on Linux; verifying on Windows) ----
+      - name: Run pytest suite
+        id: pytest_check
+        if: always()
+        continue-on-error: true
+        run: |
+          pytest tests/ -v
+          if ($LASTEXITCODE -ne 0) { throw "pytest tests/ failed" }
+
+      # --- 9. Clear summary in the Actions log/UI --------------------------
+      - name: Summarize results
+        if: always()
+        run: |
+          $rows = @(
+            @{Name="ffmpeg / ffprobe"; Outcome="${{ steps.ffmpeg_check.outcome }}"},
+            @{Name="pip install (依存関係)"; Outcome="${{ steps.pip_install.outcome }}"},
+            @{Name="日本語フォント (meiryo.ttc)"; Outcome="${{ steps.font_check.outcome }}"},
+            @{Name="faster-whisper large-v3 取得 (Hugging Face)"; Outcome="${{ steps.whisper_check.outcome }}"},
+            @{Name="yt-dlp -> YouTube 到達性"; Outcome="${{ steps.ytdlp_check.outcome }}"},
+            @{Name="pytest tests/"; Outcome="${{ steps.pytest_check.outcome }}"}
+          )
+
+          "## youtube-clipper Windows Smoke Test" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| Check | Result |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "|---|---|" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          $anyFailed = $false
+          foreach ($r in $rows) {
+            if ($r.Outcome -eq "success") {
+              $mark = "PASS"
+            } else {
+              $mark = "FAIL ($($r.Outcome))"
+              $anyFailed = $true
+            }
+            "| $($r.Name) | $mark |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            Write-Host "$($r.Name): $mark"
+          }
+
+          if ($anyFailed) {
+            Write-Host "One or more smoke checks failed; see the table above and the individual step logs for details."
+            exit 1
+          }
