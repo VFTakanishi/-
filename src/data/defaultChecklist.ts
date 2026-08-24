@@ -15,13 +15,26 @@ export const DEFAULT_CHECKLIST: ChecklistItemDef[] = [
   { id: "mission_oil", category: "ミッションオイル", group: "油脂・エンジン関連", aliases: ["ミッションオイル"] },
   { id: "transfer_oil", category: "トランスファーオイル", group: "油脂・エンジン関連", aliases: ["トランスファーオイル"] },
   { id: "diff_oil", category: "デフオイル", group: "油脂・エンジン関連", aliases: ["デフオイル", "デファレンシャルオイル"] },
-  { id: "ac_filter", category: "エアコンフィルター", group: "油脂・エンジン関連", aliases: ["エアコンフィルター"] },
+  { id: "ac_filter", category: "エアコンフィルター", group: "油脂・エンジン関連", aliases: ["エアコンフィルター", "コンフィルター", "エアコンフィルタ", "エアコンフイルター", "エアコンフィルダー"] },
 
   // ブレーキ・足回り
   { id: "driveshaft_boot", category: "ドライブシャフトブーツ", group: "ブレーキ・足回り", aliases: ["ドライブシャフトブーツ", "ドライブシャフト"] },
   { id: "steering_boot", category: "ステアリングブーツ", group: "ブレーキ・足回り", aliases: ["ステアリングブーツ"] },
   { id: "lower_boot", category: "ロアブーツ", group: "ブレーキ・足回り", aliases: ["ロアブーツ", "ロアアームブーツ", "ロワブーツ", "ロアーブール", "ロワーブーツ"] },
-  { id: "tie_rod_end_boot", category: "タイロッドエンドブーツ", group: "ブレーキ・足回り", aliases: ["タイロッドエンドブーツ", "タイロットエンドブーツ"] },
+  {
+    id: "tie_rod_end_boot",
+    category: "タイロッドエンドブーツ",
+    group: "ブレーキ・足回り",
+    aliases: [
+      "タイロッドエンドブーツ",
+      "タイロットエンドブーツ",
+      "タイロッドエンドブース",
+      "タイロットエンドブース",
+      "タイロッドエンドブート",
+      "タイロットエンドブート",
+      "タイロッドエンド",
+    ],
+  },
   { id: "stabilizer_link_boot", category: "スタビリンクブーツ", group: "ブレーキ・足回り", aliases: ["スタビリンクブーツ", "スタビライザーリンクブーツ"] },
   { id: "brake_pad_front", category: "フロントブレーキパッド", group: "ブレーキ・足回り", aliases: ["フロントブレーキパッド", "Fブレーキパッド", "前ブレーキパッド"] },
   { id: "brake_pad_rear", category: "リヤブレーキパッド/ライニング", group: "ブレーキ・足回り", aliases: ["リアブレーキパッド", "Rブレーキパッド", "後ろブレーキパッド", "リヤブレーキパッド", "ブレーキライニング", "ライニング"] },

@@ -119,6 +119,7 @@ button {
 
 .brand-image {
   width: clamp(200px, 62vw, 320px);
+  max-width: 100%;
   height: auto;
   object-fit: contain;
   background: transparent;
@@ -363,6 +364,34 @@ button {
   font-size: 1.2rem;
   font-weight: 800;
   margin: 4px 0;
+}
+
+/*
+ * unmatchedが出ても点検作業を止めないための控えめなインライン表示。
+ * recognition-result-scroll内に収まる小さな1行で、自動でモーダルは開かない
+ * （追加ボタンを明示的にタップした時だけ呼び出し元がモーダルを開く）。
+ */
+.recognition-result-unmatched-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: #92660a;
+  background: #fffbeb;
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
+.recognition-result-unmatched-add {
+  flex-shrink: 0;
+  border: none;
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: #92660a;
+  background: #fde68a;
 }
 
 .recognition-result-actions {

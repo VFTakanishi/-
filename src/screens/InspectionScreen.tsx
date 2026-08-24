@@ -26,6 +26,22 @@ function buildRecordLines(item: InspectionItem): string[] {
   return lines;
 }
 
+// unmatchedは自動でモーダルを出さず、RecognitionResultの固定欄に小さく
+// ヒント表示するだけにする。無限に蓄積させる必要はないため、同じ未認識文字列は
+// 積み増さず、最新の候補を優先して最大UNMATCHED_QUEUE_LIMIT件までに留める。
+const UNMATCHED_QUEUE_LIMIT = 3;
+
+function appendUnmatchedQueue(prev: ParsedUnmatched[], additions: ParsedUnmatched[]): ParsedUnmatched[] {
+  const seen = new Set(prev.map((u) => u.customCategoryName));
+  const merged = [...prev];
+  for (const addition of additions) {
+    if (seen.has(addition.customCategoryName)) continue;
+    seen.add(addition.customCategoryName);
+    merged.push(addition);
+  }
+  return merged.length > UNMATCHED_QUEUE_LIMIT ? merged.slice(merged.length - UNMATCHED_QUEUE_LIMIT) : merged;
+}
+
 const ELECTRICAL_NOTE_SEPARATOR = " / ";
 
 /**
@@ -62,6 +78,7 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
   const [lastRecognition, setLastRecognition] = useState<RecognitionResultData | null>(null);
   const [pendingUnmatchedQueue, setPendingUnmatchedQueue] = useState<ParsedUnmatched[]>([]);
+  const [showUnmatchedModal, setShowUnmatchedModal] = useState(false);
   const pendingUnmatched = pendingUnmatchedQueue[0] ?? null;
 
   useEffect(() => {
@@ -86,7 +103,7 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
     }
 
     if (unmatchedList.length > 0) {
-      setPendingUnmatchedQueue((prev) => [...prev, ...unmatchedList]);
+      setPendingUnmatchedQueue((prev) => appendUnmatchedQueue(prev, unmatchedList));
     }
 
     // 表示用のサマリーは現在のスナップショットから算出する（保存処理とは独立した副作用のない計算）
@@ -123,10 +140,12 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
       matchedItems: [{ category: newItem.category, lines: buildRecordLines(newItem) }],
     });
     setPendingUnmatchedQueue((prev) => prev.slice(1));
+    setShowUnmatchedModal(false);
   };
 
   const handleDiscardUnmatched = () => {
     setPendingUnmatchedQueue((prev) => prev.slice(1));
+    setShowUnmatchedModal(false);
   };
 
   const editingItem = inspection?.items.find((i) => i.id === editingItemId) ?? null;
@@ -187,9 +206,14 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
       <VoiceWordHint />
       <VoiceErrorBanner error={lastError} />
 
-      <RecognitionResult result={lastRecognition} />
+      <RecognitionResult
+        result={lastRecognition}
+        pendingUnmatched={pendingUnmatched}
+        pendingUnmatchedCount={pendingUnmatchedQueue.length}
+        onRequestAdd={() => setShowUnmatchedModal(true)}
+      />
 
-      {pendingUnmatched && (
+      {showUnmatchedModal && pendingUnmatched && (
         <UnmatchedConfirmModal
           pendingUnmatched={pendingUnmatched}
           pendingUnmatchedCount={pendingUnmatchedQueue.length}

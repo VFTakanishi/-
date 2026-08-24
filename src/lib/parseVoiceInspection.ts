@@ -1,5 +1,5 @@
 import { FRONT_REAR_ALIASES, INNER_OUTER_ALIASES, LEFT_RIGHT_ALIASES } from "../data/voiceAliases";
-import { findCategoryOccurrences, type CategoryToken } from "./matchInspectionItem";
+import { findCategoryOccurrences, resolveApproximateAlias, type CategoryToken } from "./matchInspectionItem";
 import { matchJudgement } from "./matchJudgement";
 import { buildAligned, normalize, type AlignedText } from "./normalizeText";
 import type { ItemMeasurement, ItemPosition, JudgementStatus } from "../types";
@@ -7,8 +7,13 @@ import type { ItemMeasurement, ItemPosition, JudgementStatus } from "../types";
 export interface ParsedMatched {
   matched: true;
   itemId: string;
-  /** 項目名がexact(既知エイリアス)一致かfuzzy一致かの候補選定用メタ情報 */
-  matchType?: "exact" | "fuzzy";
+  /**
+   * 項目名の一致方法。候補選定用メタ情報。
+   * exact: 既知エイリアスに完全一致 / fuzzy: 同文字数Hamming距離での軽微な誤認識吸収 /
+   * approx: どちらでも見つからなかったセグメント全体を、判定語・数値・位置語を
+   * 除いた上でエイリアス全体とLevenshtein比較して解決したもの（最も信頼度が低い）
+   */
+  matchType?: "exact" | "fuzzy" | "approx";
   status?: JudgementStatus;
   position?: ItemPosition;
   measurement?: ItemMeasurement;
@@ -171,6 +176,65 @@ function extractTrailingPositionWords(text: string): { position: ItemPosition | 
   return { position: hasPosition ? position : undefined, consumedLength: consumed };
 }
 
+/**
+ * テキストの「先頭」から連続する位置語だけを貪欲に剥がす。extractTrailingPositionWords
+ * の先頭版。項目名として認識されたトークンが1つも無い発話（whole-segment approximate
+ * resolverの対象）では、位置語を前のトークンに帰属させる仕組みが使えないため、
+ * 「項目名らしい部分」を切り出す前段としてこちらを使う。
+ */
+function extractLeadingPositionWords(text: string): { position: ItemPosition | undefined; consumedLength: number } {
+  let start = 0;
+  const position: ItemPosition = {};
+  let consumed = 0;
+  let progressed = true;
+
+  while (progressed && start < text.length) {
+    progressed = false;
+    const head = text.slice(start);
+
+    if (!position.frontRear) {
+      for (const entry of FRONT_REAR_SORTED) {
+        if (head.startsWith(entry.alias)) {
+          position.frontRear = entry.value;
+          start += entry.alias.length;
+          consumed += entry.alias.length;
+          progressed = true;
+          break;
+        }
+      }
+      if (progressed) continue;
+    }
+
+    if (!position.leftRight) {
+      for (const entry of LEFT_RIGHT_SORTED) {
+        if (head.startsWith(entry.alias)) {
+          position.leftRight = entry.value;
+          start += entry.alias.length;
+          consumed += entry.alias.length;
+          progressed = true;
+          break;
+        }
+      }
+      if (progressed) continue;
+    }
+
+    if (!position.innerOuter) {
+      for (const entry of INNER_OUTER_SORTED) {
+        if (head.startsWith(entry.alias)) {
+          position.innerOuter = entry.value;
+          start += entry.alias.length;
+          consumed += entry.alias.length;
+          progressed = true;
+          break;
+        }
+      }
+    }
+  }
+
+  const hasPosition = position.frontRear !== undefined || position.leftRight !== undefined || position.innerOuter !== undefined;
+  return { position: hasPosition ? position : undefined, consumedLength: consumed };
+}
+
 function extractMeasurement(pair: AlignedText): { measurement: ItemMeasurement | undefined; remaining: AlignedText } {
   const match = pair.compare.match(/(\d+(?:\.\d+)?)(mm|ミリ)/i);
   if (!match) return { measurement: undefined, remaining: pair };
@@ -249,6 +313,49 @@ const ELECTRICAL_DESCRIPTIVE_ALIASES = new Set([
   "ライセンスランプ",
 ]);
 
+/**
+ * whole-segment approximate resolver。findCategoryOccurrences（完全一致 +
+ * 同文字数Hammingフォールバック）で登録済み項目が1つも見つからなかった発話に
+ * 対してだけ呼ぶ最終フォールバック。判定語・数値・位置語を取り除いた
+ * 「項目名らしい部分」の文字列全体を、登録済みエイリアス全体とLevenshtein距離で
+ * 比較する（文字列中をずらしながら比較することはしない）。「文字が抜ける／
+ * 増える」タイプの誤認識（例:「タイロットエンドブース」）は同文字数Hammingでは
+ * 拾えないが、こちらなら吸収できる。一意に確信を持てる項目が無ければnullを返し、
+ * 呼び出し側は通常どおり未登録項目として扱う。
+ */
+function tryResolveAsApproximateItem(pair: AlignedText): ParsedMatched | null {
+  const { position: leadingPosition, consumedLength: leadConsumed } = extractLeadingPositionWords(pair.compare);
+  let working = leadConsumed > 0 ? slicePair(pair, leadConsumed, pair.compare.length) : pair;
+
+  const { position: trailingPosition, remaining: afterPosition } = extractPosition(working);
+  working = afterPosition;
+
+  const { measurement, remaining: afterMeasurement } = extractMeasurement(working);
+  working = afterMeasurement;
+
+  const judgement = matchJudgement(working.compare);
+  if (judgement) working = removeFirstPair(working, judgement.alias);
+
+  const candidate = working.compare;
+  if (!candidate) return null;
+
+  const approxMatch = resolveApproximateAlias(candidate);
+  if (!approxMatch) return null;
+
+  const position = mergePositions(leadingPosition, trailingPosition);
+
+  return {
+    matched: true,
+    itemId: approxMatch.itemId,
+    matchType: "approx",
+    status: judgement?.status,
+    position,
+    measurement,
+    note: undefined,
+    rawText: pair.display,
+  };
+}
+
 function parseUnmatchedSegment(rawText: string, pair: AlignedText): ParsedUnmatched {
   const judgement = matchJudgement(pair.compare);
   const remaining = judgement ? removeFirstPair(pair, judgement.alias) : pair;
@@ -277,7 +384,10 @@ export function parseVoiceInspections(rawText: string): ParsedVoiceInspection[] 
   const tokens = mergeAdjacentSameItemTokens(findCategoryOccurrences(aligned.compare));
 
   if (tokens.length === 0) {
-    // 登録済み項目が1つも見つからない: 未登録項目候補として扱う
+    // 登録済み項目が1つも見つからない: whole-segment approximate resolverで
+    // 最後の望みを試し、それでも一意に決まらなければ未登録項目候補として扱う
+    const approx = tryResolveAsApproximateItem(aligned);
+    if (approx) return [{ ...approx, rawText }];
     return [parseUnmatchedSegment(rawText, aligned)];
   }
 
@@ -409,7 +519,7 @@ function scoreParsedResults(results: ParsedVoiceInspection[]): number {
   for (const r of results) {
     if (r.matched) {
       score += 10;
-      if (r.matchType !== "fuzzy") score += 5; // exact/明示alias一致を優遇
+      if (r.matchType === "exact") score += 5; // exact/明示alias一致を優遇（fuzzy/approxより上）
     } else {
       score -= 3; // unmatchedは減点（曖昧なら無理に別項目へ記録しないというルールと整合）
     }

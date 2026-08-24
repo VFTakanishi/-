@@ -1,5 +1,5 @@
 import { DEFAULT_CHECKLIST } from "../data/defaultChecklist";
-import { hammingDistance } from "./fuzzyMatch";
+import { hammingDistance, levenshteinDistance } from "./fuzzyMatch";
 import { normalize } from "./normalizeText";
 import type { ChecklistItemDef } from "../types";
 
@@ -144,4 +144,72 @@ export function findCategoryOccurrences(
     i += 1;
   }
   return tokens;
+}
+
+// whole-segment approximate resolver（フォールバックの最終段）:
+// findCategoryOccurrences の完全一致・同文字数Hammingフォールバックで一切
+// 見つからなかった発話セグメントに対してだけ使う。文字列中をずらしながら
+// Levenshteinで走査することはしない（過去に隣接語を飲み込む誤爆の原因になった
+// ため、明確に禁止）。ここでは「判定語・数値・位置語等を取り除いた後の
+// 項目名らしい部分の文字列全体」1つと、登録済みエイリアス「全体」を
+// 1対1で比較するだけ。「文字が抜ける／増える」タイプのASR誤認識
+// （例:「タイロットエンドブース」）は同文字数Hammingでは長さが違うため
+// 拾えないが、こちらのLevenshtein比較なら挿入・削除も吸収できる。
+const APPROX_MIN_ALIAS_LENGTH = 5; // 4文字以下のエイリアスはapprox対象外（誤爆しやすいため）
+const APPROX_MIN_SIMILARITY = 0.75; // 類似率75%未満は不採用
+
+function maxApproxDistanceForAliasLength(aliasLength: number): number {
+  if (aliasLength <= 7) return 1; // 5〜7文字: 距離1まで
+  if (aliasLength <= 11) return 2; // 8〜11文字: 距離2まで
+  return 3; // 12文字以上: 距離3まで
+}
+
+export interface ApproxMatch {
+  itemId: string;
+  alias: string;
+  distance: number;
+}
+
+/**
+ * 「項目名らしい部分」として切り出された文字列candidate全体を、登録済み
+ * エイリアス全体と1対1のLevenshtein距離で比較し、最も近い項目を1つだけ返す。
+ * 以下をすべて満たす場合のみ採用する（安全側に倒す）:
+ *  ・エイリアス長が5文字以上（4文字以下は対象外）
+ *  ・エイリアス長に応じた最大編集距離以内（5〜7文字:1 / 8〜11文字:2 / 12文字以上:3）
+ *  ・類似率（1 - 距離/長い方の文字数）が75%以上
+ *  ・該当項目が複数（別項目）で同距離以下に並ぶ場合は採用しない（一意に決まる場合のみ）
+ * 例えば「オイル」のような短い曖昧語だけでは、どのオイル系項目にも
+ * 安全マージンを満たさないため採用されない。
+ */
+export function resolveApproximateAlias(candidate: string, checklist: ChecklistItemDef[] = DEFAULT_CHECKLIST): ApproxMatch | null {
+  if (!candidate) return null;
+  const entries = checklist === DEFAULT_CHECKLIST ? SORTED_ALIAS_ENTRIES : toNormalizedEntries(checklist);
+
+  const bestByItem = new Map<string, { alias: string; distance: number }>();
+  for (const entry of entries) {
+    if (entry.alias.length < APPROX_MIN_ALIAS_LENGTH) continue;
+    const distance = levenshteinDistance(candidate, entry.alias);
+    if (distance === 0) continue; // 完全一致は上位のフォールバックで既に処理済みのはず
+    if (distance > maxApproxDistanceForAliasLength(entry.alias.length)) continue;
+
+    const longer = Math.max(candidate.length, entry.alias.length);
+    const similarity = longer === 0 ? 0 : 1 - distance / longer;
+    if (similarity < APPROX_MIN_SIMILARITY) continue;
+
+    const existing = bestByItem.get(entry.itemId);
+    if (!existing || distance < existing.distance) {
+      bestByItem.set(entry.itemId, { alias: entry.alias, distance });
+    }
+  }
+
+  if (bestByItem.size === 0) return null;
+
+  const ranked = [...bestByItem.entries()].sort((a, b) => a[1].distance - b[1].distance);
+  const [bestItemId, bestInfo] = ranked[0];
+  const second = ranked[1];
+
+  // 2位の項目が同距離以下（＝同程度）なら、どちらか一方に決められないため不採用
+  if (second && second[1].distance <= bestInfo.distance) return null;
+
+  return { itemId: bestItemId, alias: bestInfo.alias, distance: bestInfo.distance };
 }
