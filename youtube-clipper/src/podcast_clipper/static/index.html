@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Podcast Clipper</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<main class="app">
+  <h1>YouTube ポッドキャスト切り抜きツール</h1>
+
+  <section id="analyze-section" class="card">
+    <h2>1. 解析</h2>
+    <div class="row">
+      <input id="url-input" type="text" placeholder="YouTube URLを入力" />
+      <button id="analyze-btn">解析開始</button>
+    </div>
+    <div id="analyze-status" class="status"></div>
+  </section>
+
+  <section id="candidates-section" class="card hidden">
+    <h2>2. 候補（3件）から1件を選択</h2>
+    <div id="candidates" class="candidates"></div>
+  </section>
+
+  <section id="render-section" class="card hidden">
+    <h2>3. レンダリング＆QA</h2>
+    <div id="render-status" class="status"></div>
+    <div id="qa-report"></div>
+    <div id="related-video-guidance" class="guidance hidden">
+      <strong>本編への誘導設定</strong>
+      <p id="related-video-text"></p>
+    </div>
+    <button id="download-btn" class="hidden" disabled>ダウンロード</button>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

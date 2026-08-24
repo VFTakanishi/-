@@ -1,0 +1,97 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f5f5f7;
+  --card-bg: #ffffff;
+  --text: #1a1a1a;
+  --muted: #666;
+  --border: #ddd;
+  --accent: #2f6fed;
+  --danger: #d9363e;
+  --ok: #1a9e5c;
+  --warn: #b8860b;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", "Yu Gothic", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 24px 16px 64px;
+}
+
+h1 { font-size: 1.4rem; }
+h2 { font-size: 1.1rem; margin-top: 0; }
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 20px;
+}
+
+.hidden { display: none !important; }
+
+.row { display: flex; gap: 8px; }
+
+input[type="text"] {
+  flex: 1;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 1rem;
+}
+
+button {
+  padding: 10px 16px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: white;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  background: #aaa;
+  cursor: not-allowed;
+}
+
+.status { margin-top: 10px; color: var(--muted); white-space: pre-wrap; }
+.status.error { color: var(--danger); }
+
+.candidates {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.candidate-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.candidate-card h3 { margin: 0 0 6px; font-size: 1rem; }
+.candidate-card .meta { font-size: 0.85rem; color: var(--muted); margin-bottom: 8px; }
+.candidate-card .segments { font-size: 0.85rem; margin: 8px 0; }
+.candidate-card .segments li { margin-bottom: 4px; }
+.candidate-card .caveats { font-size: 0.85rem; color: var(--warn); margin: 8px 0; }
+.candidate-card .score { font-weight: bold; }
+
+.qa-check { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+.qa-check.pass { color: var(--ok); }
+.qa-check.fail.critical { color: var(--danger); font-weight: bold; }
+.qa-check.fail.warning { color: var(--warn); }
+
+.thumbnails { display: flex; gap: 8px; margin: 12px 0; }
+.thumbnails img { width: 100px; height: 178px; object-fit: cover; border-radius: 6px; border: 1px solid var(--border); }
+
+.guidance { margin-top: 12px; padding: 10px; background: #eef4ff; border-radius: 6px; }
