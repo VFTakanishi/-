@@ -12,6 +12,7 @@ interface EditInspectionItemProps {
 export function EditInspectionItem({ item, onSave, onClose, onDelete }: EditInspectionItemProps) {
   const [status, setStatus] = useState<JudgementStatus>(item.status);
   const [frontRear, setFrontRear] = useState(item.position?.frontRear ?? "");
+  const [leftRight, setLeftRight] = useState(item.position?.leftRight ?? "");
   const [innerOuter, setInnerOuter] = useState(item.position?.innerOuter ?? "");
   const [measurementValue, setMeasurementValue] = useState(
     item.measurement?.value !== undefined ? String(item.measurement.value) : ""
@@ -24,9 +25,10 @@ export function EditInspectionItem({ item, onSave, onClose, onDelete }: EditInsp
       status,
       note: note.trim() || undefined,
       position:
-        frontRear || innerOuter
+        frontRear || leftRight || innerOuter
           ? {
               frontRear: (frontRear || undefined) as "front" | "rear" | undefined,
+              leftRight: (leftRight || undefined) as "left" | "right" | undefined,
               innerOuter: (innerOuter || undefined) as "inner" | "outer" | undefined,
             }
           : undefined,
@@ -69,7 +71,19 @@ export function EditInspectionItem({ item, onSave, onClose, onDelete }: EditInsp
                 className={`toggle-choice ${frontRear === v ? "toggle-choice--active" : ""}`}
                 onClick={() => setFrontRear(v)}
               >
-                {v === "" ? "指定なし" : v === "front" ? "フロント" : "リア"}
+                {v === "" ? "指定なし" : v === "front" ? "フロント" : "リヤ"}
+              </button>
+            ))}
+          </div>
+          <div className="toggle-row">
+            {(["", "left", "right"] as const).map((v) => (
+              <button
+                key={v || "none"}
+                type="button"
+                className={`toggle-choice ${leftRight === v ? "toggle-choice--active" : ""}`}
+                onClick={() => setLeftRight(v)}
+              >
+                {v === "" ? "指定なし" : v === "left" ? "左" : "右"}
               </button>
             ))}
           </div>

@@ -1,14 +1,21 @@
 import { DEFAULT_CHECKLIST } from "../data/defaultChecklist";
-import { levenshteinDistance } from "./fuzzyMatch";
+import { hammingDistance } from "./fuzzyMatch";
 import type { ChecklistItemDef } from "../types";
 
 // 項目名のfuzzy matchを許可する条件（安全側に倒す）:
 // ・完全一致・既知エイリアスで見つからない場合のフォールバックとしてのみ使う
 // ・短すぎる単語には使わない（誤爆しやすいため）
-// ・編集距離1までしか許容しない
+// ・長いエイリアスほど許容編集距離を広げる（短い単語で距離2まで許すと誤爆しやすいため）
 // ・該当項目が複数（別項目にまたがって）候補になった場合は採用しない
 const FUZZY_MIN_ALIAS_LENGTH = 3;
-const FUZZY_MAX_DISTANCE = 1;
+// 「○○ブーツ」のように語尾が共通する項目名が多く、6〜7文字程度では距離2まで
+// 許すと別項目と衝突しやすいため、距離2まで許すのは十分に長い（8文字以上の）
+// エイリアスに限定する。
+const FUZZY_LONG_ALIAS_LENGTH = 8;
+
+function maxDistanceForAliasLength(aliasLength: number): number {
+  return aliasLength >= FUZZY_LONG_ALIAS_LENGTH ? 2 : 1;
+}
 
 interface AliasEntry {
   itemId: string;
@@ -79,8 +86,8 @@ function findFuzzyMatchAt(text: string, i: number, entries: AliasEntry[]): Fuzzy
     const windowLen = entry.alias.length;
     if (i + windowLen > text.length) continue;
     const window = text.slice(i, i + windowLen);
-    const distance = levenshteinDistance(window, entry.alias);
-    if (distance > 0 && distance <= FUZZY_MAX_DISTANCE) {
+    const distance = hammingDistance(window, entry.alias);
+    if (distance > 0 && distance <= maxDistanceForAliasLength(entry.alias.length)) {
       if (!candidatesByItem.has(entry.itemId)) {
         candidatesByItem.set(entry.itemId, { itemId: entry.itemId, alias: entry.alias, end: i + windowLen });
       }

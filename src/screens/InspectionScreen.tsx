@@ -31,7 +31,7 @@ function applyParsedToItem(item: InspectionItem, parsed: ParsedMatched, now: str
     status: parsed.status ?? item.status,
     position: parsed.position ?? item.position,
     measurement: parsed.measurement ?? item.measurement,
-    measurements: parsed.measurements ?? item.measurements,
+    measurements: parsed.measurements ? { ...item.measurements, ...parsed.measurements } : item.measurements,
     note: parsed.note ?? item.note,
     updatedAt: now,
   };

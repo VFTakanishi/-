@@ -26,3 +26,23 @@ export function levenshteinDistance(a: string, b: string): number {
 
   return prev[b.length];
 }
+
+/**
+ * 同じ長さの2文字列を「位置ごとに」比較し、文字が異なる箇所の数を返す。
+ *
+ * 項目名のfuzzy matchでは、長さが同じ窓同士の比較にLevenshtein距離ではなく
+ * こちらを使う。Levenshteinは挿入・削除も許すため、例えば本物の完全一致の
+ * 直前の窓（先頭を1文字捨てて末尾に1文字補う「1文字ずれ」）が常に距離2に
+ * なってしまい、距離2までの許容と組み合わせると隣接語まで誤って
+ * fuzzy一致してしまう。Hamming距離は「ずれ」に低いスコアを与えないため、
+ * 本当に近い（同じ位置の文字が数個違うだけの）誤認識だけを安全に拾える。
+ * 長さが異なる場合はfuzzy match対象外として扱うため呼び出し側で長さを揃える。
+ */
+export function hammingDistance(a: string, b: string): number {
+  if (a.length !== b.length) return Math.max(a.length, b.length);
+  let distance = 0;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) distance++;
+  }
+  return distance;
+}

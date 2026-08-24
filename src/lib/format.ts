@@ -30,7 +30,9 @@ export function statusLabel(status: JudgementStatus): string {
 function positionLabel(item: InspectionItem): string {
   const parts: string[] = [];
   if (item.position?.frontRear === "front") parts.push("フロント");
-  if (item.position?.frontRear === "rear") parts.push("リア");
+  if (item.position?.frontRear === "rear") parts.push("リヤ");
+  if (item.position?.leftRight === "left") parts.push("左");
+  if (item.position?.leftRight === "right") parts.push("右");
   if (item.position?.innerOuter === "inner") parts.push("インナー");
   if (item.position?.innerOuter === "outer") parts.push("アウター");
   return parts.join("・");

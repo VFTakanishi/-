@@ -58,6 +58,11 @@ export const INNER_OUTER_ALIASES: Array<{ value: "inner" | "outer"; alias: strin
   { value: "outer", alias: "アウター" },
 ];
 
+export const LEFT_RIGHT_ALIASES: Array<{ value: "left" | "right"; alias: string }> = [
+  { value: "right", alias: "右" },
+  { value: "left", alias: "左" },
+];
+
 export const STATUS_LABELS: Record<JudgementStatus, string> = {
   ng: "不合格",
   replace_strong: "要交換",

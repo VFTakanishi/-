@@ -10,6 +10,7 @@ export type JudgementStatus =
 
 export interface ItemPosition {
   frontRear?: "front" | "rear";
+  leftRight?: "left" | "right";
   innerOuter?: "inner" | "outer";
 }
 

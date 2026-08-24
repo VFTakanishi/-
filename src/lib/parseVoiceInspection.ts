@@ -1,4 +1,4 @@
-import { FRONT_REAR_ALIASES, INNER_OUTER_ALIASES } from "../data/voiceAliases";
+import { FRONT_REAR_ALIASES, INNER_OUTER_ALIASES, LEFT_RIGHT_ALIASES } from "../data/voiceAliases";
 import { findCategoryOccurrences, removeAlias, type CategoryToken } from "./matchInspectionItem";
 import { matchJudgement, removeJudgementAlias } from "./matchJudgement";
 import type { ItemMeasurement, ItemPosition, JudgementStatus } from "../types";
@@ -38,13 +38,16 @@ function normalize(text: string): string {
     .trim();
 }
 
+const FRONT_REAR_SORTED = [...FRONT_REAR_ALIASES].sort((a, b) => b.alias.length - a.alias.length);
+const LEFT_RIGHT_SORTED = [...LEFT_RIGHT_ALIASES].sort((a, b) => b.alias.length - a.alias.length);
+const INNER_OUTER_SORTED = [...INNER_OUTER_ALIASES].sort((a, b) => b.alias.length - a.alias.length);
+
 function extractPosition(text: string): { position: ItemPosition | undefined; remaining: string } {
   let remaining = text;
   const position: ItemPosition = {};
   let found = false;
 
-  const frontRearSorted = [...FRONT_REAR_ALIASES].sort((a, b) => b.alias.length - a.alias.length);
-  for (const entry of frontRearSorted) {
+  for (const entry of FRONT_REAR_SORTED) {
     if (remaining.includes(entry.alias)) {
       position.frontRear = entry.value;
       remaining = removeAlias(remaining, entry.alias);
@@ -53,8 +56,16 @@ function extractPosition(text: string): { position: ItemPosition | undefined; re
     }
   }
 
-  const innerOuterSorted = [...INNER_OUTER_ALIASES].sort((a, b) => b.alias.length - a.alias.length);
-  for (const entry of innerOuterSorted) {
+  for (const entry of LEFT_RIGHT_SORTED) {
+    if (remaining.includes(entry.alias)) {
+      position.leftRight = entry.value;
+      remaining = removeAlias(remaining, entry.alias);
+      found = true;
+      break;
+    }
+  }
+
+  for (const entry of INNER_OUTER_SORTED) {
     if (remaining.includes(entry.alias)) {
       position.innerOuter = entry.value;
       remaining = removeAlias(remaining, entry.alias);
@@ -64,6 +75,76 @@ function extractPosition(text: string): { position: ItemPosition | undefined; re
   }
 
   return { position: found ? position : undefined, remaining };
+}
+
+function mergePositions(leading: ItemPosition | undefined, trailing: ItemPosition | undefined): ItemPosition | undefined {
+  if (!leading && !trailing) return undefined;
+  const merged: ItemPosition = {
+    frontRear: trailing?.frontRear ?? leading?.frontRear,
+    leftRight: trailing?.leftRight ?? leading?.leftRight,
+    innerOuter: trailing?.innerOuter ?? leading?.innerOuter,
+  };
+  return merged;
+}
+
+/**
+ * テキストの「末尾」から連続する位置語（前後・左右・インナーアウター）だけを
+ * 貪欲に剥がす。項目名の直前に置かれた位置語（例:「リヤドライブシャフトブーツ」の
+ * 「リヤ」）を、次の項目のものとして正しく拾うために使う。
+ * 位置語以外の文字が混ざっている場合はそこで打ち切り、誤って無関係な文字列を
+ * 位置語とみなさないようにする。
+ */
+function extractTrailingPositionWords(text: string): { position: ItemPosition | undefined; consumedLength: number } {
+  let end = text.length;
+  const position: ItemPosition = {};
+  let consumed = 0;
+  let progressed = true;
+
+  while (progressed && end > 0) {
+    progressed = false;
+    const tail = text.slice(0, end);
+
+    if (!position.frontRear) {
+      for (const entry of FRONT_REAR_SORTED) {
+        if (tail.endsWith(entry.alias)) {
+          position.frontRear = entry.value;
+          end -= entry.alias.length;
+          consumed += entry.alias.length;
+          progressed = true;
+          break;
+        }
+      }
+      if (progressed) continue;
+    }
+
+    if (!position.leftRight) {
+      for (const entry of LEFT_RIGHT_SORTED) {
+        if (tail.endsWith(entry.alias)) {
+          position.leftRight = entry.value;
+          end -= entry.alias.length;
+          consumed += entry.alias.length;
+          progressed = true;
+          break;
+        }
+      }
+      if (progressed) continue;
+    }
+
+    if (!position.innerOuter) {
+      for (const entry of INNER_OUTER_SORTED) {
+        if (tail.endsWith(entry.alias)) {
+          position.innerOuter = entry.value;
+          end -= entry.alias.length;
+          consumed += entry.alias.length;
+          progressed = true;
+          break;
+        }
+      }
+    }
+  }
+
+  const hasPosition = position.frontRear !== undefined || position.leftRight !== undefined || position.innerOuter !== undefined;
+  return { position: hasPosition ? position : undefined, consumedLength: consumed };
 }
 
 function extractMeasurement(text: string): { measurement: ItemMeasurement | undefined; remaining: string } {
@@ -157,11 +238,32 @@ export function parseVoiceInspections(rawText: string): ParsedVoiceInspection[] 
     return [parseUnmatchedSegment(rawText, text)];
   }
 
+  // トークン間の「隙間」を求める。gaps[i] はトークンiの直前（=トークンi-1の直後）、
+  // gaps[tokens.length] は最後のトークンの直後。
+  const gaps: string[] = [];
+  for (let i = 0; i <= tokens.length; i++) {
+    const start = i === 0 ? 0 : tokens[i - 1].end;
+    const end = i < tokens.length ? tokens[i].start : text.length;
+    gaps.push(text.slice(start, end));
+  }
+
+  // 各隙間の「末尾」にある位置語（例:「…リヤ」）は、直後のトークン（項目名の前に
+  // 置かれた位置語）に属するとみなし、直前のトークンの内容からは取り除く。
+  const leadingPositionForToken: Array<ItemPosition | undefined> = [];
+  const trimmedGap: string[] = new Array(gaps.length);
+  trimmedGap[gaps.length - 1] = gaps[gaps.length - 1]; // 最後の隙間（末尾）は次の項目が無いのでそのまま
+  for (let i = 0; i < tokens.length; i++) {
+    const { position, consumedLength } = extractTrailingPositionWords(gaps[i]);
+    leadingPositionForToken[i] = position;
+    trimmedGap[i] = gaps[i].slice(0, gaps[i].length - consumedLength);
+  }
+
   const results: ParsedVoiceInspection[] = [];
 
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
     const nextStart = tokens[i + 1]?.start ?? text.length;
+    const ownContent = i + 1 < tokens.length ? trimmedGap[i + 1] : gaps[tokens.length];
 
     if (token.itemId === "co_hc") {
       const span = text.slice(token.start, nextStart);
@@ -173,9 +275,9 @@ export function parseVoiceInspections(rawText: string): ParsedVoiceInspection[] 
       // CO/HCの数値が取れなければ通常の項目として処理を続ける（fall through）
     }
 
-    let remaining = text.slice(token.end, nextStart);
+    let remaining = ownContent;
 
-    const { position, remaining: afterPosition } = extractPosition(remaining);
+    const { position: trailingPosition, remaining: afterPosition } = extractPosition(remaining);
     remaining = afterPosition;
 
     const { measurement, remaining: afterMeasurement } = extractMeasurement(remaining);
@@ -183,6 +285,8 @@ export function parseVoiceInspections(rawText: string): ParsedVoiceInspection[] 
 
     const judgement = matchJudgement(remaining);
     if (judgement) remaining = removeJudgementAlias(remaining, judgement.alias);
+
+    const position = mergePositions(leadingPositionForToken[i], trailingPosition);
 
     results.push({
       matched: true,
