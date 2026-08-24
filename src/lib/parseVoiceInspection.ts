@@ -1,11 +1,14 @@
 import { FRONT_REAR_ALIASES, INNER_OUTER_ALIASES, LEFT_RIGHT_ALIASES } from "../data/voiceAliases";
-import { findCategoryOccurrences, removeAlias, type CategoryToken } from "./matchInspectionItem";
-import { matchJudgement, removeJudgementAlias } from "./matchJudgement";
+import { findCategoryOccurrences, type CategoryToken } from "./matchInspectionItem";
+import { matchJudgement } from "./matchJudgement";
+import { buildAligned, normalize, type AlignedText } from "./normalizeText";
 import type { ItemMeasurement, ItemPosition, JudgementStatus } from "../types";
 
 export interface ParsedMatched {
   matched: true;
   itemId: string;
+  /** 項目名がexact(既知エイリアス)一致かfuzzy一致かの候補選定用メタ情報 */
+  matchType?: "exact" | "fuzzy";
   status?: JudgementStatus;
   position?: ItemPosition;
   measurement?: ItemMeasurement;
@@ -23,52 +26,73 @@ export interface ParsedUnmatched {
 
 export type ParsedVoiceInspection = ParsedMatched | ParsedUnmatched;
 
-const FULLWIDTH_RE = /[０-９Ａ-Ｚａ-ｚ．]/g;
+// 比較対象のテキストは常にnormalize()済みのため、比較する別名側も同様に
+// normalize()しておく（別名にひらがなが含まれる場合、正規化後のカタカナ
+// テキストと表記が一致せずマッチしなくなるのを防ぐ）。
+const FRONT_REAR_SORTED = [...FRONT_REAR_ALIASES]
+  .map((e) => ({ ...e, alias: normalize(e.alias) }))
+  .sort((a, b) => b.alias.length - a.alias.length);
+const LEFT_RIGHT_SORTED = [...LEFT_RIGHT_ALIASES]
+  .map((e) => ({ ...e, alias: normalize(e.alias) }))
+  .sort((a, b) => b.alias.length - a.alias.length);
+const INNER_OUTER_SORTED = [...INNER_OUTER_ALIASES]
+  .map((e) => ({ ...e, alias: normalize(e.alias) }))
+  .sort((a, b) => b.alias.length - a.alias.length);
 
-function toHalfWidth(char: string): string {
-  const code = char.charCodeAt(0);
-  if (code === 0xff0e) return ".";
-  return String.fromCharCode(code - 0xfee0);
+/**
+ * compare（マッチング用に正規化済み）とdisplay（空白のみ除去した原文）を
+ * 常に同じ長さ・同じインデックス対応で保持する組。マッチング自体はcompare側で
+ * 行い、実際にnoteとして残す文字列はdisplay側から取り出すことで、
+ * 「ぶーつ破れ」のような原文のひらがな表記をカタカナに変換してしまう
+ * ことなく、ユーザーへの表示内容を発話どおりに保つ。
+ */
+function slicePair(pair: AlignedText, start: number, end: number): AlignedText {
+  return { compare: pair.compare.slice(start, end), display: pair.display.slice(start, end) };
 }
 
-function normalize(text: string): string {
-  return text
-    .replace(FULLWIDTH_RE, toHalfWidth)
-    .replace(/\s+/g, "")
-    .trim();
+/** compare側で見つかった最初のneedleを、display側の同じ位置からも取り除く。 */
+function removeFirstPair(pair: AlignedText, needle: string): AlignedText {
+  const idx = pair.compare.indexOf(needle);
+  if (idx === -1) return pair;
+  return {
+    compare: pair.compare.slice(0, idx) + pair.compare.slice(idx + needle.length),
+    display: pair.display.slice(0, idx) + pair.display.slice(idx + needle.length),
+  };
 }
 
-const FRONT_REAR_SORTED = [...FRONT_REAR_ALIASES].sort((a, b) => b.alias.length - a.alias.length);
-const LEFT_RIGHT_SORTED = [...LEFT_RIGHT_ALIASES].sort((a, b) => b.alias.length - a.alias.length);
-const INNER_OUTER_SORTED = [...INNER_OUTER_ALIASES].sort((a, b) => b.alias.length - a.alias.length);
+/** 末尾からlen文字を両方から取り除く（インデックスのみに基づくため内容に依存しない）。 */
+function trimTailPair(pair: AlignedText, len: number): AlignedText {
+  const end = pair.compare.length - len;
+  return { compare: pair.compare.slice(0, end), display: pair.display.slice(0, end) };
+}
 
-function extractPosition(text: string): { position: ItemPosition | undefined; remaining: string } {
-  let remaining = text;
+function extractPosition(pair: AlignedText): { position: ItemPosition | undefined; remaining: AlignedText } {
+  let remaining = pair;
   const position: ItemPosition = {};
   let found = false;
 
   for (const entry of FRONT_REAR_SORTED) {
-    if (remaining.includes(entry.alias)) {
+    if (remaining.compare.includes(entry.alias)) {
       position.frontRear = entry.value;
-      remaining = removeAlias(remaining, entry.alias);
+      remaining = removeFirstPair(remaining, entry.alias);
       found = true;
       break;
     }
   }
 
   for (const entry of LEFT_RIGHT_SORTED) {
-    if (remaining.includes(entry.alias)) {
+    if (remaining.compare.includes(entry.alias)) {
       position.leftRight = entry.value;
-      remaining = removeAlias(remaining, entry.alias);
+      remaining = removeFirstPair(remaining, entry.alias);
       found = true;
       break;
     }
   }
 
   for (const entry of INNER_OUTER_SORTED) {
-    if (remaining.includes(entry.alias)) {
+    if (remaining.compare.includes(entry.alias)) {
       position.innerOuter = entry.value;
-      remaining = removeAlias(remaining, entry.alias);
+      remaining = removeFirstPair(remaining, entry.alias);
       found = true;
       break;
     }
@@ -147,11 +171,11 @@ function extractTrailingPositionWords(text: string): { position: ItemPosition | 
   return { position: hasPosition ? position : undefined, consumedLength: consumed };
 }
 
-function extractMeasurement(text: string): { measurement: ItemMeasurement | undefined; remaining: string } {
-  const match = text.match(/(\d+(?:\.\d+)?)(mm|ミリ)/i);
-  if (!match) return { measurement: undefined, remaining: text };
+function extractMeasurement(pair: AlignedText): { measurement: ItemMeasurement | undefined; remaining: AlignedText } {
+  const match = pair.compare.match(/(\d+(?:\.\d+)?)(mm|ミリ)/i);
+  if (!match) return { measurement: undefined, remaining: pair };
   const value = Number(match[1]);
-  const remaining = text.replace(match[0], "");
+  const remaining = removeFirstPair(pair, match[0]);
   return { measurement: { value, unit: "mm" }, remaining };
 }
 
@@ -160,32 +184,33 @@ function cleanNote(text: string): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function tryParseCoHc(text: string): ParsedMatched | null {
-  const coMatch = text.match(/CO(\d+(?:\.\d+)?)/i);
-  const hcMatch = text.match(/HC(\d+(?:\.\d+)?)/i);
+function tryParseCoHc(pair: AlignedText): ParsedMatched | null {
+  const coMatch = pair.compare.match(/CO(\d+(?:\.\d+)?)/i);
+  const hcMatch = pair.compare.match(/HC(\d+(?:\.\d+)?)/i);
   if (!coMatch && !hcMatch) return null;
 
   const measurements: Record<string, number> = {};
-  let remaining = text;
+  let remaining = pair;
   if (coMatch) {
     measurements.CO = Number(coMatch[1]);
-    remaining = remaining.replace(coMatch[0], "");
+    remaining = removeFirstPair(remaining, coMatch[0]);
   }
   if (hcMatch) {
     measurements.HC = Number(hcMatch[1]);
-    remaining = remaining.replace(hcMatch[0], "");
+    remaining = removeFirstPair(remaining, hcMatch[0]);
   }
 
-  const judgement = matchJudgement(remaining);
-  if (judgement) remaining = removeJudgementAlias(remaining, judgement.alias);
+  const judgement = matchJudgement(remaining.compare);
+  if (judgement) remaining = removeFirstPair(remaining, judgement.alias);
 
   return {
     matched: true,
     itemId: "co_hc",
+    matchType: "exact",
     status: judgement?.status,
     measurements,
-    note: cleanNote(remaining),
-    rawText: text,
+    note: cleanNote(remaining.display),
+    rawText: pair.display,
   };
 }
 
@@ -224,10 +249,10 @@ const ELECTRICAL_DESCRIPTIVE_ALIASES = new Set([
   "ライセンスランプ",
 ]);
 
-function parseUnmatchedSegment(rawText: string, text: string): ParsedUnmatched {
-  const judgement = matchJudgement(text);
-  const remaining = judgement ? removeJudgementAlias(text, judgement.alias) : text;
-  const customCategoryName = cleanNote(remaining) ?? remaining;
+function parseUnmatchedSegment(rawText: string, pair: AlignedText): ParsedUnmatched {
+  const judgement = matchJudgement(pair.compare);
+  const remaining = judgement ? removeFirstPair(pair, judgement.alias) : pair;
+  const customCategoryName = cleanNote(remaining.display) ?? remaining.display;
 
   return {
     matched: false,
@@ -248,47 +273,49 @@ function parseUnmatchedSegment(rawText: string, text: string): ParsedUnmatched {
  * 判定語が前の項目に誤って適用されることを防ぐ。
  */
 export function parseVoiceInspections(rawText: string): ParsedVoiceInspection[] {
-  const text = normalize(rawText);
-  const tokens = mergeAdjacentSameItemTokens(findCategoryOccurrences(text));
+  const aligned = buildAligned(rawText);
+  const tokens = mergeAdjacentSameItemTokens(findCategoryOccurrences(aligned.compare));
 
   if (tokens.length === 0) {
     // 登録済み項目が1つも見つからない: 未登録項目候補として扱う
-    return [parseUnmatchedSegment(rawText, text)];
+    return [parseUnmatchedSegment(rawText, aligned)];
   }
 
   // トークン間の「隙間」を求める。gaps[i] はトークンiの直前（=トークンi-1の直後）、
-  // gaps[tokens.length] は最後のトークンの直後。
-  const gaps: string[] = [];
+  // gaps[tokens.length] は最後のトークンの直後。compare/displayは常に同じ長さ・
+  // 同じインデックス対応なので、compareで見つけたトークン境界をdisplay側の
+  // スライスにもそのまま使える。
+  const gaps: AlignedText[] = [];
   for (let i = 0; i <= tokens.length; i++) {
     const start = i === 0 ? 0 : tokens[i - 1].end;
-    const end = i < tokens.length ? tokens[i].start : text.length;
-    gaps.push(text.slice(start, end));
+    const end = i < tokens.length ? tokens[i].start : aligned.compare.length;
+    gaps.push(slicePair(aligned, start, end));
   }
 
   // 各隙間の「末尾」にある位置語（例:「…リヤ」）は、直後のトークン（項目名の前に
   // 置かれた位置語）に属するとみなし、直前のトークンの内容からは取り除く。
-  // 電気回りだけは位置語を構造化せず生テキストのままnoteに残すため、
-  // 剥がした文字列そのもの（leadingRawTextForToken）も別途保持しておく。
+  // 電気回りだけは位置語を構造化せず発話どおりの文言（display）のままnoteに
+  // 残すため、剥がした文字列そのもの（leadingRawTextForToken）も別途保持しておく。
   const leadingPositionForToken: Array<ItemPosition | undefined> = [];
   const leadingRawTextForToken: string[] = [];
-  const trimmedGap: string[] = new Array(gaps.length);
+  const trimmedGap: AlignedText[] = new Array(gaps.length);
   trimmedGap[gaps.length - 1] = gaps[gaps.length - 1]; // 最後の隙間（末尾）は次の項目が無いのでそのまま
   for (let i = 0; i < tokens.length; i++) {
-    const { position, consumedLength } = extractTrailingPositionWords(gaps[i]);
+    const { position, consumedLength } = extractTrailingPositionWords(gaps[i].compare);
     leadingPositionForToken[i] = position;
-    leadingRawTextForToken[i] = consumedLength > 0 ? gaps[i].slice(gaps[i].length - consumedLength) : "";
-    trimmedGap[i] = gaps[i].slice(0, gaps[i].length - consumedLength);
+    leadingRawTextForToken[i] = consumedLength > 0 ? gaps[i].display.slice(gaps[i].display.length - consumedLength) : "";
+    trimmedGap[i] = trimTailPair(gaps[i], consumedLength);
   }
 
   const results: ParsedVoiceInspection[] = [];
 
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
-    const nextStart = tokens[i + 1]?.start ?? text.length;
+    const nextStart = tokens[i + 1]?.start ?? aligned.compare.length;
     const ownContent = i + 1 < tokens.length ? trimmedGap[i + 1] : gaps[tokens.length];
 
     if (token.itemId === "co_hc") {
-      const span = text.slice(token.start, nextStart);
+      const span = slicePair(aligned, token.start, nextStart);
       const coHc = tryParseCoHc(span);
       if (coHc) {
         results.push({ ...coHc, rawText });
@@ -304,14 +331,15 @@ export function parseVoiceInspections(rawText: string): ParsedVoiceInspection[] 
       // 具体的な灯火名は不具合内容そのものなのでnoteに残す。
       const keepAliasInNote = ELECTRICAL_DESCRIPTIVE_ALIASES.has(token.alias);
       let trailing = ownContent;
-      const judgement = matchJudgement(trailing);
-      if (judgement) trailing = removeJudgementAlias(trailing, judgement.alias);
+      const judgement = matchJudgement(trailing.compare);
+      if (judgement) trailing = removeFirstPair(trailing, judgement.alias);
 
-      const noteText = leadingRawTextForToken[i] + (keepAliasInNote ? token.alias : "") + trailing;
+      const noteText = leadingRawTextForToken[i] + (keepAliasInNote ? token.alias : "") + trailing.display;
 
       results.push({
         matched: true,
         itemId: "electrical",
+        matchType: token.matchType,
         status: judgement?.status,
         note: cleanNote(noteText),
         rawText,
@@ -327,23 +355,66 @@ export function parseVoiceInspections(rawText: string): ParsedVoiceInspection[] 
     const { measurement, remaining: afterMeasurement } = extractMeasurement(remaining);
     remaining = afterMeasurement;
 
-    const judgement = matchJudgement(remaining);
-    if (judgement) remaining = removeJudgementAlias(remaining, judgement.alias);
+    const judgement = matchJudgement(remaining.compare);
+    if (judgement) remaining = removeFirstPair(remaining, judgement.alias);
 
     const position = mergePositions(leadingPositionForToken[i], trailingPosition);
 
     results.push({
       matched: true,
       itemId: token.itemId,
+      matchType: token.matchType,
       status: judgement?.status,
       position,
       measurement,
-      note: cleanNote(remaining),
+      note: cleanNote(remaining.display),
       rawText,
     });
   }
 
   return results;
+}
+
+/**
+ * Safariが返す複数の認識候補（alternatives）から、
+ * 「点検項目として最も自然に成立する候補」を1つだけ選ぶ。
+ *
+ * 優先順位:
+ *  1. 登録済み点検項目へのmatch件数が多い
+ *  2. unmatchedが少ない
+ *  3. 完全一致/明示aliasによるmatchを優先（fuzzy matchより高評価）
+ *  4. 条件が同等ならSafariの候補順位が上のもの（先頭）を優先
+ *
+ * 複数候補の解析結果を混ぜることはしない: 採用した1つの候補のtranscriptを
+ * そのままparseVoiceInspectionsした結果をまとめて返す。
+ */
+export function chooseBestTranscript(candidates: string[]): { transcript: string; results: ParsedVoiceInspection[] } {
+  if (candidates.length === 0) return { transcript: "", results: [] };
+
+  let best: { transcript: string; results: ParsedVoiceInspection[]; score: number } | null = null;
+
+  for (const candidate of candidates) {
+    const results = parseVoiceInspections(candidate);
+    const score = scoreParsedResults(results);
+    if (!best || score > best.score) {
+      best = { transcript: candidate, results, score };
+    }
+  }
+
+  return { transcript: best!.transcript, results: best!.results };
+}
+
+function scoreParsedResults(results: ParsedVoiceInspection[]): number {
+  let score = 0;
+  for (const r of results) {
+    if (r.matched) {
+      score += 10;
+      if (r.matchType !== "fuzzy") score += 5; // exact/明示alias一致を優遇
+    } else {
+      score -= 3; // unmatchedは減点（曖昧なら無理に別項目へ記録しないというルールと整合）
+    }
+  }
+  return score;
 }
 
 /** 後方互換用: 1発話につき1項目だけを扱いたい場合に最初の結果を返す。 */

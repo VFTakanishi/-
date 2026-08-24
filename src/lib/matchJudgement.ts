@@ -1,7 +1,13 @@
 import { JUDGEMENT_ALIASES } from "../data/voiceAliases";
+import { normalize } from "./normalizeText";
 import type { JudgementStatus } from "../types";
 
-const SORTED_ALIASES = [...JUDGEMENT_ALIASES].sort((a, b) => b.alias.length - a.alias.length);
+// 比較対象のテキストは常にnormalize()済みのため、比較する判定語エイリアス側も
+// 同様にnormalize()しておく（「いらない」等ひらがなを含むエイリアスが、
+// 正規化後のカタカナテキストと表記が一致せずマッチしなくなるのを防ぐ）。
+const SORTED_ALIASES = [...JUDGEMENT_ALIASES]
+  .map((e) => ({ ...e, alias: normalize(e.alias) }))
+  .sort((a, b) => b.alias.length - a.alias.length);
 
 export interface JudgementMatch {
   status: JudgementStatus;

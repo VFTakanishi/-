@@ -118,11 +118,13 @@ button {
 }
 
 .brand-image {
-  width: clamp(180px, 55vw, 260px);
+  width: clamp(200px, 62vw, 320px);
   height: auto;
   object-fit: contain;
-  border-radius: 10px;
-  opacity: 0.94;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  opacity: 1;
 }
 
 .past-list {
@@ -298,19 +300,35 @@ button {
 }
 
 /* Recognition result */
+/*
+ * 音声認識結果カードは常に高さ固定（内容量に関わらず変化しない）。
+ * これは「全項目一覧」の表示位置が認識結果のたびに上下してしまう問題への対策で、
+ * 内容がこの高さに収まらない場合は内部（.recognition-result-scroll）だけが
+ * スクロールし、カード自体の外形サイズ（＝後続要素の位置）には影響しない。
+ */
 .recognition-result {
   background: #fff;
   border-radius: 16px;
-  padding: 16px;
+  padding: 14px 16px;
   box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
+  height: 104px;
 }
 
 .recognition-result--empty {
+  height: 104px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   color: #64748b;
   text-align: center;
+}
+
+.recognition-result-scroll {
+  height: 100%;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
 .recognition-result-label {
@@ -339,12 +357,6 @@ button {
 .recognition-result-record-item + .recognition-result-record-item {
   padding-top: 10px;
   border-top: 1px solid rgba(21, 128, 61, 0.2);
-}
-
-.recognition-result-unmatched {
-  background: #fffbeb;
-  border-radius: 12px;
-  padding: 12px;
 }
 
 .recognition-result-unmatched-name {

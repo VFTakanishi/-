@@ -1,7 +1,12 @@
+interface SpeechRecognitionAlternativeLike {
+  transcript: string;
+  confidence: number;
+}
+
 interface SpeechRecognitionResultLike {
-  0: { transcript: string; confidence: number };
-  isFinal: boolean;
-  length: number;
+  readonly length: number;
+  readonly isFinal: boolean;
+  [index: number]: SpeechRecognitionAlternativeLike;
 }
 
 interface SpeechRecognitionEventLike extends Event {

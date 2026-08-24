@@ -1,5 +1,5 @@
 import { useState } from "react";
-import brandImage from "../assets/vf-takanishi-brand.jpg";
+import brandImage from "../assets/vf-takanishi-brand-transparent.png";
 import { createInspection, deleteInspection, listInspections } from "../lib/storage";
 import type { Inspection } from "../types";
 

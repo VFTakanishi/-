@@ -5,7 +5,7 @@ export const DEFAULT_CHECKLIST: ChecklistItemDef[] = [
   { id: "engine_oil", category: "エンジンオイル", group: "油脂・エンジン関連", aliases: ["エンジンオイル"] },
   { id: "oil_element", category: "オイルエレメント", group: "油脂・エンジン関連", aliases: ["オイルエレメント", "オイルフィルター"] },
   { id: "air_element", category: "エアーエレメント", group: "油脂・エンジン関連", aliases: ["エアエレメント", "エアクリーナーエレメント", "エアクリーナー", "エアーエレメント"] },
-  { id: "power_steering_oil", category: "パワステオイル", group: "油脂・エンジン関連", aliases: ["パワステオイル", "パワーステアリングオイル"] },
+  { id: "power_steering_oil", category: "パワステオイル", group: "油脂・エンジン関連", aliases: ["パワステオイル", "パワーステアリングオイル", "合わせてオイル", "ファーストオイル", "パワーステオイル"] },
   { id: "coolant", category: "クーラント", group: "油脂・エンジン関連", aliases: ["クーラント", "冷却水", "空欄と", "空欄ト", "クーランド"] },
   { id: "accessory_belt", category: "補機ベルト", group: "油脂・エンジン関連", aliases: ["補機ベルト", "ファンベルト", "エアコンベルト", "補器ベルト", "ホキベルト", "ほきベルト"] },
   { id: "timing_belt", category: "タイミングベルト", group: "油脂・エンジン関連", aliases: ["タイミングベルト"] },

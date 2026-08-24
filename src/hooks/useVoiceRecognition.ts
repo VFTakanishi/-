@@ -8,7 +8,12 @@ export interface VoiceErrorInfo {
 }
 
 interface UseVoiceRecognitionOptions {
-  onResult: (transcript: string) => void;
+  /**
+   * Safariが返す複数の認識候補（alternatives）をそのまま渡す。
+   * 候補は1件以上、Safariの信頼度順（先頭が最有力候補）。
+   * 「点検項目として最も自然に成立する候補」を選ぶ判断は呼び出し側（parser）に委ねる。
+   */
+  onResult: (transcripts: string[]) => void;
   lang?: string;
 }
 
@@ -90,7 +95,7 @@ export function useVoiceRecognition({ onResult, lang = "ja-JP" }: UseVoiceRecogn
     recognition.lang = lang;
     recognition.continuous = false;
     recognition.interimResults = false;
-    recognition.maxAlternatives = 1;
+    recognition.maxAlternatives = 5;
 
     recognition.onstart = () => setState("listening");
 
@@ -98,9 +103,16 @@ export function useVoiceRecognition({ onResult, lang = "ja-JP" }: UseVoiceRecogn
       setState("processing");
       setLastError(null);
       const lastIndex = event.results.length - 1;
-      const transcript = event.results[lastIndex]?.[0]?.transcript ?? "";
-      if (transcript.trim()) {
-        onResultRef.current(transcript.trim());
+      const result = event.results[lastIndex];
+      const transcripts: string[] = [];
+      if (result) {
+        for (let i = 0; i < result.length; i++) {
+          const t = result[i]?.transcript?.trim();
+          if (t) transcripts.push(t);
+        }
+      }
+      if (transcripts.length > 0) {
+        onResultRef.current(transcripts);
       }
     };
 

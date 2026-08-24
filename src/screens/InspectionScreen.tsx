@@ -2,12 +2,13 @@ import { useEffect, useState } from "react";
 import { EditInspectionItem } from "../components/EditInspectionItem";
 import { InspectionItemRow } from "../components/InspectionItemRow";
 import { RecognitionResult, type RecognitionResultData } from "../components/RecognitionResult";
+import { UnmatchedConfirmModal } from "../components/UnmatchedConfirmModal";
 import { VoiceButton } from "../components/VoiceButton";
 import { VoiceErrorBanner } from "../components/VoiceErrorBanner";
 import { VoiceWordHint } from "../components/VoiceWordHint";
 import { useVoiceRecognition } from "../hooks/useVoiceRecognition";
 import { itemSummaryLine, statusLabel } from "../lib/format";
-import { parseVoiceInspections, type ParsedMatched, type ParsedUnmatched } from "../lib/parseVoiceInspection";
+import { chooseBestTranscript, type ParsedMatched, type ParsedUnmatched } from "../lib/parseVoiceInspection";
 import { getInspection, makeItemId, saveInspection } from "../lib/storage";
 import type { Inspection, InspectionItem } from "../types";
 
@@ -67,8 +68,8 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
     if (inspection) saveInspection(inspection);
   }, [inspection]);
 
-  const handleVoiceResult = (transcript: string) => {
-    const parsedList = parseVoiceInspections(transcript);
+  const handleVoiceResult = (transcripts: string[]) => {
+    const { transcript, results: parsedList } = chooseBestTranscript(transcripts);
     const matchedList = parsedList.filter((p): p is ParsedMatched => p.matched);
     const unmatchedList = parsedList.filter((p): p is ParsedUnmatched => !p.matched);
     const now = new Date().toISOString();
@@ -186,13 +187,16 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
       <VoiceWordHint />
       <VoiceErrorBanner error={lastError} />
 
-      <RecognitionResult
-        result={lastRecognition}
-        pendingUnmatched={pendingUnmatched}
-        pendingUnmatchedCount={pendingUnmatchedQueue.length}
-        onConfirmAdd={handleConfirmAdd}
-        onDiscard={handleDiscardUnmatched}
-      />
+      <RecognitionResult result={lastRecognition} />
+
+      {pendingUnmatched && (
+        <UnmatchedConfirmModal
+          pendingUnmatched={pendingUnmatched}
+          pendingUnmatchedCount={pendingUnmatchedQueue.length}
+          onConfirmAdd={handleConfirmAdd}
+          onDiscard={handleDiscardUnmatched}
+        />
+      )}
 
       <div className="modal-section-title">全項目一覧</div>
       <div className="item-list">

@@ -1,5 +1,6 @@
 import { DEFAULT_CHECKLIST } from "../data/defaultChecklist";
 import { hammingDistance } from "./fuzzyMatch";
+import { normalize } from "./normalizeText";
 import type { ChecklistItemDef } from "../types";
 
 // 項目名のfuzzy matchを許可する条件（安全側に倒す）:
@@ -22,9 +23,16 @@ interface AliasEntry {
   alias: string;
 }
 
-const SORTED_ALIAS_ENTRIES: AliasEntry[] = DEFAULT_CHECKLIST.flatMap((item) =>
-  item.aliases.map((alias) => ({ itemId: item.id, alias }))
-).sort((a, b) => b.alias.length - a.alias.length);
+// 比較対象のテキストは常にnormalize()済みのため、比較する別名側も同様に
+// normalize()しておく（別名にひらがなが含まれる場合、正規化後のカタカナ
+// テキストと表記が一致せずマッチしなくなるのを防ぐ）。
+function toNormalizedEntries(checklist: ChecklistItemDef[]): AliasEntry[] {
+  return checklist
+    .flatMap((item) => item.aliases.map((alias) => ({ itemId: item.id, alias: normalize(alias) })))
+    .sort((a, b) => b.alias.length - a.alias.length);
+}
+
+const SORTED_ALIAS_ENTRIES: AliasEntry[] = toNormalizedEntries(DEFAULT_CHECKLIST);
 
 export interface CategoryMatch {
   itemId: string;
@@ -36,10 +44,7 @@ export interface CategoryMatch {
  * 一致が無ければ null（未登録項目の候補として扱う）。
  */
 export function matchCategory(text: string, checklist: ChecklistItemDef[] = DEFAULT_CHECKLIST): CategoryMatch | null {
-  const entries = checklist === DEFAULT_CHECKLIST
-    ? SORTED_ALIAS_ENTRIES
-    : checklist.flatMap((item) => item.aliases.map((alias) => ({ itemId: item.id, alias })))
-        .sort((a, b) => b.alias.length - a.alias.length);
+  const entries = checklist === DEFAULT_CHECKLIST ? SORTED_ALIAS_ENTRIES : toNormalizedEntries(checklist);
 
   for (const entry of entries) {
     if (text.includes(entry.alias)) {
@@ -58,6 +63,8 @@ export interface CategoryToken {
   alias: string;
   start: number;
   end: number;
+  /** 完全一致（既知エイリアス）か、軽微な誤認識を吸収したfuzzy matchか */
+  matchType: "exact" | "fuzzy";
 }
 
 interface FuzzyMatch {
@@ -109,10 +116,7 @@ export function findCategoryOccurrences(
   text: string,
   checklist: ChecklistItemDef[] = DEFAULT_CHECKLIST
 ): CategoryToken[] {
-  const entries = checklist === DEFAULT_CHECKLIST
-    ? SORTED_ALIAS_ENTRIES
-    : checklist.flatMap((item) => item.aliases.map((alias) => ({ itemId: item.id, alias })))
-        .sort((a, b) => b.alias.length - a.alias.length);
+  const entries = checklist === DEFAULT_CHECKLIST ? SORTED_ALIAS_ENTRIES : toNormalizedEntries(checklist);
 
   const tokens: CategoryToken[] = [];
   let i = 0;
@@ -125,14 +129,14 @@ export function findCategoryOccurrences(
       }
     }
     if (matched) {
-      tokens.push({ itemId: matched.itemId, alias: matched.alias, start: i, end: i + matched.alias.length });
+      tokens.push({ itemId: matched.itemId, alias: matched.alias, start: i, end: i + matched.alias.length, matchType: "exact" });
       i += matched.alias.length;
       continue;
     }
 
     const fuzzy = findFuzzyMatchAt(text, i, entries);
     if (fuzzy) {
-      tokens.push({ itemId: fuzzy.itemId, alias: fuzzy.alias, start: i, end: fuzzy.end });
+      tokens.push({ itemId: fuzzy.itemId, alias: fuzzy.alias, start: i, end: fuzzy.end, matchType: "fuzzy" });
       i = fuzzy.end;
       continue;
     }
