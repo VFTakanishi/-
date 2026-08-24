@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { EditInspectionItem } from "../components/EditInspectionItem";
 import { InspectionItemRow } from "../components/InspectionItemRow";
 import { RecognitionResult, type RecognitionResultData } from "../components/RecognitionResult";
@@ -128,14 +128,6 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
     setPendingUnmatchedQueue((prev) => prev.slice(1));
   };
 
-  const recentItems = useMemo(() => {
-    if (!inspection) return [];
-    return [...inspection.items]
-      .filter((i) => i.updatedAt)
-      .sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""))
-      .slice(0, 5);
-  }, [inspection]);
-
   const editingItem = inspection?.items.find((i) => i.id === editingItemId) ?? null;
 
   const handleSaveEdit = (updated: InspectionItem) => {
@@ -200,17 +192,6 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
         onConfirmAdd={handleConfirmAdd}
         onDiscard={handleDiscardUnmatched}
       />
-
-      {recentItems.length > 0 && (
-        <>
-          <div className="modal-section-title">最近の記録</div>
-          <div className="item-list">
-            {recentItems.map((item) => (
-              <InspectionItemRow key={item.id} item={item} onClick={() => setEditingItemId(item.id)} />
-            ))}
-          </div>
-        </>
-      )}
 
       <div className="modal-section-title">全項目一覧</div>
       <div className="item-list">
