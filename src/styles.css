@@ -219,15 +219,23 @@ button {
 
 /* Voice word hint */
 .voice-word-hint {
+  position: sticky;
+  top: calc(env(safe-area-inset-top, 0px) + 4px);
+  z-index: 20;
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
   align-items: center;
-  gap: 4px 10px;
-  color: #94a3b8;
-  font-size: 0.85rem;
-  line-height: 1.5;
-  padding: 0 8px;
+  gap: 2px 10px;
+  color: #6b7686;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  padding: 5px 10px;
+  border-radius: 10px;
+  background: rgba(244, 246, 248, 0.85);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.05);
 }
 
 .voice-word-hint-item {
