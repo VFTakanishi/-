@@ -10,6 +10,7 @@ import { useVoiceRecognition } from "../hooks/useVoiceRecognition";
 import { itemSummaryLine, statusLabel } from "../lib/format";
 import { chooseBestTranscript, type ParsedMatched, type ParsedUnmatched } from "../lib/parseVoiceInspection";
 import { getInspection, makeItemId, saveInspection } from "../lib/storage";
+import { trackAnalyticsEvent } from "../lib/analytics";
 import type { Inspection, InspectionItem } from "../types";
 
 interface InspectionScreenProps {
@@ -86,6 +87,7 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
   }, [inspection]);
 
   const handleVoiceResult = (transcripts: string[]) => {
+    trackAnalyticsEvent("speech_recognition_success");
     const { transcript, results: parsedList } = chooseBestTranscript(transcripts);
     const matchedList = parsedList.filter((p): p is ParsedMatched => p.matched);
     const unmatchedList = parsedList.filter((p): p is ParsedUnmatched => !p.matched);
@@ -103,6 +105,7 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
     }
 
     if (unmatchedList.length > 0) {
+      trackAnalyticsEvent("unrecognized_input");
       setPendingUnmatchedQueue((prev) => appendUnmatchedQueue(prev, unmatchedList));
     }
 
@@ -120,6 +123,13 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
   };
 
   const { state: voiceState, isListening, lastError, toggle } = useVoiceRecognition({ onResult: handleVoiceResult });
+
+  const handleVoiceToggle = () => {
+    if (!isListening && voiceState !== "unsupported") {
+      trackAnalyticsEvent("microphone_start");
+    }
+    toggle();
+  };
 
   const handleConfirmAdd = () => {
     if (!pendingUnmatched) return;
@@ -202,7 +212,7 @@ export function InspectionScreen({ inspectionId, onOpenSummary, onBackToStart }:
         {inspection.mileage ? ` / ${inspection.mileage}km` : ""}
       </div>
 
-      <VoiceButton state={voiceState} isListening={isListening} onClick={toggle} />
+      <VoiceButton state={voiceState} isListening={isListening} onClick={handleVoiceToggle} />
       <VoiceWordHint />
       <VoiceErrorBanner error={lastError} />
 

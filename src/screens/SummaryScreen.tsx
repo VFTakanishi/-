@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { InspectionItemRow } from "../components/InspectionItemRow";
 import { buildSummaryText } from "../lib/format";
 import type { Inspection } from "../types";
+import { trackAnalyticsEvent } from "../lib/analytics";
 
 interface SummaryScreenProps {
   inspection: Inspection;
@@ -17,6 +18,10 @@ export function SummaryScreen({ inspection, onBack, onBackToStart }: SummaryScre
 
   const summaryText = buildSummaryText(inspection);
   const problemItems = inspection.items.filter((i) => PROBLEM_STATUSES.has(i.status));
+
+  useEffect(() => {
+    trackAnalyticsEvent("summary_view");
+  }, []);
 
   const handleCopy = async () => {
     try {

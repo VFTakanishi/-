@@ -1,6 +1,7 @@
 import { useState } from "react";
 import brandImage from "../assets/vf-takanishi-brand-transparent.png";
 import { createInspection, deleteInspection, listInspections } from "../lib/storage";
+import { trackAnalyticsEvent } from "../lib/analytics";
 import type { Inspection } from "../types";
 
 interface StartScreenProps {
@@ -20,6 +21,7 @@ export function StartScreen({ onOpenInspection }: StartScreenProps) {
 
   const handleStart = () => {
     const inspection = createInspection(customerName, vehicleModel, mileage);
+    trackAnalyticsEvent("inspection_start");
     onOpenInspection(inspection.id);
   };
 

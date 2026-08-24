@@ -3,6 +3,7 @@ import { InspectionScreen } from "./screens/InspectionScreen";
 import { StartScreen } from "./screens/StartScreen";
 import { SummaryScreen } from "./screens/SummaryScreen";
 import { getInspection } from "./lib/storage";
+import { trackAnalyticsEvent } from "./lib/analytics";
 
 type Screen = "start" | "inspection" | "summary";
 
@@ -13,6 +14,11 @@ export default function App() {
   const openInspection = (id: string) => {
     setInspectionId(id);
     setScreen("inspection");
+  };
+
+  const backToStart = () => {
+    trackAnalyticsEvent("back_to_top");
+    setScreen("start");
   };
 
   if (screen === "start" || !inspectionId) {
@@ -29,7 +35,7 @@ export default function App() {
       <SummaryScreen
         inspection={inspection}
         onBack={() => setScreen("inspection")}
-        onBackToStart={() => setScreen("start")}
+        onBackToStart={backToStart}
       />
     );
   }
@@ -38,7 +44,7 @@ export default function App() {
     <InspectionScreen
       inspectionId={inspectionId}
       onOpenSummary={() => setScreen("summary")}
-      onBackToStart={() => setScreen("start")}
+      onBackToStart={backToStart}
     />
   );
 }
