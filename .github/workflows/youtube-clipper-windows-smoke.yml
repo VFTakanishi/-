@@ -60,18 +60,60 @@ jobs:
           pip install pytest httpx
           if ($LASTEXITCODE -ne 0) { throw "pip install pytest httpx failed" }
 
-      # --- 5. Japanese font (meiryo.ttc) -----------------------------------
-      - name: Check Japanese font (C:/Windows/Fonts/meiryo.ttc)
+      # --- 5. Japanese font -------------------------------------------------
+      # Checks several fonts normally present on a real Windows install
+      # (meiryo.ttc first, since that's the product's documented default).
+      # GitHub-hosted windows-latest runner images are Windows Server based
+      # and may be missing some of these (this is what step 1's smoke run
+      # found), so only if none are present does this fall back to a
+      # CI-only download of a freely licensed (SIL OFL) Japanese font,
+      # discovered dynamically via the GitHub API rather than a hardcoded
+      # URL. Either way, PODCAST_CLIPPER_FONT_PATH is exported for the
+      # later steps (faster-whisper isn't affected, but pytest is).
+      - name: Ensure a Japanese font is available
         id: font_check
         if: always()
         continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $path = "C:/Windows/Fonts/meiryo.ttc"
-          $exists = Test-Path $path
-          Write-Host "meiryo.ttc exists at ${path}: $exists"
-          if (-not $exists) {
-            throw "meiryo.ttc not found at $path -- an alternative Japanese font path will need to be configured via PODCAST_CLIPPER_FONT_PATH"
+          $candidates = @(
+            "C:/Windows/Fonts/meiryo.ttc",
+            "C:/Windows/Fonts/YuGothM.ttc",
+            "C:/Windows/Fonts/YuGothR.ttc",
+            "C:/Windows/Fonts/msgothic.ttc",
+            "C:/Windows/Fonts/msmincho.ttc"
+          )
+          $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if ($found) {
+            Write-Host "Using built-in Windows Japanese font: $found"
+            $fontPath = $found
+          } else {
+            Write-Host "No built-in Japanese font found on this runner image ($($candidates -join ', ')). Falling back to a CI-only download of a licensed Japanese font (SIL OFL)."
+            $releaseJson = gh api repos/googlefonts/noto-cjk/releases/latest
+            if (-not $releaseJson) { throw "Could not query googlefonts/noto-cjk releases via gh api" }
+            $release = $releaseJson | ConvertFrom-Json
+            $asset = $release.assets | Where-Object { $_.name -match "(?i)sans.*\.zip" } | Select-Object -First 1
+            if (-not $asset) { throw "Could not find a Sans-family zip asset in the latest googlefonts/noto-cjk release" }
+
+            Write-Host "Downloading font asset: $($asset.name)"
+            $zipPath = Join-Path $env:RUNNER_TEMP "noto-cjk.zip"
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+            $extractDir = Join-Path $env:RUNNER_TEMP "noto-cjk"
+            Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+            $jpFont = Get-ChildItem -Path $extractDir -Recurse -Include "*.otf", "*.ttc", "*.ttf" |
+              Where-Object { $_.Name -match "(?i)jp|japan" } | Select-Object -First 1
+            if (-not $jpFont) { throw "Downloaded Noto CJK archive did not contain a Japanese-specific font file" }
+
+            $fontPath = $jpFont.FullName
+            Write-Host "Using downloaded Japanese font: $fontPath"
           }
+
+          if (-not (Test-Path $fontPath)) { throw "Resolved font path does not exist: $fontPath" }
+          "PODCAST_CLIPPER_FONT_PATH=$fontPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "PODCAST_CLIPPER_FONT_PATH set to: $fontPath"
 
       # --- 6. faster-whisper large-v3 / cpu / int8, real Hugging Face fetch
       - name: faster-whisper large-v3 model download (Hugging Face)
@@ -107,7 +149,7 @@ jobs:
           $rows = @(
             @{Name="ffmpeg / ffprobe"; Outcome="${{ steps.ffmpeg_check.outcome }}"},
             @{Name="pip install (依存関係)"; Outcome="${{ steps.pip_install.outcome }}"},
-            @{Name="日本語フォント (meiryo.ttc)"; Outcome="${{ steps.font_check.outcome }}"},
+            @{Name="日本語フォント確保"; Outcome="${{ steps.font_check.outcome }}"},
             @{Name="faster-whisper large-v3 取得 (Hugging Face)"; Outcome="${{ steps.whisper_check.outcome }}"},
             @{Name="yt-dlp -> YouTube 到達性"; Outcome="${{ steps.ytdlp_check.outcome }}"},
             @{Name="pytest tests/"; Outcome="${{ steps.pytest_check.outcome }}"}

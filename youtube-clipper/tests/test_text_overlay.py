@@ -2,7 +2,7 @@ import subprocess
 
 import pytest
 
-from conftest import requires_ffmpeg
+from conftest import find_available_japanese_font, requires_ffmpeg
 from podcast_clipper import config, text_overlay
 
 
@@ -60,12 +60,13 @@ def test_drawtext_actually_renders_with_real_ffmpeg(monkeypatch, tmp_path):
     condition: font failure is never a silent success), and a valid font
     must let ffmpeg exit 0 and produce a real output file.
     """
-    import glob
-
-    cjk_fonts = glob.glob("/usr/share/fonts/**/NotoSansCJK*.ttc", recursive=True)
-    if not cjk_fonts:
-        pytest.skip("no CJK font available in this environment to smoke-test drawtext")
-    monkeypatch.setattr(config, "FONT_PATH", cjk_fonts[0])
+    font_path = find_available_japanese_font()
+    if font_path is None:
+        pytest.skip(
+            "no Japanese font available to smoke-test drawtext "
+            "(set PODCAST_CLIPPER_FONT_PATH, or run where a CJK font is installed)"
+        )
+    monkeypatch.setattr(config, "FONT_PATH", font_path)
 
     spec = text_overlay.TextOverlaySpec(
         text="日本語テスト表示", x_expr="10", y_expr="10", fontsize=32

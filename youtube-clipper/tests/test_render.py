@@ -1,8 +1,9 @@
-import glob
 import subprocess
 from pathlib import Path
 
-from conftest import requires_ffmpeg
+import pytest
+
+from conftest import find_available_japanese_font, requires_ffmpeg
 from podcast_clipper import config, qa, render
 from podcast_clipper.models import ClipCandidate, UsedSegment
 
@@ -44,12 +45,13 @@ def test_trim_concat_filter_supports_single_and_triple_segment_candidates():
 
 @requires_ffmpeg
 def test_render_candidate_end_to_end_produces_valid_files(monkeypatch, tmp_path):
-    cjk_fonts = glob.glob("/usr/share/fonts/**/NotoSansCJK*.ttc", recursive=True)
-    if not cjk_fonts:
-        import pytest
-
-        pytest.skip("no CJK font available to exercise the full render pipeline")
-    monkeypatch.setattr(config, "FONT_PATH", cjk_fonts[0])
+    font_path = find_available_japanese_font()
+    if font_path is None:
+        pytest.skip(
+            "no Japanese font available to exercise the full render pipeline "
+            "(set PODCAST_CLIPPER_FONT_PATH, or run where a CJK font is installed)"
+        )
+    monkeypatch.setattr(config, "FONT_PATH", font_path)
 
     # Build a 20s synthetic source video (colour bars + tone) so segment
     # extraction has real content to cut from.
