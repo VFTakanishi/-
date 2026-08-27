@@ -15,6 +15,18 @@ import yt_dlp
 
 from . import config
 
+# YouTube increasingly requires a proof-of-origin token for its default
+# "web" player client, which datacenter IPs (including CI runners) often
+# can't satisfy and get rejected with "Sign in to confirm you're not a
+# bot." The "tv" and "android" clients don't have that requirement as of
+# this writing, so trying them first is yt-dlp's documented mitigation
+# for that error (see https://github.com/yt-dlp/yt-dlp/wiki/FAQ). This
+# does not touch the pipeline's own logic -- extraction still returns the
+# same info dict shape either way.
+_YT_DLP_COMMON_OPTS = {
+    "extractor_args": {"youtube": {"player_client": ["tv", "android", "web"]}},
+}
+
 
 @dataclass
 class VideoInfo:
@@ -39,7 +51,8 @@ def download_video(url: str, out_root: Path, force_refresh: bool = False) -> Vid
     interrupted job, or a render step running after analyze, reuse the
     already-downloaded file instead of re-fetching from YouTube).
     """
-    with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True}) as probe:
+    probe_opts = {"quiet": True, "noplaylist": True, **_YT_DLP_COMMON_OPTS}
+    with yt_dlp.YoutubeDL(probe_opts) as probe:
         probe_info = probe.extract_info(url, download=False)
     video_id = probe_info["id"]
 
@@ -57,6 +70,7 @@ def download_video(url: str, out_root: Path, force_refresh: bool = False) -> Vid
             "merge_output_format": "mp4",
             "noplaylist": True,
             "quiet": True,
+            **_YT_DLP_COMMON_OPTS,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
