@@ -65,6 +65,59 @@ def test_video_content_qa_ignores_freeze_well_after_opening(monkeypatch):
     assert freeze_check.passed is True
 
 
+def test_video_content_qa_opening_freeze_passes_when_source_is_also_static(monkeypatch):
+    """Slide-heavy podcast case: the output's opening looks frozen, but so
+    does the original source over the same segment -- this is genuine
+    content (a static slide), not a rendering accident, so it must not be
+    a critical failure.
+    """
+
+    def fake_run(args):
+        joined = " ".join(args)
+        if "blackdetect" in joined:
+            return _fake_completed(stderr="")
+        if "freezedetect" in joined:
+            if "intermediate.mp4" in joined:
+                return _fake_completed(stderr="[freezedetect @ 0x0] freeze_start: 0.5\n")
+            if "source.mp4" in joined:
+                return _fake_completed(stderr="[freezedetect @ 0x0] freeze_start: 0.2\n")
+        return _fake_completed(stderr="")
+
+    monkeypatch.setattr(qa, "_run", fake_run)
+    checks = qa.video_content_qa(
+        Path("intermediate.mp4"), source_path=Path("source.mp4"), source_segment_start=120.0
+    )
+    freeze_check = next(c for c in checks if c.name == "静止画/フリーズ検出")
+    assert freeze_check.passed is True
+    assert freeze_check.critical is True
+
+
+def test_video_content_qa_opening_freeze_fails_when_source_is_not_static(monkeypatch):
+    """The output alone is frozen at the opening while the source is moving
+    over the same segment -- a genuine rendering accident, so this must
+    stay a critical failure exactly as before.
+    """
+
+    def fake_run(args):
+        joined = " ".join(args)
+        if "blackdetect" in joined:
+            return _fake_completed(stderr="")
+        if "freezedetect" in joined:
+            if "intermediate.mp4" in joined:
+                return _fake_completed(stderr="[freezedetect @ 0x0] freeze_start: 0.5\n")
+            if "source.mp4" in joined:
+                return _fake_completed(stderr="")  # source has no freeze here
+        return _fake_completed(stderr="")
+
+    monkeypatch.setattr(qa, "_run", fake_run)
+    checks = qa.video_content_qa(
+        Path("intermediate.mp4"), source_path=Path("source.mp4"), source_segment_start=120.0
+    )
+    freeze_check = next(c for c in checks if c.name == "静止画/フリーズ検出")
+    assert freeze_check.passed is False
+    assert freeze_check.critical is True
+
+
 # --- audio presence QA (signal only, not "speech" -- plan fix #6) -------
 
 
@@ -225,12 +278,17 @@ def test_run_full_qa_runs_video_content_qa_on_intermediate_only(monkeypatch):
     seen_technical_qa_paths = []
     seen_audio_qa_paths = []
 
-    monkeypatch.setattr(qa, "video_content_qa", lambda p: (seen_video_content_qa_paths.append(str(p)), [])[1])
+    monkeypatch.setattr(
+        qa, "video_content_qa",
+        lambda p, source_path=None, source_segment_start=None: (
+            seen_video_content_qa_paths.append(str(p)), []
+        )[1],
+    )
     monkeypatch.setattr(qa, "technical_qa", lambda p, d: (seen_technical_qa_paths.append(str(p)), [])[1])
     monkeypatch.setattr(qa, "audio_presence_qa", lambda p: (seen_audio_qa_paths.append(str(p)), [])[1])
     monkeypatch.setattr(qa, "extract_thumbnails", lambda *a, **k: [])
 
-    qa.run_full_qa(raw, transcript, manifest)
+    qa.run_full_qa(raw, transcript, manifest, Path("source.mp4"))
 
     assert seen_video_content_qa_paths == ["intermediate_novtext.mp4"]
     assert seen_technical_qa_paths == ["final.mp4"]

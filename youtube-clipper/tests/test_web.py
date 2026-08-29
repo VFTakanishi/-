@@ -132,7 +132,7 @@ def test_analyze_then_render_then_download_flow(monkeypatch, tmp_path):
     monkeypatch.setattr("podcast_clipper.web.render.render_candidate", fake_render_candidate)
     monkeypatch.setattr(
         "podcast_clipper.web.qa.run_full_qa",
-        lambda raw, transcript, manifest: qa.QAReport(checks=[], thumbnails=[]),
+        lambda raw, transcript, manifest, source_path: qa.QAReport(checks=[], thumbnails=[]),
     )
 
     resp = client.post(f"/api/jobs/{analyze_job_id}/render", json={"candidate_id": "c1"})
@@ -198,7 +198,9 @@ def test_download_blocked_when_qa_has_critical_failure(monkeypatch, tmp_path):
     monkeypatch.setattr("podcast_clipper.web.render.render_candidate", fake_render_candidate)
     monkeypatch.setattr(
         "podcast_clipper.web.qa.run_full_qa",
-        lambda raw, transcript, manifest: qa.QAReport(checks=[critical_fail_check], thumbnails=[]),
+        lambda raw, transcript, manifest, source_path: qa.QAReport(
+            checks=[critical_fail_check], thumbnails=[]
+        ),
     )
 
     resp = client.post(f"/api/jobs/{analyze_job_id}/render", json={"candidate_id": "c1"})

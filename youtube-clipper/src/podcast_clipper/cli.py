@@ -69,7 +69,7 @@ def render_cmd(video_id: str, candidate_id: str) -> None:
         raise click.ClickException(f"source video not found under output/{video_id}/source")
 
     manifest = render.render_candidate(source_files[0], resolved_candidate, video_id)
-    qa_report = qa.run_full_qa(raw_candidate, transcript, manifest)
+    qa_report = qa.run_full_qa(raw_candidate, transcript, manifest, source_files[0])
 
     click.echo(
         json.dumps(

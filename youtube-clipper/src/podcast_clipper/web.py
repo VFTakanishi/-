@@ -111,7 +111,7 @@ def _run_render(job: jobs.Job) -> dict[str, Any]:
     resolved_candidate = boundary.resolve_candidate(raw_candidate, transcript, candidate_id)
 
     manifest = render.render_candidate(source_path, resolved_candidate, video_id)
-    qa_report = qa.run_full_qa(raw_candidate, transcript, manifest)
+    qa_report = qa.run_full_qa(raw_candidate, transcript, manifest, source_path)
 
     return {
         "video_id": video_id,
