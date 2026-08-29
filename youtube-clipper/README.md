@@ -46,9 +46,17 @@ ffmpegでの日本語テキスト描画（ウォーターマーク「VF高西で
 
 ## 起動方法（ブラウザUI）
 
+### Windowsで簡単に起動する（推奨）
+
+`youtube-clipper` フォルダ直下の **`start.bat`をダブルクリック**するだけで起動できます。サーバーが立ち上がると自動的に既定のブラウザで `http://localhost:8000` が開きます。
+
+- `.venv` が存在すればそれを使用します（無ければPATH上のPythonを探します）
+- Pythonが見つからない場合や、依存パッケージ・`ANTHROPIC_API_KEY`が不足している場合は、ウィンドウを閉じずに日本語でその旨を表示します
+- 終了するには、開いたウィンドウで`Ctrl+C`を押すか、ウィンドウを閉じてください
+
+### 手動で起動する場合（Windows以外・上級者向け）
+
 ```bash
-python -m podcast_clipper.web
-# または
 uvicorn podcast_clipper.web:app --reload --port 8000
 ```
 
