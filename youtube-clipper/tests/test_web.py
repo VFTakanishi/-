@@ -10,9 +10,10 @@ wiring end to end.
 import io
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 
-from podcast_clipper import cache, config, ingest, qa, transcribe, web
+from podcast_clipper import boundary, cache, config, ingest, qa, transcribe, web
 from podcast_clipper.models import (
     RawClipCandidate,
     RawUsedSegment,
@@ -98,6 +99,14 @@ def test_analyze_then_render_then_download_flow(monkeypatch, tmp_path):
     candidates = job["result"]["candidates"]
     assert len(candidates) == 3
     assert all(1 <= len(c["segments"]) <= 3 for c in candidates)
+    # regression: total_duration is a ClipCandidate @property, so it must be
+    # added explicitly in _serialize_candidate -- dataclasses.asdict() alone
+    # drops it, which crashed the frontend's `c.total_duration.toFixed(1)`.
+    for c in candidates:
+        assert isinstance(c["total_duration"], (int, float))
+        assert c["total_duration"] == pytest.approx(
+            sum(s["end"] - s["start"] for s in c["segments"])
+        )
 
     # job.input carries video_id/video_title/source_path, and transcribe was
     # handed the correct local source_path -- no YouTube download involved.
@@ -201,3 +210,20 @@ def test_download_blocked_when_qa_has_critical_failure(monkeypatch, tmp_path):
 
     dl = client.get(f"/api/jobs/{analyze_job_id}/render/{render_id}/download")
     assert dl.status_code == 403
+
+
+def test_serialize_candidate_includes_total_duration():
+    """Low-level pin for the exact bug reported in real-machine E2E: the
+    frontend called c.total_duration.toFixed(1), but total_duration is a
+    ClipCandidate @property, so plain dataclasses.asdict(c) silently dropped
+    it from the JSON, leaving c.total_duration undefined in the browser.
+    """
+    transcript = _fake_transcript("webtestvid3")
+    raw_candidate = _fake_raw_candidate()
+    candidate = boundary.resolve_candidate(raw_candidate, transcript, candidate_id="c1")
+
+    data = web._serialize_candidate(candidate)
+
+    assert "total_duration" in data
+    assert data["total_duration"] == candidate.total_duration
+    assert isinstance(data["total_duration"], (int, float))

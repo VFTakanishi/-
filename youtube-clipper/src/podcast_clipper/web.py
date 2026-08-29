@@ -43,7 +43,12 @@ class RenderRequest(BaseModel):
 
 
 def _serialize_candidate(c: ClipCandidate) -> dict[str, Any]:
-    return asdict(c)
+    # total_duration is a @property (derived from segments), so
+    # dataclasses.asdict() -- which only walks declared fields -- omits it;
+    # it must be added explicitly or the frontend never receives it.
+    data = asdict(c)
+    data["total_duration"] = c.total_duration
+    return data
 
 
 def _to_media_url(path: str) -> str:

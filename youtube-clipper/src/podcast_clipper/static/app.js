@@ -192,11 +192,16 @@ function renderCandidates(candidates) {
       )
       .join("");
 
+    const totalDuration =
+      typeof c.total_duration === "number"
+        ? c.total_duration
+        : c.segments.reduce((sum, s) => sum + (s.end - s.start), 0);
+
     card.innerHTML = `
       <h3>${escapeHtml(c.title)}</h3>
       <div class="meta">
         タイプ: ${HOOK_TYPE_LABELS[c.hook_type] || c.hook_type} /
-        尺: ${c.total_duration.toFixed(1)}秒 /
+        尺: ${totalDuration.toFixed(1)}秒 /
         <span class="score">スコア: ${c.score}</span>
       </div>
       <ul class="segments">${segmentsHtml}</ul>
