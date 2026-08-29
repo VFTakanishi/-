@@ -1,11 +1,12 @@
 """FastAPI backend for the browser UI (absolute condition #3).
 
-Flow (absolute condition #2): POST /api/analyze kicks off download ->
-transcribe -> Stage1/Stage2 selection as a background job; the client
-polls GET /api/jobs/{id} until it sees exactly 3 candidates
-(absolute condition #1); the user picks one and POST
-/api/jobs/{id}/render starts rendering+QA for that candidate only; the
-client polls GET /api/jobs/{id}/render/{render_id}; GET .../download
+Flow (absolute condition #2): the user uploads a local video file via
+POST /api/analyze (multipart), which is persisted to disk synchronously
+via ingest.py, then transcribe -> Stage1/Stage2 selection runs as a
+background job; the client polls GET /api/jobs/{id} until it sees
+exactly 3 candidates (absolute condition #1); the user picks one and
+POST /api/jobs/{id}/render starts rendering+QA for that candidate only;
+the client polls GET /api/jobs/{id}/render/{render_id}; GET .../download
 returns the mp4 (plan fix #4: nothing else) once QA allows it.
 """
 from __future__ import annotations
@@ -15,12 +16,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import boundary, cache, clip_selector, config, download, jobs, qa, render, transcribe
+from . import boundary, cache, clip_selector, config, ingest, jobs, qa, render, transcribe
 from .models import ClipCandidate
 
 config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -35,11 +36,6 @@ async def _lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Podcast Clipper", lifespan=_lifespan)
-
-
-class AnalyzeRequest(BaseModel):
-    url: str
-    force_refresh: bool = False
 
 
 class RenderRequest(BaseModel):
@@ -64,20 +60,14 @@ def _serialize_qa(report: qa.QAReport) -> dict[str, Any]:
 
 
 def _run_analyze(job: jobs.Job) -> dict[str, Any]:
-    url = job.input["url"]
+    video_id = job.input["video_id"]
+    video_title = job.input["video_title"]
+    source_path = Path(job.input["source_path"])
     force_refresh = job.input.get("force_refresh", False)
 
-    video_info = download.download_video(url, config.OUTPUT_DIR, force_refresh=force_refresh)
-    job.input["video_id"] = video_info.video_id
-    job.input["video_title"] = video_info.title
-    job.input["source_path"] = str(video_info.path)
-    jobs.save_job(job)
-
-    transcript = transcribe.transcribe_video(
-        video_info.path, video_info.video_id, force_refresh=force_refresh
-    )
+    transcript = transcribe.transcribe_video(source_path, video_id, force_refresh=force_refresh)
     raw_candidates = clip_selector.select_candidates(
-        transcript, video_info.title, force_refresh=force_refresh
+        transcript, video_title, force_refresh=force_refresh
     )
     resolved = [
         boundary.resolve_candidate(rc, transcript, candidate_id=f"c{i + 1}")
@@ -85,8 +75,8 @@ def _run_analyze(job: jobs.Job) -> dict[str, Any]:
     ]
 
     return {
-        "video_id": video_info.video_id,
-        "video_title": video_info.title,
+        "video_id": video_id,
+        "video_title": video_title,
         "candidates": [_serialize_candidate(c) for c in resolved],
     }
 
@@ -129,8 +119,25 @@ def _run_render(job: jobs.Job) -> dict[str, Any]:
 
 
 @app.post("/api/analyze")
-def analyze(req: AnalyzeRequest) -> dict[str, Any]:
-    job = jobs.create_job("analyze", {"url": req.url, "force_refresh": req.force_refresh})
+def analyze(file: UploadFile = File(...), force_refresh: bool = Form(False)) -> dict[str, Any]:
+    # Persisted to disk synchronously, before the background job is created:
+    # UploadFile is request-scoped and must never be handed to a background
+    # thread (its underlying file may already be closed by the time a
+    # background job would get around to reading it).
+    try:
+        result = ingest.ingest_uploaded_file(file.file, file.filename)
+    except ingest.IngestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    job = jobs.create_job(
+        "analyze",
+        {
+            "video_id": result.video_id,
+            "video_title": result.title,
+            "source_path": str(result.path),
+            "force_refresh": force_refresh,
+        },
+    )
     jobs.run_async(job, _run_analyze, running_status="analyzing")
     return {"job_id": job.id}
 

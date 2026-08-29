@@ -75,13 +75,6 @@ FONT_PATH = os.environ.get(
     "PODCAST_CLIPPER_FONT_PATH", "C:/Windows/Fonts/meiryo.ttc"
 )
 
-# --- yt-dlp download (plan fix #8) --------------------------------------
-YT_DLP_FORMAT = (
-    "bestvideo[ext=mp4][height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/"
-    "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/"
-    "best[ext=mp4][height<=1080]/best[height<=1080]/best"
-)
-
 # --- QA thresholds (absolute condition #13) ------------------------------
 BLACKDETECT_MIN_DURATION_SEC = 0.5
 BLACKDETECT_PIXEL_BLACK_TH = 0.10

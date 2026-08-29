@@ -39,11 +39,97 @@ async function getJSON(url) {
   return res.json();
 }
 
+let selectedFile = null;
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function setSelectedFile(file) {
+  selectedFile = file;
+  const infoEl = document.getElementById("file-info");
+  const analyzeBtn = document.getElementById("analyze-btn");
+  if (file) {
+    infoEl.textContent = `${file.name} (${formatBytes(file.size)})`;
+    infoEl.classList.remove("hidden");
+    analyzeBtn.disabled = false;
+  } else {
+    infoEl.classList.add("hidden");
+    analyzeBtn.disabled = true;
+  }
+}
+
+const dropzone = document.getElementById("dropzone");
+const fileInput = document.getElementById("file-input");
+
+fileInput.addEventListener("change", () => {
+  if (fileInput.files.length > 0) setSelectedFile(fileInput.files[0]);
+});
+
+["dragenter", "dragover"].forEach((evt) => {
+  dropzone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    dropzone.classList.add("dragover");
+  });
+});
+
+["dragleave", "drop"].forEach((evt) => {
+  dropzone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    dropzone.classList.remove("dragover");
+  });
+});
+
+dropzone.addEventListener("drop", (e) => {
+  if (e.dataTransfer.files.length > 0) setSelectedFile(e.dataTransfer.files[0]);
+});
+
+function uploadAndAnalyze(file) {
+  return new Promise((resolve, reject) => {
+    const progressEl = document.getElementById("upload-progress");
+    progressEl.classList.remove("hidden");
+    progressEl.textContent = "アップロード中… 0%";
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/analyze");
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const pct = Math.round((e.loaded / e.total) * 100);
+        progressEl.textContent = `アップロード中… ${pct}%`;
+      }
+    };
+    xhr.onload = () => {
+      progressEl.classList.add("hidden");
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(JSON.parse(xhr.responseText));
+      } else {
+        let detail = `HTTP ${xhr.status}`;
+        try {
+          detail = JSON.parse(xhr.responseText).detail || detail;
+        } catch (_) {
+          // ignore parse failure, keep default detail
+        }
+        reject(new Error(detail));
+      }
+    };
+    xhr.onerror = () => {
+      progressEl.classList.add("hidden");
+      reject(new Error("アップロードに失敗しました"));
+    };
+    xhr.send(formData);
+  });
+}
+
 document.getElementById("analyze-btn").addEventListener("click", async () => {
-  const url = document.getElementById("url-input").value.trim();
   const statusEl = document.getElementById("analyze-status");
-  if (!url) {
-    statusEl.textContent = "YouTube URLを入力してください";
+  if (!selectedFile) {
+    statusEl.textContent = "動画ファイルを選択してください";
     statusEl.className = "status error";
     return;
   }
@@ -53,7 +139,7 @@ document.getElementById("analyze-btn").addEventListener("click", async () => {
   document.getElementById("render-section").classList.add("hidden");
 
   try {
-    const { job_id } = await postJSON("/api/analyze", { url });
+    const { job_id } = await uploadAndAnalyze(selectedFile);
     analyzeJobId = job_id;
     pollAnalyze();
   } catch (e) {
@@ -76,7 +162,7 @@ function pollAnalyze() {
         renderCandidates(job.result.candidates);
       } else if (job.status === "interrupted") {
         statusEl.textContent = job.resumable
-          ? "前回の処理が中断されました。キャッシュが残っているため、同じURLで再度解析するとYouTube再ダウンロード等をスキップして再開できます。"
+          ? "前回の処理が中断されました。キャッシュが残っているため、同じファイルを再アップロードすると文字起こし等をスキップして再開できます。"
           : "前回の処理が中断されました。再度解析を実行してください。";
         statusEl.className = "status error";
       } else if (job.status === "failed") {

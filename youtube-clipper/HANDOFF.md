@@ -1,84 +1,77 @@
-# 引き継ぎメモ（youtube-clipper: YouTubeポッドキャスト切り抜きツール）
+# 引き継ぎメモ（youtube-clipper: ポッドキャスト切り抜きツール）
 
-最終更新: 2026-08-24（Linuxサンドボックスでの部分E2E検証を実施した時点）
+最終更新: 2026-08-29（MVP設計変更「YouTube URL取得 → ローカル動画ファイルアップロード」を実装・feature branchへpush済みの時点）
 
 ## 現在地
 
 - **ブランチ**: `claude/youtube-podcast-clip-tool-1qwqlh`（origin にpush済み）
-- **実装状態**: 全モジュール実装済み・`pytest tests/` は51件全てパス（実ffmpeg統合テスト含む）
+- **実装状態**: 全モジュール実装済み・`pytest tests/` は58件全てパス（実ffmpeg統合テスト含む）
 - **mainへは未マージ**（ユーザー指示により、実際のポッドキャスト1本が最後まで正常に完成するまでマージしない）
-- 直近のコミット: `Add YouTube podcast Shorts clipper (browser UI + pipeline)`
 
-## 今日完了した内容
+## MVP設計変更の経緯（2026-08-29）
 
-1. 実装完了報告後、mainマージ前のE2Eテストを依頼された
-2. 本セッションがクラウドLinuxサンドボックス（Windows実機ではない）であることを確認し、ユーザーに「このLinux環境で代行する」承認を得た
-3. **重大な環境制約を2件発見**（詳細は下記「発見した環境ブロッカー」）
-4. ユーザー承認のもと、YouTube以外の実在する日本語音声（パブリックドメイン）で代替検証する方針に切り替え
-5. 実際に以下を検証済み（下記「E2Eテスト結果」参照）:
-   - 依存関係（Python/ffmpeg/ffprobe/yt-dlp/faster-whisper/anthropic/FastAPI等）は全てインストール済み・正常動作
-   - 実際の`podcast_clipper.web`（無改変）をuvicornで起動し、ブラウザ（Playwright/Chromium）で`http://localhost:8000`のUIが実際に正常表示されることをスクリーンショットで確認（日本語文字化けなし）
-   - UIの「解析開始」ボタンを実際にクリックし、実際の`POST /api/analyze`→ジョブ管理（`jobs.py`）→`download.py`の呼び出しが正しく配線されていることを確認（`download.download_video`のみ、テスト用に用意した実音声ファイルを返すようモンキーパッチ。リポジトリのソースコード自体は無変更）
-   - `pytest tests/`（51件）が引き続き全てパス
+以前のMVPは「YouTube URLをyt-dlpで取得 → Whisper文字起こし → …」だったが、以下の理由で**YouTube取得処理をMVPから完全に削除**し、「ローカル動画ファイルをブラウザへアップロード」を入力の起点に変更した。
 
-## E2Eテスト結果
+- YouTube側のbot検知（`Sign in to confirm you're not a bot`）が、GitHub Actions等のデータセンターIPからのyt-dlp取得を恒常的にブロックすることを実測で確認（`player_client=[tv,android,web]`フォールバックでも解消せず）
+- 対象動画はユーザー自身の配信であり、すでに手元にある。YouTubeへ再度取りに行く必要がない
+- ネットワーク依存自体をなくすことで、bot検知・Cookie・PO Token・player_client・データセンターIP問題を設計上まとめて排除
 
-### 使用した代替素材
-- YouTube実ダウンロードがネットワークポリシー上不可能なため、GitHub Release経由で実在するパブリックドメイン日本語音声を取得
-- 出典: `kaiidams/Kokoro-Speech-Dataset`（LibriVox録音・青空文庫テキスト、夏目漱石『こころ』の朗読クリップ34件、本文中の順序通りに結合、実時間 約2分39秒）
-- 映像トラックは到達可能な実写素材が存在しないため、ffmpeg合成のテストパターン映像（1280x720）と合成。**音声は実在する公有音声、映像は合成プレースホルダー**という構成
-- 素材の保存場所: このセッションのスクラッチパッド（`/tmp/.../scratchpad/e2e/`）。**リポジトリには含めていない**（再現する場合は同じ手順でGitHub Releaseから再取得可能。詳細は本ファイル末尾の「代替素材の再現手順」）
+Windowsローカル検証用に使った一時的なBAT/PowerShell/SABR回避パッチは製品設計に一切持ち込んでいない。
 
-### 到達できたところ
-- ブラウザUI表示 ✅（実際にPlaywrightでスクリーンショット確認、日本語表示も正常）
-- URL入力→解析開始ボタン→`POST /api/analyze`→ジョブ作成→`download.py`（モック経由）まで ✅
-- ジョブの`input`に正しく`video_id`・`video_title`・`source_path`が記録されることを確認 ✅
+## 新しいエンドツーエンド処理フロー
 
-### ブロックされた地点
-`transcribe.py`の`faster-whisper`モデル初期化（`WhisperModel(...)`のコンストラクタ）で失敗。原因は後述の環境ブロッカー。**そこから先（Whisper文字起こし→Claude 2段階候補選定→候補3件表示→ユーザー選択→レンダリング→QA→ダウンロード）は本セッションでは実行できていない。**
+1. ブラウザUIで動画ファイルをドラッグ&ドロップ、または「ファイルを選択」で指定し「解析開始」
+2. `POST /api/analyze`（multipart）→ `ingest.ingest_uploaded_file`が**バックグラウンドジョブ開始前に同期的に**ファイルをチャンクストリーミングでディスクへ保存（内容のSHA-256から`video_id`を決定。同一内容の再アップロードは同じ`video_id`になりキャッシュを再利用）
+3. バックグラウンドジョブが`transcribe.transcribe_video(source_path, video_id)`から開始（YouTube取得ステップは存在しない）
+4. `clip_selector.select_candidates`（10分チャンク＋1分オーバーラップの2段階AI選定、キャッシュあり）
+5. `boundary.resolve_candidate`で意味範囲→実秒への変換（3候補、`c1`/`c2`/`c3`）
+6. ブラウザUIに3候補を表示 → ユーザーが1件選択
+7. `POST /api/jobs/{id}/render`で選択した1件のみレンダリング（元映像全体＋ぼかし背景の縦型変換 → Content QA(中間映像) → テキスト焼き込み → Technical QA/音声QA(最終mp4)）
+8. QA重大不合格でなければ`GET .../download`でmp4のみ取得（関連動画設定手順は別途JSON/UIで案内、自動投稿なし）
 
-## 発見した環境ブロッカー（コードのバグではない）
+CLIは`python -m podcast_clipper.cli analyze-file "C:\path\podcast.mp4"`に変更（内部デバッグ専用、ブラウザUIが正式な入口という条件は維持）。
 
-1. **YouTube等へのアクセスがネットワークポリシーで403拒否**
-   `youtube.com` / `archive.org` / `wikimedia.org` が、このサンドボックスの outbound プロキシ（許可リスト方式）で拒否される。`yt-dlp`によるYouTube実ダウンロードは本環境では実行不可能。
-2. **Hugging Face Hubへのアクセスも403拒否 → faster-whisperのモデルダウンロードが失敗**
-   `faster-whisper`は初回実行時にWhisperモデル重みを`huggingface_hub`経由でダウンロードする実装になっており、`huggingface.co`も同じ理由で403拒否される。そのため**このサンドボックスではWhisper文字起こしそのものが実行不可能**（コード側の問題ではなく、モデルの重みを一度も取得できていないことが原因）。
-   - 実際のエラー: `httpx.ProxyError: 403 Forbidden`（`faster_whisper.utils.download_model` → `huggingface_hub.snapshot_download` 内で発生）
-   - 到達可能だったドメイン（参考）: `github.com` / `raw.githubusercontent.com` / `objects.githubusercontent.com`（GitHub Releaseアセット）/ `storage.googleapis.com`
-3. **`ANTHROPIC_API_KEY`が未設定**
-   ユーザー指示により、チャットへのキー貼り付けは求めていない。Claude API呼び出し（候補選定）に到達する前に確認が必要（ブロッカー2により、そもそも今回はそこまで到達しなかった）。
+## 変更ファイル一覧
 
-**重要**: 上記3点はいずれも**このクラウドサンドボックス特有のネットワーク制約**であり、Windows実機（通常のインターネットアクセスがある環境）では発生しないと想定される。今回の検証で**リポジトリのコード自体に不具合は見つからなかった**（見つかった範囲では）。
+- 新規: `src/podcast_clipper/ingest.py`、`tests/test_ingest.py`
+- 削除: `src/podcast_clipper/download.py`、`.github/workflows/youtube-clipper-e2e.yml`
+- 変更: `src/podcast_clipper/{web.py, cli.py, config.py}`、`src/podcast_clipper/static/{index.html, app.js, style.css}`、`tests/test_web.py`、`requirements.txt`（yt-dlp削除・python-multipart追加）、`README.md`、`.github/workflows/youtube-clipper-windows-smoke.yml`（yt-dlp reachabilityステップ削除）
+
+`.env.example`にYouTube固有の環境変数は元々なく、変更不要だった。
+
+## 既知の残存事項
+
+- `main`ブランチには以前のE2E検証準備の一環で`youtube-clipper-e2e.yml`（YouTube URL専用・現在はfeature branchから削除済み）のみをコピーしたコミットが残っている。今回の変更は**feature branchのみ**が対象のため、`main`上のこの古いworkflowファイルは今回未対応（本体コードは元々mainに入っていない）。次回mainへの反映を検討する際に合わせて整理するかどうかはユーザー判断待ち。
+- 実際のポッドキャスト動画ファイルでのWhisper文字起こし〜候補選定〜レンダリングの実データE2Eテストは、本ピボット後まだ実施していない（下記「未完了の作業」参照）。
 
 ## 未完了の作業
 
-- [ ] Whisper文字起こし〜候補3件表示までの実データでの動作確認
+- [ ] 実際の動画ファイルをアップロードしてのWhisper文字起こし〜候補3件表示までの実データ動作確認（faster-whisperモデルの初回ダウンロードにHugging Face到達性が必要。クラウドLinuxサンドボックスでは`huggingface.co`が403で拒否されるため、このセッションでは実行不可。Windows実機またはHugging Faceに到達できる環境で確認する必要がある）
 - [ ] 候補選択→レンダリング→Technical QA→Content QA→ダウンロード可否判定の実データでの動作確認
 - [ ] 完成mp4の実際の目視確認（尺25〜45秒/発話境界/2カット構成/1080x1920/ぼかし背景/字幕なし/常時ウォーターマーク/末尾CTA重畳/日本語文字化けなし/黒画面・フリーズなし/音声存在/QA不合格時DL不可）
 - [ ] 上記で問題が見つかった場合の修正
 - [ ] mainへのマージ判断（**現時点ではマージ不可** — 実際に1本最後まで正常完成していないため）
 
-## 明日最初にやること
+## 次にやること
 
 1. この`HANDOFF.md`を読む
 2. `git status`とブランチ（`claude/youtube-podcast-clip-tool-1qwqlh`）を確認
-3. **実行環境をWindows実機（または少なくとも通常のインターネットアクセスがある環境）に変更する**（本セッションのクラウドサンドボックスではWhisperモデルのダウンロードすらできないため、E2Eテスト続行は実質的に不可能）
-4. Windows実機で `youtube-clipper/README.md` のセットアップ手順に従い環境構築
-5. `ANTHROPIC_API_KEY`を`.env`に設定（チャットに貼り付けない）
-6. 実際のYouTubeポッドキャストURLで一連の流れ（解析→候補3件→選択→レンダリング→QA→ダウンロード）を実行し、「未完了の作業」の各項目を確認
-7. 問題があれば修正→`pytest tests/`再実行→再確認
-8. 実際の1本が最後まで正常に完成したらmainマージを検討（ユーザーの最終判断を仰ぐ）
+3. Hugging Face Hub（`huggingface.co`）と通常のインターネットアクセスがある環境（Windows実機等）で環境構築（`README.md`のセットアップ手順に従う）
+4. `ANTHROPIC_API_KEY`を`.env`に設定（チャットに貼り付けない）
+5. ブラウザUIで実際の動画ファイルをアップロードし、一連の流れ（解析→候補3件→選択→レンダリング→QA→ダウンロード）を実行し、「未完了の作業」の各項目を確認
+6. 問題があれば修正→`pytest tests/`再実行→再確認
+7. 実際の1本が最後まで正常に完成したらmainマージを検討（ユーザーの最終判断を仰ぐ）
 
 ## 必要なAPIキー・環境設定
 
 - `ANTHROPIC_API_KEY`（必須。Claude API候補選定に使用）— `.env`に設定。チャットに貼り付けない
 - `PODCAST_CLIPPER_FONT_PATH`（Windows実機では既定値`C:/Windows/Fonts/meiryo.ttc`を確認し、問題があれば単体`.ttf/.otf`日本語フォントに変更）
 - ffmpeg/ffprobeがPATHに通っていること
-- 通常のインターネットアクセス（YouTube・Hugging Face Hubへ到達可能なこと）— 本クラウドサンドボックスでは両方とも403でブロックされていた
+- faster-whisperの初回モデル取得のためHugging Face Hub（`huggingface.co`）に到達できること（YouTubeへの到達性は不要になった）
 
 ## 14項目の絶対条件（変更しないこと）
 
-以下はユーザーとの複数回の合意事項であり、明日以降の作業でも**変更・簡略化・追加機能の投入をしないこと**。
+以下はユーザーとの複数回の合意事項であり、今後の作業でも**変更・簡略化・追加機能の投入をしないこと**。
 
 1. 候補は3件
 2. ユーザーが3件から1件選択した後にのみレンダリング
@@ -95,18 +88,4 @@
 13. Technical QA / Content QA（黒画面・静止画・音声存在・発話整合性・編集境界整合性を個別チェック）を実施し、重大不合格時はダウンロード禁止。映像Content QAはテキスト焼き込み前の中間映像に対して実行（焼き込み後の最終mp4には実行しない）
 14. YouTube「関連動画」機能を本編誘導の主要導線とする。自動投稿はMVP対象外。`/download`APIはmp4のみ返却し、関連動画設定手順はレンダリング結果JSON/UIに分離
 
-追加しないもの: 全文字幕、顔検出クロップ、自動リフレーム、人物追跡、クロスフェード、YouTube自動投稿、Celery/Redis等の不要な外部インフラ、その他今回決めていない新機能。
-
-## 代替素材の再現手順（参考）
-
-本セッションのスクラッチパッドは次回のセッションには引き継がれないため、同様の代替検証を再度行う場合は以下で再現できる:
-
-```bash
-curl -sSL -o sample.zip \
-  "https://github.com/kaiidams/Kokoro-Speech-Dataset/releases/download/1.3/kokoro-speech-v1_3-sample-flac.zip"
-unzip sample.zip -d extracted
-# extracted/wavs/kokoro-by-soseki-natsume-*.flac を番号順（=本文中の位置順）に結合
-# → ffmpeg concatで1本の音声にし、lavfi testsrc2等の合成映像と合成してmp4化
-```
-
-ただし本命はWindows実機での**実際のYouTube URL**によるテストであり、この代替素材はあくまで昨日ネットワーク制約下で可能だった範囲の代替検証用。
+追加しないもの: 全文字幕、顔検出クロップ、自動リフレーム、人物追跡、クロスフェード、YouTube自動投稿・再取得、Celery/Redis等の不要な外部インフラ、その他今回決めていない新機能。

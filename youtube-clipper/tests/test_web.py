@@ -1,14 +1,18 @@
 """End-to-end wiring test for the FastAPI app via TestClient (plan:
 "web.pyのAPIをFastAPIのTestClientで疎通確認"). The expensive pipeline calls
-(YouTube download, Whisper, Claude, ffmpeg) are mocked so this only
-verifies the HTTP wiring / job orchestration, not the pipeline internals
-(those are covered by the other test modules).
+(Whisper, Claude, ffmpeg) are mocked so this only verifies the HTTP wiring
+/ job orchestration, not the pipeline internals (those are covered by the
+other test modules). The multipart upload itself goes through the real
+ingest.ingest_uploaded_file (only transcribe/clip_selector/render/qa are
+mocked), so this also exercises the real upload -> video_id -> source_path
+wiring end to end.
 """
+import io
 import time
 
 from fastapi.testclient import TestClient
 
-from podcast_clipper import cache, config, download, qa, transcribe, web
+from podcast_clipper import cache, config, ingest, qa, transcribe, web
 from podcast_clipper.models import (
     RawClipCandidate,
     RawUsedSegment,
@@ -17,6 +21,8 @@ from podcast_clipper.models import (
     TranscriptSegment,
     TranscriptWord,
 )
+
+_FAKE_VIDEO_BYTES = b"fake mp4 bytes for upload wiring test"
 
 
 def _fake_transcript(video_id):
@@ -57,15 +63,13 @@ def _wait_for_status(client, url, target_statuses, timeout=5.0):
 
 
 def test_analyze_then_render_then_download_flow(monkeypatch, tmp_path):
-    video_id = "webtestvid"
+    monkeypatch.setattr(ingest, "_probe_duration", lambda path: 6.0)
 
-    monkeypatch.setattr(
-        download, "download_video",
-        lambda url, out_root, force_refresh=False: download.VideoInfo(
-            video_id=video_id, title="テスト番組", duration=6.0, path=tmp_path / "source.mp4"
-        ),
-    )
+    captured = {}
+
     def fake_transcribe(path, vid, force_refresh=False):
+        captured["source_path"] = path
+        captured["video_id"] = vid
         t = _fake_transcript(vid)
         cache.save_transcript(t)
         return t
@@ -82,7 +86,10 @@ def test_analyze_then_render_then_download_flow(monkeypatch, tmp_path):
 
     client = TestClient(web.app)
 
-    resp = client.post("/api/analyze", json={"url": "https://youtu.be/xxxx"})
+    resp = client.post(
+        "/api/analyze",
+        files={"file": ("テスト番組.mp4", io.BytesIO(_FAKE_VIDEO_BYTES), "video/mp4")},
+    )
     assert resp.status_code == 200
     analyze_job_id = resp.json()["job_id"]
 
@@ -91,6 +98,14 @@ def test_analyze_then_render_then_download_flow(monkeypatch, tmp_path):
     candidates = job["result"]["candidates"]
     assert len(candidates) == 3
     assert all(1 <= len(c["segments"]) <= 3 for c in candidates)
+
+    # job.input carries video_id/video_title/source_path, and transcribe was
+    # handed the correct local source_path -- no YouTube download involved.
+    assert job["input"]["video_id"]
+    assert job["input"]["video_title"] == "テスト番組.mp4"
+    assert job["input"]["source_path"]
+    assert str(captured["source_path"]) == job["input"]["source_path"]
+    assert captured["video_id"] == job["input"]["video_id"]
 
     # --- render a candidate, with render.render_candidate/qa.run_full_qa mocked ---
     fake_final = tmp_path / "final.mp4"
@@ -131,13 +146,8 @@ def test_analyze_then_render_then_download_flow(monkeypatch, tmp_path):
 
 
 def test_download_blocked_when_qa_has_critical_failure(monkeypatch, tmp_path):
-    video_id = "webtestvid2"
-    monkeypatch.setattr(
-        download, "download_video",
-        lambda url, out_root, force_refresh=False: download.VideoInfo(
-            video_id=video_id, title="テスト番組2", duration=6.0, path=tmp_path / "source.mp4"
-        ),
-    )
+    monkeypatch.setattr(ingest, "_probe_duration", lambda path: 6.0)
+
     def fake_transcribe(path, vid, force_refresh=False):
         t = _fake_transcript(vid)
         cache.save_transcript(t)
@@ -154,7 +164,10 @@ def test_download_blocked_when_qa_has_critical_failure(monkeypatch, tmp_path):
     )
 
     client = TestClient(web.app)
-    resp = client.post("/api/analyze", json={"url": "https://youtu.be/yyyy"})
+    resp = client.post(
+        "/api/analyze",
+        files={"file": ("テスト番組2.mp4", io.BytesIO(_FAKE_VIDEO_BYTES), "video/mp4")},
+    )
     analyze_job_id = resp.json()["job_id"]
     _wait_for_status(client, f"/api/jobs/{analyze_job_id}", {"completed", "failed"})
 

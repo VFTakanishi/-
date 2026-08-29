@@ -10,7 +10,7 @@ from pathlib import Path
 
 import click
 
-from . import boundary, cache, clip_selector, config, download, qa, render, transcribe
+from . import boundary, cache, clip_selector, config, ingest, qa, render, transcribe
 
 
 @click.group()
@@ -18,17 +18,20 @@ def cli() -> None:
     pass
 
 
-@cli.command()
-@click.argument("url")
+@cli.command(name="analyze-file")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False))
 @click.option("--force-refresh", is_flag=True, default=False)
-def analyze(url: str, force_refresh: bool) -> None:
-    """Download, transcribe, and select 3 candidates for URL. Prints JSON."""
-    video_info = download.download_video(url, config.OUTPUT_DIR, force_refresh=force_refresh)
+def analyze_file(path: str, force_refresh: bool) -> None:
+    """Ingest a local video file, transcribe, and select 3 candidates. Prints JSON."""
+    source = Path(path)
+    with open(source, "rb") as fileobj:
+        result = ingest.ingest_uploaded_file(fileobj, source.name)
+
     transcript = transcribe.transcribe_video(
-        video_info.path, video_info.video_id, force_refresh=force_refresh
+        result.path, result.video_id, force_refresh=force_refresh
     )
     raw_candidates = clip_selector.select_candidates(
-        transcript, video_info.title, force_refresh=force_refresh
+        transcript, result.title, force_refresh=force_refresh
     )
     resolved = [
         boundary.resolve_candidate(rc, transcript, candidate_id=f"c{i + 1}")
@@ -37,8 +40,8 @@ def analyze(url: str, force_refresh: bool) -> None:
     click.echo(
         json.dumps(
             {
-                "video_id": video_info.video_id,
-                "video_title": video_info.title,
+                "video_id": result.video_id,
+                "video_title": result.title,
                 "candidates": [asdict(c) for c in resolved],
             },
             ensure_ascii=False,

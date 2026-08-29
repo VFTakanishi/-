@@ -8,14 +8,23 @@
 </head>
 <body>
 <main class="app">
-  <h1>YouTube ポッドキャスト切り抜きツール</h1>
+  <h1>ポッドキャスト切り抜きツール</h1>
 
   <section id="analyze-section" class="card">
-    <h2>1. 解析</h2>
-    <div class="row">
-      <input id="url-input" type="text" placeholder="YouTube URLを入力" />
-      <button id="analyze-btn">解析開始</button>
+    <h2>1. 動画ファイルをアップロード</h2>
+    <div id="dropzone" class="dropzone">
+      <p>ここに動画ファイルをドラッグ＆ドロップ</p>
+      <p>または</p>
+      <label class="file-label">
+        ファイルを選択
+        <input id="file-input" type="file" accept="video/*" hidden />
+      </label>
+      <div id="file-info" class="file-info hidden"></div>
     </div>
+    <div class="row">
+      <button id="analyze-btn" disabled>解析開始</button>
+    </div>
+    <div id="upload-progress" class="status hidden"></div>
     <div id="analyze-status" class="status"></div>
   </section>
 
