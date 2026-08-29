@@ -49,7 +49,7 @@ _CANDIDATE_SCHEMA = {
             },
         },
         "hook_text": {"type": "string"},
-        "cta_end_text": {"type": "string"},
+        "opening_hook_strength": {"type": "integer", "minimum": 0, "maximum": 100},
         "title": {"type": "string"},
         "description": {"type": "string"},
         "score": {"type": "integer", "minimum": 0, "maximum": 100},
@@ -60,7 +60,7 @@ _CANDIDATE_SCHEMA = {
         "hook_type",
         "segments",
         "hook_text",
-        "cta_end_text",
+        "opening_hook_strength",
         "title",
         "description",
         "score",
@@ -68,6 +68,31 @@ _CANDIDATE_SCHEMA = {
         "caveats",
     ],
 }
+
+# Weak "warm-up" openings explicitly called out as unacceptable: a mechanical
+# safety net that backs up Claude's own opening_hook_strength self-rating by
+# catching the most obvious literal cases. This checks the *actual spoken*
+# transcript text of the candidate's first (hook) segment, never the
+# on-screen hook_text overlay -- a strong overlay must never excuse a weak
+# spoken opening.
+_WEAK_OPENING_PREFIXES = [
+    "今回は", "今日は", "ということで", "えー", "えーと", "えっと", "あの", "まあ", "さて",
+]
+
+
+def _looks_like_weak_opening(text: str) -> bool:
+    stripped = text.strip()
+    return any(stripped.startswith(p) for p in _WEAK_OPENING_PREFIXES)
+
+
+def _force_first_segment_is_hook(raw: RawClipCandidate) -> None:
+    """The first segment of a candidate must be tagged role=hook (this is a
+    labeling/consistency requirement, not a semantic judgement -- whatever
+    plays first *is* the hook by definition), so this corrects it directly
+    rather than asking Claude to regenerate over a mere label mismatch.
+    """
+    if raw.segments and raw.segments[0].role != "hook":
+        raw.segments[0].role = "hook"
 
 
 def _client() -> anthropic.Anthropic:
@@ -94,7 +119,7 @@ def _raw_candidate_from_tool_input(d: dict) -> RawClipCandidate:
             for s in d["segments"]
         ],
         hook_text=d["hook_text"],
-        cta_end_text=d["cta_end_text"],
+        opening_hook_strength=d["opening_hook_strength"],
         title=d["title"],
         description=d["description"],
         score=d["score"],
@@ -222,7 +247,7 @@ def rank_and_finalize(
                     for s in c.segments
                 ],
                 "hook_text": c.hook_text,
-                "cta_end_text": c.cta_end_text,
+                "opening_hook_strength": c.opening_hook_strength,
                 "title": c.title,
                 "description": c.description,
                 "score": c.score,
@@ -275,12 +300,50 @@ def rank_and_finalize(
     raise RuntimeError("Claude did not return submit_final_candidates")
 
 
+def _opening_text(raw: RawClipCandidate, transcript: Transcript) -> str:
+    return transcript.segment_by_id(raw.segments[0].start_segment_id).text
+
+
+def _find_issues(
+    finalists: list[RawClipCandidate], transcript: Transcript
+) -> list[str]:
+    """Mechanical validation the AI's own judgement can't be fully trusted
+    to self-enforce: duration range (unchanged from before) and spoken
+    opening strength (new). Both feed the same feedback+retry pass rather
+    than separate mechanisms.
+    """
+    issues = []
+    for i, c in enumerate(finalists):
+        dur = _candidate_duration(c, transcript)
+        if not (config.DURATION_HARD_MIN_SEC <= dur <= config.DURATION_HARD_MAX_SEC):
+            issues.append(
+                f"候補{i + 1}の合計尺が{dur:.1f}秒で、目標範囲"
+                f"({config.DURATION_HARD_MIN_SEC:.0f}〜{config.DURATION_HARD_MAX_SEC:.0f}秒)"
+                "から外れています。区間の取り方を見直してください。"
+            )
+
+        opening_text = _opening_text(c, transcript)
+        if c.opening_hook_strength < config.MIN_OPENING_HOOK_STRENGTH or _looks_like_weak_opening(
+            opening_text
+        ):
+            issues.append(
+                f"候補{i + 1}: 冒頭の実際の発言「{opening_text}」が弱い"
+                f"（助走・前置き的、または opening_hook_strength={c.opening_hook_strength} が低すぎます）。"
+                "最初の1〜3秒で強い主張・意外な事実・明確な疑問・結論先出し・"
+                "具体的で続きを聞きたくなる一言・強い違和感/対立/問題提起のいずれかを満たす"
+                "実際の発言から始まるsegment_idを選び直してください。"
+                "元動画の時系列上の最初から始める必要はありません。"
+            )
+    return issues
+
+
 def select_candidates(
     transcript: Transcript, video_title: str, force_refresh: bool = False
 ) -> list[RawClipCandidate]:
     """Runs Stage1 -> Stage2 (with caching) and returns exactly 3 candidates,
     validating their total duration against config.DURATION_HARD_*_SEC and
-    retrying Stage2 (once) with feedback if any candidate is out of range.
+    their spoken opening strength against config.MIN_OPENING_HOOK_STRENGTH,
+    retrying Stage2 (once) with feedback if any candidate fails either check.
     """
     if not force_refresh:
         cached = cache.load_stage2(transcript.video_id)
@@ -293,34 +356,34 @@ def select_candidates(
         raise RuntimeError("Stage1 produced no candidates for this video")
 
     finalists = rank_and_finalize(all_candidates, transcript, video_title)
+    for c in finalists:
+        _force_first_segment_is_hook(c)
 
     for attempt in range(config.MAX_STAGE2_RETRIES):
-        durations = [_candidate_duration(c, transcript) for c in finalists]
-        out_of_range = [
-            (i, dur)
-            for i, dur in enumerate(durations)
-            if not (config.DURATION_HARD_MIN_SEC <= dur <= config.DURATION_HARD_MAX_SEC)
-        ]
-        if not out_of_range:
+        issues = _find_issues(finalists, transcript)
+        if not issues:
             break
-        feedback_lines = [
-            f"候補{i + 1}の合計尺が{dur:.1f}秒で、目標範囲"
-            f"({config.DURATION_HARD_MIN_SEC:.0f}〜{config.DURATION_HARD_MAX_SEC:.0f}秒)"
-            "から外れています。区間の取り方を見直してください。"
-            for i, dur in out_of_range
-        ]
         finalists = rank_and_finalize(
-            all_candidates, transcript, video_title, feedback="\n".join(feedback_lines)
+            all_candidates, transcript, video_title, feedback="\n".join(issues)
         )
-    else:
-        # Retries exhausted; keep the result but flag any still out-of-range
-        # candidate's caveats so the UI surfaces it to the user.
         for c in finalists:
+            _force_first_segment_is_hook(c)
+    else:
+        # Retries exhausted; keep the result but flag any still-failing
+        # candidate's caveats so the UI surfaces it to the user, rather than
+        # crashing the whole analyze job over a still-imperfect candidate.
+        for i, c in enumerate(finalists):
             dur = _candidate_duration(c, transcript)
+            notes = []
             if not (config.DURATION_HARD_MIN_SEC <= dur <= config.DURATION_HARD_MAX_SEC):
-                c.caveats = (
-                    c.caveats + f" / 尺が目標範囲外（{dur:.1f}秒）"
-                ).strip(" /")
+                notes.append(f"尺が目標範囲外（{dur:.1f}秒）")
+            opening_text = _opening_text(c, transcript)
+            if c.opening_hook_strength < config.MIN_OPENING_HOOK_STRENGTH or _looks_like_weak_opening(
+                opening_text
+            ):
+                notes.append("冒頭の発言が弱い可能性")
+            if notes:
+                c.caveats = (c.caveats + " / " + " / ".join(notes)).strip(" /")
 
     cache.save_stage2(transcript.video_id, finalists)
     return finalists

@@ -89,15 +89,18 @@ def load_transcript(video_id: str) -> Transcript | None:
 
 
 def save_stage1(video_id: str, chunk_results: list[dict]) -> None:
-    serializable = [
-        {
-            "chunk_index": chunk["chunk_index"],
-            "candidates": [asdict(c) for c in chunk["candidates"]],
-        }
-        for chunk in chunk_results
-    ]
+    payload = {
+        "schema_version": config.CANDIDATE_SCHEMA_VERSION,
+        "chunks": [
+            {
+                "chunk_index": chunk["chunk_index"],
+                "candidates": [asdict(c) for c in chunk["candidates"]],
+            }
+            for chunk in chunk_results
+        ],
+    }
     _atomic_write_text(
-        stage1_path(video_id), json.dumps(serializable, ensure_ascii=False, indent=2)
+        stage1_path(video_id), json.dumps(payload, ensure_ascii=False, indent=2)
     )
 
 
@@ -106,12 +109,18 @@ def load_stage1(video_id: str) -> list[dict] | None:
     if not path.exists():
         return None
     raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or raw.get("schema_version") != config.CANDIDATE_SCHEMA_VERSION:
+        # Stale (pre-versioning) or schema-incompatible cache from before a
+        # clip_selector.py prompt/schema change: treat as a miss so the
+        # caller recomputes Stage1 fresh, rather than trying to deserialize
+        # old-shape data.
+        return None
     return [
         {
             "chunk_index": chunk["chunk_index"],
             "candidates": [_raw_candidate_from_dict(c) for c in chunk["candidates"]],
         }
-        for chunk in raw
+        for chunk in raw["chunks"]
     ]
 
 
@@ -119,9 +128,12 @@ def load_stage1(video_id: str) -> list[dict] | None:
 
 
 def save_stage2(video_id: str, candidates: list[RawClipCandidate]) -> None:
+    payload = {
+        "schema_version": config.CANDIDATE_SCHEMA_VERSION,
+        "candidates": [asdict(c) for c in candidates],
+    }
     _atomic_write_text(
-        stage2_path(video_id),
-        json.dumps([asdict(c) for c in candidates], ensure_ascii=False, indent=2),
+        stage2_path(video_id), json.dumps(payload, ensure_ascii=False, indent=2)
     )
 
 
@@ -130,7 +142,9 @@ def load_stage2(video_id: str) -> list[RawClipCandidate] | None:
     if not path.exists():
         return None
     raw = json.loads(path.read_text(encoding="utf-8"))
-    return [_raw_candidate_from_dict(c) for c in raw]
+    if not isinstance(raw, dict) or raw.get("schema_version") != config.CANDIDATE_SCHEMA_VERSION:
+        return None
+    return [_raw_candidate_from_dict(c) for c in raw["candidates"]]
 
 
 def _raw_candidate_from_dict(d: dict) -> RawClipCandidate:
@@ -138,7 +152,7 @@ def _raw_candidate_from_dict(d: dict) -> RawClipCandidate:
         hook_type=d["hook_type"],
         segments=[RawUsedSegment(**s) for s in d["segments"]],
         hook_text=d["hook_text"],
-        cta_end_text=d["cta_end_text"],
+        opening_hook_strength=d["opening_hook_strength"],
         title=d["title"],
         description=d["description"],
         score=d["score"],

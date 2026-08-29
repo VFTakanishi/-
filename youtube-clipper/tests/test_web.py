@@ -46,7 +46,7 @@ def _fake_raw_candidate():
             RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
             RawUsedSegment(role="answer", start_segment_id=1, end_segment_id=1),
         ],
-        hook_text="フック", cta_end_text="本編は関連動画から",
+        hook_text="フック", opening_hook_strength=85,
         title="タイトル", description="説明", score=88, reasoning="理由", caveats="",
     )
 
@@ -107,6 +107,11 @@ def test_analyze_then_render_then_download_flow(monkeypatch, tmp_path):
         assert c["total_duration"] == pytest.approx(
             sum(s["end"] - s["start"] for s in c["segments"])
         )
+        # the "冒頭の実音声" UI feature reads segments[0].text directly off
+        # this API response (real transcript text, never AI-generated) --
+        # confirm the data it needs is actually present.
+        assert c["segments"][0]["role"] == "hook"
+        assert c["segments"][0]["text"]
 
     # job.input carries video_id/video_title/source_path, and transcribe was
     # handed the correct local source_path -- no YouTube download involved.
@@ -124,7 +129,7 @@ def test_analyze_then_render_then_download_flow(monkeypatch, tmp_path):
         return RenderManifest(
             video_id=video_id_, candidate_id=candidate.id, segments=candidate.segments,
             hook_text=candidate.hook_text, watermark_text=config.WATERMARK_TEXT,
-            cta_end_text=candidate.cta_end_text, total_duration=candidate.total_duration,
+            total_duration=candidate.total_duration,
             intermediate_video_path=str(tmp_path / "mid.mp4"),
             final_video_path=str(fake_final),
         )
@@ -187,7 +192,7 @@ def test_download_blocked_when_qa_has_critical_failure(monkeypatch, tmp_path):
         return RenderManifest(
             video_id=video_id_, candidate_id=candidate.id, segments=candidate.segments,
             hook_text=candidate.hook_text, watermark_text=config.WATERMARK_TEXT,
-            cta_end_text=candidate.cta_end_text, total_duration=candidate.total_duration,
+            total_duration=candidate.total_duration,
             intermediate_video_path=str(tmp_path / "mid2.mp4"),
             final_video_path=str(fake_final),
         )

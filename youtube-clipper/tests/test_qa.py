@@ -245,12 +245,12 @@ def test_boundary_integrity_qa_passes_when_manifest_matches_recomputation():
     raw = RawClipCandidate(
         hook_type="story",
         segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=1)],
-        hook_text="h", cta_end_text="c", title="t", description="d", score=1, reasoning="r", caveats="",
+        hook_text="h", opening_hook_strength=80, title="t", description="d", score=1, reasoning="r", caveats="",
     )
     resolved = boundary.resolve_candidate(raw, transcript, candidate_id="c1")
     manifest = RenderManifest(
         video_id="vidQ", candidate_id="c1", segments=resolved.segments,
-        hook_text="h", watermark_text="w", cta_end_text="c",
+        hook_text="h", watermark_text="w",
         total_duration=resolved.total_duration,
         intermediate_video_path="mid.mp4", final_video_path="final.mp4",
     )
@@ -263,12 +263,12 @@ def test_boundary_integrity_qa_fails_when_manifest_diverges():
     raw = RawClipCandidate(
         hook_type="story",
         segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=1)],
-        hook_text="h", cta_end_text="c", title="t", description="d", score=1, reasoning="r", caveats="",
+        hook_text="h", opening_hook_strength=80, title="t", description="d", score=1, reasoning="r", caveats="",
     )
     tampered_segment = UsedSegment(role="hook", start=999.0, end=1000.0, text="wrong")
     manifest = RenderManifest(
         video_id="vidQ", candidate_id="c1", segments=[tampered_segment],
-        hook_text="h", watermark_text="w", cta_end_text="c",
+        hook_text="h", watermark_text="w",
         total_duration=1.0,
         intermediate_video_path="mid.mp4", final_video_path="final.mp4",
     )
@@ -285,12 +285,12 @@ def test_speech_start_alignment_qa_uses_first_segment_only():
             RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
             RawUsedSegment(role="answer", start_segment_id=1, end_segment_id=1),
         ],
-        hook_text="h", cta_end_text="c", title="t", description="d", score=1, reasoning="r", caveats="",
+        hook_text="h", opening_hook_strength=80, title="t", description="d", score=1, reasoning="r", caveats="",
     )
     resolved = boundary.resolve_candidate(raw, transcript, candidate_id="c1")
     manifest = RenderManifest(
         video_id="vidQ", candidate_id="c1", segments=resolved.segments,
-        hook_text="h", watermark_text="w", cta_end_text="c",
+        hook_text="h", watermark_text="w",
         total_duration=resolved.total_duration,
         intermediate_video_path="mid.mp4", final_video_path="final.mp4",
     )
@@ -307,12 +307,12 @@ def test_run_full_qa_runs_video_content_qa_on_intermediate_only(monkeypatch):
     raw = RawClipCandidate(
         hook_type="story",
         segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=1)],
-        hook_text="h", cta_end_text="c", title="t", description="d", score=1, reasoning="r", caveats="",
+        hook_text="h", opening_hook_strength=80, title="t", description="d", score=1, reasoning="r", caveats="",
     )
     resolved = boundary.resolve_candidate(raw, transcript, candidate_id="c1")
     manifest = RenderManifest(
         video_id="vidQ", candidate_id="c1", segments=resolved.segments,
-        hook_text="h", watermark_text="w", cta_end_text="c",
+        hook_text="h", watermark_text="w",
         total_duration=resolved.total_duration,
         intermediate_video_path="intermediate_novtext.mp4", final_video_path="final.mp4",
     )

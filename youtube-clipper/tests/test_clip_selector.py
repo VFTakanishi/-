@@ -47,11 +47,11 @@ def test_usable_segments_excludes_only_when_explicitly_configured(monkeypatch):
     assert len(usable) < len(transcript.segments)
 
 
-def _raw_candidate(start_id, end_id):
+def _raw_candidate(start_id, end_id, role="hook", opening_hook_strength=80):
     return RawClipCandidate(
         hook_type="story",
-        segments=[RawUsedSegment(role="hook", start_segment_id=start_id, end_segment_id=end_id)],
-        hook_text="h", cta_end_text="c", title="t", description="d",
+        segments=[RawUsedSegment(role=role, start_segment_id=start_id, end_segment_id=end_id)],
+        hook_text="h", opening_hook_strength=opening_hook_strength, title="t", description="d",
         score=80, reasoning="r", caveats="",
     )
 
@@ -84,6 +84,68 @@ def test_select_candidates_retries_once_on_out_of_range_duration(monkeypatch):
 
     assert call_count["n"] == 2  # exactly one retry, per config.MAX_STAGE2_RETRIES=1
     assert len(result) == 3
+
+
+def test_select_candidates_retries_when_opening_hook_is_weak(monkeypatch):
+    """Stage2 must not settle for a candidate whose *actual spoken* opening
+    is weak, even if its overall score/duration look fine -- it should
+    retry with feedback and prefer a candidate whose real transcript
+    opening is strong.
+    """
+    transcript = _long_transcript(minutes=1)  # segments 0/1/2, 20s apart
+    # give segment 0 a literal weak "warm-up" opening the prefix list catches
+    transcript.segments[0].text = "今回はトランプ関税について話していきます"
+
+    monkeypatch.setattr(config, "MAX_STAGE2_RETRIES", 1)
+    monkeypatch.setattr(
+        clip_selector, "run_stage1",
+        lambda t, title, force_refresh=False: [
+            {"chunk_index": 0, "candidates": [_raw_candidate(0, 0), _raw_candidate(2, 2)]}
+        ],
+    )
+
+    call_count = {"n": 0}
+
+    def fake_rank_and_finalize(all_candidates, transcript, video_title, feedback=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # weak spoken opening (segment 0's literal "warm-up" text)
+            return [_raw_candidate(0, 0) for _ in range(3)]
+        # after feedback: a strong opening (segment 2, untouched text)
+        return [_raw_candidate(2, 2) for _ in range(3)]
+
+    monkeypatch.setattr(clip_selector, "rank_and_finalize", fake_rank_and_finalize)
+
+    result = clip_selector.select_candidates(transcript, "タイトル")
+
+    assert call_count["n"] == 2  # exactly one retry
+    assert all(c.segments[0].start_segment_id == 2 for c in result)
+
+
+def test_select_candidates_forces_first_segment_role_to_hook(monkeypatch):
+    """segments[0].role must always be "hook" in the final candidates, even
+    if Claude tagged it differently -- this is a labeling/consistency fix,
+    not a semantic re-decision, so it's corrected mechanically rather than
+    triggering a retry.
+    """
+    transcript = _long_transcript(minutes=1)
+
+    monkeypatch.setattr(
+        clip_selector, "run_stage1",
+        lambda t, title, force_refresh=False: [
+            {"chunk_index": 0, "candidates": [_raw_candidate(0, 0)]}
+        ],
+    )
+    monkeypatch.setattr(
+        clip_selector, "rank_and_finalize",
+        lambda all_candidates, transcript, video_title, feedback=None: [
+            _raw_candidate(0, 0, role="context") for _ in range(3)
+        ],
+    )
+
+    result = clip_selector.select_candidates(transcript, "タイトル")
+
+    assert all(c.segments[0].role == "hook" for c in result)
 
 
 def test_select_candidates_caches_and_skips_recompute(monkeypatch):

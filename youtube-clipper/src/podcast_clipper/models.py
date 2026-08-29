@@ -71,7 +71,7 @@ class RawClipCandidate:
     hook_type: HookType
     segments: list[RawUsedSegment]
     hook_text: str
-    cta_end_text: str
+    opening_hook_strength: int
     title: str
     description: str
     score: int
@@ -85,6 +85,10 @@ class RawClipCandidate:
             )
         if not (0 <= self.score <= 100):
             raise ValueError(f"score must be within 0-100 (got {self.score})")
+        if not (0 <= self.opening_hook_strength <= 100):
+            raise ValueError(
+                f"opening_hook_strength must be within 0-100 (got {self.opening_hook_strength})"
+            )
 
 
 @dataclass
@@ -118,7 +122,7 @@ class ClipCandidate:
     hook_type: HookType
     segments: list[UsedSegment]
     hook_text: str
-    cta_end_text: str
+    opening_hook_strength: int
     title: str
     description: str
     score: int
@@ -132,6 +136,10 @@ class ClipCandidate:
             )
         if not (0 <= self.score <= 100):
             raise ValueError(f"score must be within 0-100 (got {self.score})")
+        if not (0 <= self.opening_hook_strength <= 100):
+            raise ValueError(
+                f"opening_hook_strength must be within 0-100 (got {self.opening_hook_strength})"
+            )
 
     @property
     def total_duration(self) -> float:
@@ -152,7 +160,6 @@ class RenderManifest:
     segments: list[UsedSegment]
     hook_text: str
     watermark_text: str
-    cta_end_text: str
     total_duration: float
     intermediate_video_path: str
     final_video_path: str

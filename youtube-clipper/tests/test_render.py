@@ -11,7 +11,7 @@ from podcast_clipper.models import ClipCandidate, UsedSegment
 def _candidate(segments):
     return ClipCandidate(
         id="c1", hook_type="story", segments=segments, hook_text="つかみのテキスト",
-        cta_end_text="本編は関連動画から", title="t", description="d",
+        opening_hook_strength=80, title="t", description="d",
         score=80, reasoning="r", caveats="",
     )
 
@@ -41,6 +41,30 @@ def test_trim_concat_filter_supports_single_and_triple_segment_candidates():
     ]
     assert render._trim_concat_and_verticalize_filter(one).count("[0:v]trim=start=") == 1
     assert render._trim_concat_and_verticalize_filter(three).count("[0:v]trim=start=") == 3
+
+
+def test_apply_text_overlays_never_builds_a_cta_spec(monkeypatch, tmp_path):
+    """cta_end_text was retired entirely (an AI-authored closing CTA risked
+    asserting unverified claims about the full episode). This pins that
+    apply_text_overlays only ever burns in the watermark and hook_text --
+    never a third, end-of-clip spec -- so no such subtitle can reappear.
+    """
+    captured = {}
+
+    def fake_chain(input_label, output_label, specs, tmp_dir):
+        captured["specs"] = specs
+        return f"[{input_label}]null[{output_label}]", []
+
+    monkeypatch.setattr(render.text_overlay, "chain_drawtext_filters", fake_chain)
+    monkeypatch.setattr(render, "_run_ffmpeg", lambda cmd: None)
+
+    candidate = _candidate([UsedSegment(role="hook", start=0.0, end=2.0, text="a")])
+    render.apply_text_overlays(Path("intermediate.mp4"), candidate, tmp_path, tmp_path)
+
+    specs = captured["specs"]
+    assert len(specs) == 2
+    assert specs[0].text == config.WATERMARK_TEXT
+    assert specs[1].text == candidate.hook_text
 
 
 @requires_ffmpeg

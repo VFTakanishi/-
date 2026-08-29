@@ -77,7 +77,7 @@ def test_resolve_candidate_resolves_all_segments_in_order():
             RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
             RawUsedSegment(role="answer", start_segment_id=2, end_segment_id=2),
         ],
-        hook_text="h", cta_end_text="c", title="t", description="d",
+        hook_text="h", opening_hook_strength=80, title="t", description="d",
         score=80, reasoning="r", caveats="",
     )
     candidate = boundary.resolve_candidate(raw, transcript, candidate_id="c1")

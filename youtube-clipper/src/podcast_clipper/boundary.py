@@ -65,7 +65,7 @@ def resolve_candidate(
         hook_type=raw.hook_type,
         segments=segments,
         hook_text=raw.hook_text,
-        cta_end_text=raw.cta_end_text,
+        opening_hook_strength=raw.opening_hook_strength,
         title=raw.title,
         description=raw.description,
         score=raw.score,

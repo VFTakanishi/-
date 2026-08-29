@@ -197,8 +197,14 @@ function renderCandidates(candidates) {
         ? c.total_duration
         : c.segments.reduce((sum, s) => sum + (s.end - s.start), 0);
 
+    // The actual first words that will be heard, straight from the real
+    // transcript (never AI-generated) -- lets the user judge the spoken
+    // hook themselves before picking a candidate.
+    const openingLine = c.segments && c.segments.length > 0 ? c.segments[0].text : "";
+
     card.innerHTML = `
       <h3>${escapeHtml(c.title)}</h3>
+      <div class="opening-line"><strong>冒頭の実音声:</strong> ${escapeHtml(openingLine)}</div>
       <div class="meta">
         タイプ: ${HOOK_TYPE_LABELS[c.hook_type] || c.hook_type} /
         尺: ${totalDuration.toFixed(1)}秒 /

@@ -7,7 +7,7 @@ source frame could be masked by the overlay text sitting on top of it):
   1. extract + concat the candidate's segments from the source video
   2. convert to vertical (blurred background fit)      -> intermediate mp4
   3. [qa.py video Content QA runs on the intermediate]   (called by caller)
-  4. burn in hook_text / watermark / cta_end_text        -> final mp4
+  4. burn in hook_text / watermark                       -> final mp4
   5. [qa.py technical + audio/speech QA runs on the final] (called by caller)
 
 This module only produces the two video files and a RenderManifest
@@ -93,14 +93,15 @@ def extract_and_verticalize(
 def apply_text_overlays(
     intermediate_path: Path,
     candidate: ClipCandidate,
-    total_duration: float,
     out_dir: Path,
     tmp_dir: Path,
 ) -> Path:
-    """Step 4: burn in hook_text (first HOOK_TEXT_DISPLAY_SEC), the
-    always-on watermark, and cta_end_text (last CTA_END_DISPLAY_SEC).
+    """Step 4: burn in hook_text (first HOOK_TEXT_DISPLAY_SEC) and the
+    always-on watermark. No end-of-clip CTA text is burned in -- the main
+    funnel to the full episode is the YouTube Studio "related video"
+    setting, not an in-video subtitle (an AI-authored closing CTA risked
+    asserting unverified claims about the full episode's content).
     """
-    cta_start = max(0.0, total_duration - config.CTA_END_DISPLAY_SEC)
     specs = [
         text_overlay.TextOverlaySpec(
             text=config.WATERMARK_TEXT,
@@ -118,14 +119,6 @@ def apply_text_overlays(
             fontsize=64,
             box=True,
             enable_expr=f"between(t,0,{config.HOOK_TEXT_DISPLAY_SEC})",
-        ),
-        text_overlay.TextOverlaySpec(
-            text=candidate.cta_end_text,
-            x_expr="(w-text_w)/2",
-            y_expr="h*0.80",
-            fontsize=52,
-            box=True,
-            enable_expr=f"between(t,{cta_start},{total_duration})",
         ),
     ]
 
@@ -157,9 +150,7 @@ def render_candidate(
     tmp_dir = _tmp_dir(video_id, candidate.id)
 
     intermediate_path = extract_and_verticalize(source_path, candidate, out_dir)
-    final_path = apply_text_overlays(
-        intermediate_path, candidate, candidate.total_duration, out_dir, tmp_dir
-    )
+    final_path = apply_text_overlays(intermediate_path, candidate, out_dir, tmp_dir)
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
     manifest = RenderManifest(
@@ -168,7 +159,6 @@ def render_candidate(
         segments=candidate.segments,
         hook_text=candidate.hook_text,
         watermark_text=config.WATERMARK_TEXT,
-        cta_end_text=candidate.cta_end_text,
         total_duration=candidate.total_duration,
         intermediate_video_path=str(intermediate_path),
         final_video_path=str(final_path),

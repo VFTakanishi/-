@@ -29,6 +29,20 @@ MIN_SEGMENTS_PER_CANDIDATE = 1
 MAX_SEGMENTS_PER_CANDIDATE = 3
 DEFAULT_SEGMENTS_PER_CANDIDATE = 2
 
+# Below this, a candidate's *spoken* opening (the real transcript text of
+# its first/hook segment, not the on-screen hook_text overlay) is treated
+# as too weak and triggers the same feedback+retry pass as an out-of-range
+# duration (see clip_selector.select_candidates).
+MIN_OPENING_HOOK_STRENGTH = 60
+
+# Bump this whenever clip_selector.py's Claude prompt text or JSON
+# tool-calling schema changes in a way that makes previously-cached
+# Stage1/Stage2 JSON stale/incompatible. cache.py stores this alongside the
+# cached data and treats a mismatch as a cache miss (falls back to a fresh
+# Stage1/Stage2 run) rather than trying to deserialize old-shape data. The
+# Whisper transcript cache has no dependency on this and is unaffected.
+CANDIDATE_SCHEMA_VERSION = 2
+
 CHUNK_MINUTES = 10.0
 CHUNK_OVERLAP_MINUTES = 1.0
 
@@ -61,7 +75,6 @@ BACKGROUND_BLUR_SIGMA = 20
 # --- Text overlays (absolute condition #8) ------------------------------
 WATERMARK_TEXT = os.environ.get("PODCAST_CLIPPER_WATERMARK_TEXT", "VF高西で検索！")
 HOOK_TEXT_DISPLAY_SEC = 2.0
-CTA_END_DISPLAY_SEC = 4.0  # within the 3-5s window required by condition #8
 
 RELATED_VIDEO_INSTRUCTIONS = (
     "YouTubeへアップロード後、YouTube Studioでこのショートの「関連動画」に"
