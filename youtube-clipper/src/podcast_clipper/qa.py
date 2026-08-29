@@ -62,45 +62,56 @@ def _blackdetect(video_path: Path) -> list[tuple[float, float]]:
     return intervals
 
 
-def _freezedetect(
+def _frame_hashes(
     video_path: Path, start: float | None = None, t: float | None = None
-) -> list[float]:
-    vf = (
-        f"freezedetect=n={config.FREEZEDETECT_NOISE_TOLERANCE_DB}dB:"
-        f"d={config.FREEZEDETECT_MIN_FREEZE_DURATION_SEC}"
-    )
+) -> list[str]:
+    """Decoded-frame hashes via ffmpeg's framemd5 muxer, sampled at a fixed
+    rate (config.FREEZE_FRAME_SAMPLE_FPS). Unlike ffmpeg's freezedetect
+    filter -- which flags a clip as frozen once the *average* pixel change
+    across the whole frame drops below a threshold, and so false-positives
+    on real content with only a small moving element (e.g. a speaker inset
+    against mostly-static slides) -- comparing decoded frame hashes only
+    calls something "unchanged" when it is byte-identical.
+    """
     cmd = ["ffmpeg"]
     if start is not None:
         cmd += ["-ss", str(start)]
     cmd += ["-i", str(video_path)]
     if t is not None:
         cmd += ["-t", str(t)]
-    cmd += ["-vf", vf, "-an", "-f", "null", "-"]
+    cmd += ["-vf", f"fps={config.FREEZE_FRAME_SAMPLE_FPS}", "-an", "-f", "framemd5", "-"]
     result = _run(cmd)
-    starts = [float(m.group(1)) for m in re.finditer(r"freeze_start: ([\d.]+)", result.stderr)]
-    return starts
+    hashes = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if parts and parts[-1]:
+            hashes.append(parts[-1])
+    return hashes
 
 
-def _source_has_opening_freeze(source_path: Path, segment_start: float) -> bool:
-    """Checks whether the *original* source also looks frozen over the same
-    opening window the candidate's first segment starts at. Used only to
-    tell a genuinely static source (e.g. a slide-heavy podcast) apart from a
-    freeze render.py itself introduced.
-
-    The extraction window is intentionally a bit longer than
-    CONTENT_QA_OPENING_WINDOW_SEC (it adds FREEZEDETECT_MIN_FREEZE_DURATION_SEC
-    of slack) so freezedetect has enough trailing context to confirm a freeze
-    that starts near the edge of the window -- mirroring how the
-    intermediate-side check scans the whole (unbounded) clip and only
-    filters by the opening window afterwards. Any freeze_start reported at
-    all within this bounded extraction is treated as "source is also
-    static here": since the extraction is already scoped to the opening
-    window, this doesn't need to interpret the specific timestamp value
-    ffmpeg reports (which depends on how -ss seeking renumbers timestamps).
+def _longest_identical_run_sec(hashes: list[str]) -> float:
+    """Longest run of consecutive byte-identical sampled frames, expressed
+    in seconds at the fixed sampling rate. N identical consecutive samples
+    confirm the decoded content was unchanged for (N-1) sample intervals.
     """
-    window = config.CONTENT_QA_OPENING_WINDOW_SEC + config.FREEZEDETECT_MIN_FREEZE_DURATION_SEC
-    starts = _freezedetect(source_path, start=segment_start, t=window)
-    return bool(starts)
+    if len(hashes) < 2:
+        return 0.0
+    longest = current = 1
+    for prev, cur in zip(hashes, hashes[1:]):
+        if cur == prev:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 1
+    return (longest - 1) / config.FREEZE_FRAME_SAMPLE_FPS
+
+
+def _has_real_freeze(video_path: Path, start: float | None = None, t: float | None = None) -> bool:
+    hashes = _frame_hashes(video_path, start=start, t=t)
+    return _longest_identical_run_sec(hashes) >= config.FREEZEDETECT_MIN_FREEZE_DURATION_SEC
 
 
 def video_content_qa(
@@ -127,39 +138,50 @@ def video_content_qa(
         )
     )
 
-    freeze_starts = _freezedetect(intermediate_video_path)
-    opening_freeze = [s for s in freeze_starts if s < config.CONTENT_QA_OPENING_WINDOW_SEC]
+    opening_window = config.CONTENT_QA_OPENING_WINDOW_SEC + config.FREEZEDETECT_MIN_FREEZE_DURATION_SEC
+    intermediate_frozen = _has_real_freeze(intermediate_video_path, t=opening_window)
 
-    source_confirms_freeze = False
-    if opening_freeze and source_path is not None and source_segment_start is not None:
-        source_confirms_freeze = _source_has_opening_freeze(source_path, source_segment_start)
-
-    if opening_freeze and source_confirms_freeze:
+    if not intermediate_frozen:
         checks.append(
             QACheck(
                 name="静止画/フリーズ検出",
                 passed=True,
                 critical=True,
-                detail=(
-                    f"冒頭付近({opening_freeze}秒付近)に静止を検出しましたが、"
-                    "元動画の同じ区間も同様に静止しているため、"
-                    "コンテンツ由来（スライド等）の静止と判断しPASS扱いとしました"
-                ),
+                detail="冒頭付近でデコード後フレームの連続同一（本当のフリーズ）を検出しませんでした",
             )
         )
     else:
-        checks.append(
-            QACheck(
-                name="静止画/フリーズ検出",
-                passed=not opening_freeze,
-                critical=True,
-                detail=(
-                    "冒頭付近に静止画/フリーズを検出しませんでした"
-                    if not opening_freeze
-                    else f"冒頭付近({opening_freeze}秒付近)に静止画/フリーズを検出しました"
-                ),
+        source_frozen = False
+        if source_path is not None and source_segment_start is not None:
+            source_frozen = _has_real_freeze(
+                source_path, start=source_segment_start, t=opening_window
             )
-        )
+        if source_frozen:
+            checks.append(
+                QACheck(
+                    name="静止画/フリーズ検出",
+                    passed=True,
+                    critical=True,
+                    detail=(
+                        "冒頭付近でデコード後フレームが連続同一でしたが、"
+                        "元動画の同じ区間も同様に連続同一フレームであるため、"
+                        "コンテンツ由来（静止画/スライド等）の静止と判断しPASS扱いとしました"
+                    ),
+                )
+            )
+        else:
+            checks.append(
+                QACheck(
+                    name="静止画/フリーズ検出",
+                    passed=False,
+                    critical=True,
+                    detail=(
+                        "冒頭付近で出力側のみデコード後フレームが"
+                        f"{config.FREEZEDETECT_MIN_FREEZE_DURATION_SEC}秒以上連続同一でした"
+                        "（元動画の同じ区間は変化しています）。レンダリング事故の可能性があります"
+                    ),
+                )
+            )
     return checks
 
 

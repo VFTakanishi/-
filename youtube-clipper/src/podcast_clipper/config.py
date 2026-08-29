@@ -80,8 +80,14 @@ BLACKDETECT_MIN_DURATION_SEC = 0.5
 BLACKDETECT_PIXEL_BLACK_TH = 0.10
 BLACKDETECT_PICTURE_BLACK_RATIO_TH = 0.98
 
-FREEZEDETECT_NOISE_TOLERANCE_DB = -40
+# Freeze detection is based on decoded-frame identity (via ffmpeg's
+# framemd5 muxer), not ffmpeg's freezedetect filter: freezedetect's
+# average-changed-pixels heuristic false-positives on low-motion-but-real
+# content (e.g. a small moving speaker inset against mostly-static slides).
+# A run of byte-identical decoded frames lasting at least this long counts
+# as a real freeze; frames are sampled at FREEZE_FRAME_SAMPLE_FPS.
 FREEZEDETECT_MIN_FREEZE_DURATION_SEC = 1.5
+FREEZE_FRAME_SAMPLE_FPS = 5.0
 # Only the first few seconds of the clip are checked for a frozen/static
 # opening (a real talking-head clip is expected to move).
 CONTENT_QA_OPENING_WINDOW_SEC = 3.0

@@ -2,6 +2,7 @@ import json
 import subprocess
 from pathlib import Path
 
+from conftest import requires_ffmpeg
 from podcast_clipper import boundary, config, qa
 from podcast_clipper.models import (
     RawClipCandidate,
@@ -40,50 +41,65 @@ def test_video_content_qa_passes_when_no_opening_black_or_freeze(monkeypatch):
     assert all(c.passed for c in checks)
 
 
-def test_video_content_qa_flags_opening_freeze(monkeypatch):
-    def fake_run(args):
-        if "freezedetect" in " ".join(args):
-            return _fake_completed(stderr="[freezedetect @ 0x0] freeze_start: 0.5\n")
-        return _fake_completed(stderr="")
+# --- freeze detection based on decoded-frame identity (not freezedetect's
+# --- average-motion heuristic, which false-positives on low-motion content
+# --- e.g. a small moving speaker inset against mostly-static slides) -----
 
-    monkeypatch.setattr(qa, "_run", fake_run)
-    checks = qa.video_content_qa(Path("dummy.mp4"))
+
+def test_video_content_qa_low_motion_content_passes_when_frames_actually_differ(monkeypatch):
+    """A small moving person in front of mostly-static slides: overall
+    motion is tiny, but the decoded frames are never byte-identical for
+    long, so this must not be flagged as a real freeze.
+    """
+    monkeypatch.setattr(qa, "_run", lambda args: _fake_completed(stderr=""))
+    monkeypatch.setattr(
+        qa, "_frame_hashes",
+        lambda video_path, start=None, t=None: [f"h{i % 3}" for i in range(30)],
+    )
+    checks = qa.video_content_qa(Path("intermediate.mp4"))
+    freeze_check = next(c for c in checks if c.name == "静止画/フリーズ検出")
+    assert freeze_check.passed is True
+
+
+def test_video_content_qa_flags_real_freeze_when_source_is_moving(monkeypatch):
+    """The output alone repeats the exact same decoded frame for longer
+    than the minimum freeze duration, while the source over the same
+    segment keeps changing -- a genuine rendering accident, so this must
+    stay a critical failure.
+    """
+
+    def fake_frame_hashes(video_path, start=None, t=None):
+        if str(video_path) == "intermediate.mp4":
+            return ["x"] * 15  # identical for (15-1)/5fps = 2.8s >= 1.5s threshold
+        if str(video_path) == "source.mp4":
+            return [f"h{i % 3}" for i in range(15)]  # keeps changing
+        return []
+
+    monkeypatch.setattr(qa, "_run", lambda args: _fake_completed(stderr=""))
+    monkeypatch.setattr(qa, "_frame_hashes", fake_frame_hashes)
+    checks = qa.video_content_qa(
+        Path("intermediate.mp4"), source_path=Path("source.mp4"), source_segment_start=120.0
+    )
     freeze_check = next(c for c in checks if c.name == "静止画/フリーズ検出")
     assert freeze_check.passed is False
     assert freeze_check.critical is True
 
 
-def test_video_content_qa_ignores_freeze_well_after_opening(monkeypatch):
-    def fake_run(args):
-        if "freezedetect" in " ".join(args):
-            return _fake_completed(stderr="[freezedetect @ 0x0] freeze_start: 20.0\n")
-        return _fake_completed(stderr="")
-
-    monkeypatch.setattr(qa, "_run", fake_run)
-    checks = qa.video_content_qa(Path("dummy.mp4"))
-    freeze_check = next(c for c in checks if c.name == "静止画/フリーズ検出")
-    assert freeze_check.passed is True
-
-
-def test_video_content_qa_opening_freeze_passes_when_source_is_also_static(monkeypatch):
-    """Slide-heavy podcast case: the output's opening looks frozen, but so
-    does the original source over the same segment -- this is genuine
-    content (a static slide), not a rendering accident, so it must not be
-    a critical failure.
+def test_video_content_qa_real_freeze_passes_when_source_is_also_frozen(monkeypatch):
+    """Both the output and the source genuinely repeat the same decoded
+    frame (a true still image/slide) -- content, not a render accident, so
+    this must not be a critical failure.
     """
 
-    def fake_run(args):
-        joined = " ".join(args)
-        if "blackdetect" in joined:
-            return _fake_completed(stderr="")
-        if "freezedetect" in joined:
-            if "intermediate.mp4" in joined:
-                return _fake_completed(stderr="[freezedetect @ 0x0] freeze_start: 0.5\n")
-            if "source.mp4" in joined:
-                return _fake_completed(stderr="[freezedetect @ 0x0] freeze_start: 0.2\n")
-        return _fake_completed(stderr="")
+    def fake_frame_hashes(video_path, start=None, t=None):
+        if str(video_path) == "intermediate.mp4":
+            return ["x"] * 15
+        if str(video_path) == "source.mp4":
+            return ["y"] * 15
+        return []
 
-    monkeypatch.setattr(qa, "_run", fake_run)
+    monkeypatch.setattr(qa, "_run", lambda args: _fake_completed(stderr=""))
+    monkeypatch.setattr(qa, "_frame_hashes", fake_frame_hashes)
     checks = qa.video_content_qa(
         Path("intermediate.mp4"), source_path=Path("source.mp4"), source_segment_start=120.0
     )
@@ -92,30 +108,57 @@ def test_video_content_qa_opening_freeze_passes_when_source_is_also_static(monke
     assert freeze_check.critical is True
 
 
-def test_video_content_qa_opening_freeze_fails_when_source_is_not_static(monkeypatch):
-    """The output alone is frozen at the opening while the source is moving
-    over the same segment -- a genuine rendering accident, so this must
-    stay a critical failure exactly as before.
-    """
-
-    def fake_run(args):
-        joined = " ".join(args)
-        if "blackdetect" in joined:
-            return _fake_completed(stderr="")
-        if "freezedetect" in joined:
-            if "intermediate.mp4" in joined:
-                return _fake_completed(stderr="[freezedetect @ 0x0] freeze_start: 0.5\n")
-            if "source.mp4" in joined:
-                return _fake_completed(stderr="")  # source has no freeze here
-        return _fake_completed(stderr="")
-
-    monkeypatch.setattr(qa, "_run", fake_run)
-    checks = qa.video_content_qa(
-        Path("intermediate.mp4"), source_path=Path("source.mp4"), source_segment_start=120.0
+@requires_ffmpeg
+def test_video_content_qa_real_ffmpeg_flags_frozen_output_when_source_moves(tmp_path):
+    intermediate = tmp_path / "intermediate.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi",
+            "-i", "color=c=blue:size=320x240:rate=10:duration=5",
+            "-c:v", "libx264", str(intermediate),
+        ],
+        check=True, capture_output=True,
     )
+    source = tmp_path / "source.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi",
+            "-i", "testsrc=size=320x240:rate=10:duration=5",
+            "-c:v", "libx264", str(source),
+        ],
+        check=True, capture_output=True,
+    )
+
+    checks = qa.video_content_qa(intermediate, source_path=source, source_segment_start=0.0)
     freeze_check = next(c for c in checks if c.name == "静止画/フリーズ検出")
     assert freeze_check.passed is False
     assert freeze_check.critical is True
+
+
+@requires_ffmpeg
+def test_video_content_qa_real_ffmpeg_passes_when_source_is_also_frozen(tmp_path):
+    intermediate = tmp_path / "intermediate.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi",
+            "-i", "color=c=blue:size=320x240:rate=10:duration=5",
+            "-c:v", "libx264", str(intermediate),
+        ],
+        check=True, capture_output=True,
+    )
+    source = tmp_path / "source.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi",
+            "-i", "color=c=red:size=320x240:rate=10:duration=5",
+            "-c:v", "libx264", str(source),
+        ],
+        check=True, capture_output=True,
+    )
+
+    checks = qa.video_content_qa(intermediate, source_path=source, source_segment_start=0.0)
+    freeze_check = next(c for c in checks if c.name == "静止画/フリーズ検出")
+    assert freeze_check.passed is True
 
 
 # --- audio presence QA (signal only, not "speech" -- plan fix #6) -------
