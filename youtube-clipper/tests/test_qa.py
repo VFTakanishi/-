@@ -298,6 +298,43 @@ def test_speech_start_alignment_qa_uses_first_segment_only():
     assert check.passed is True
 
 
+# --- utterance completeness: the clip must not end mid-utterance --------
+
+
+def _manifest_with_last_segment_text(text: str) -> RenderManifest:
+    segments = [
+        UsedSegment(role="hook", start=0.0, end=2.0, text="冒頭の発言"),
+        UsedSegment(role="answer", start=10.0, end=15.0, text=text),
+    ]
+    return RenderManifest(
+        video_id="vidQ", candidate_id="c1", segments=segments,
+        hook_text="h", watermark_text="w",
+        total_duration=7.0,
+        intermediate_video_path="mid.mp4", final_video_path="final.mp4",
+    )
+
+
+def test_utterance_completeness_qa_passes_on_natural_sentence_ending():
+    manifest = _manifest_with_last_segment_text("これで結論です。")
+    check = qa.utterance_completeness_qa(RawClipCandidate(
+        hook_type="story", segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=1)],
+        hook_text="h", opening_hook_strength=80, title="t", description="d", score=1, reasoning="r", caveats="",
+    ), _transcript(), manifest)
+    assert check.passed is True
+    assert check.critical is True
+
+
+def test_utterance_completeness_qa_fails_on_mid_utterance_ending():
+    manifest = _manifest_with_last_segment_text("それが起きた理由としては、こういうことが考えられるので")
+    check = qa.utterance_completeness_qa(RawClipCandidate(
+        hook_type="story", segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=1)],
+        hook_text="h", opening_hook_strength=80, title="t", description="d", score=1, reasoning="r", caveats="",
+    ), _transcript(), manifest)
+    assert check.passed is False
+    assert check.critical is True
+    assert check.detail  # names the offending trailing text
+
+
 # --- ordering guarantee (plan fix #7): video Content QA must run on the --
 # --- intermediate (pre-text) video, never on the final (post-text) mp4  --
 
@@ -331,10 +368,12 @@ def test_run_full_qa_runs_video_content_qa_on_intermediate_only(monkeypatch):
     monkeypatch.setattr(qa, "audio_presence_qa", lambda p: (seen_audio_qa_paths.append(str(p)), [])[1])
     monkeypatch.setattr(qa, "extract_thumbnails", lambda *a, **k: [])
 
-    qa.run_full_qa(raw, transcript, manifest, Path("source.mp4"))
+    report = qa.run_full_qa(raw, transcript, manifest, Path("source.mp4"))
 
     assert seen_video_content_qa_paths == ["intermediate_novtext.mp4"]
     assert seen_technical_qa_paths == ["final.mp4"]
     assert seen_audio_qa_paths == ["final.mp4"]
     # Critically: the final (post-text) mp4 must never be passed to video_content_qa
     assert "final.mp4" not in seen_video_content_qa_paths
+    # The utterance-completeness safety net must be wired into run_full_qa.
+    assert "発話完結性チェック" in [c.name for c in report.checks]

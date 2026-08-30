@@ -144,6 +144,101 @@ def test_filter_local_quality_forces_first_segment_role_to_hook(monkeypatch):
     assert kept[0].segments[0].role == "hook"
 
 
+# --- ending completeness: clips must not end mid-utterance ----------------
+
+
+def _transcript_with_gap(gap_sec, texts):
+    segments = []
+    t = 0.0
+    for i, text in enumerate(texts):
+        segments.append(
+            TranscriptSegment(
+                id=i, start=t, end=t + 2.0, text=text,
+                words=[TranscriptWord(start=t, end=t + 2.0, text=text)],
+            )
+        )
+        t += 2.0 + gap_sec
+    return Transcript(video_id="vidX", language="ja", segments=segments)
+
+
+def test_is_natural_sentence_ending_true_for_terminal_punctuation():
+    assert clip_selector.is_natural_sentence_ending("これで終わりです。") is True
+
+
+def test_is_natural_sentence_ending_false_for_continuation_suffix():
+    assert clip_selector.is_natural_sentence_ending("それはこうなので") is False
+
+
+def test_is_natural_sentence_ending_true_when_neither_signal_present():
+    assert clip_selector.is_natural_sentence_ending("普通の単語") is True
+
+
+def test_extend_to_natural_ending_leaves_natural_endings_unchanged():
+    # A: already ends naturally -- no extension needed.
+    transcript = _transcript_with_gap(0.3, ["これで結論です。", "次のトピックです。"])
+    raw = _raw_candidate(0, 0)
+    result = clip_selector._extend_to_natural_ending(raw, transcript)
+    assert result is raw
+
+
+def test_extend_to_natural_ending_returns_none_when_nothing_to_extend_into():
+    # B: mid-utterance, but it's the last transcript segment -- nothing to pull in.
+    transcript = _transcript_with_gap(0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので"])
+    raw = _raw_candidate(0, 1)
+    result = clip_selector._extend_to_natural_ending(raw, transcript)
+    assert result is None
+
+
+def test_extend_to_natural_ending_returns_none_on_real_pause(monkeypatch):
+    # B (variant): mid-utterance, but the next segment is far enough away
+    # (a real VAD-detected pause) that it isn't a safe continuation.
+    monkeypatch.setattr(config, "END_EXTENSION_MAX_GAP_SEC", 0.8)
+    transcript = _transcript_with_gap(
+        5.0, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "全く別の話題です。"]
+    )
+    raw = _raw_candidate(0, 1)
+    result = clip_selector._extend_to_natural_ending(raw, transcript)
+    assert result is None
+
+
+def test_extend_to_natural_ending_extends_into_continuing_segment():
+    # C: next segment is a close-in-time continuation that completes the thought.
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
+    )
+    raw = _raw_candidate(0, 1)
+    result = clip_selector._extend_to_natural_ending(raw, transcript)
+    assert result is not None
+    assert result.segments[-1].end_segment_id == 2
+
+
+def test_filter_local_quality_rejects_candidate_when_natural_ending_exceeds_hard_max(monkeypatch):
+    # D: reaching a natural ending would exceed DURATION_HARD_MAX_SEC --
+    # the candidate is rejected rather than cut off mid-utterance to fit.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 5.0)
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
+    )
+    raw = _raw_candidate(0, 1, opening_hook_strength=90)
+
+    kept = clip_selector._filter_local_quality([raw], transcript)
+    assert kept == []
+
+
+def test_filter_local_quality_keeps_candidate_when_extension_stays_within_hard_max(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
+    )
+    raw = _raw_candidate(0, 1, opening_hook_strength=90)
+
+    kept = clip_selector._filter_local_quality([raw], transcript)
+    assert len(kept) == 1
+    assert kept[0].segments[-1].end_segment_id == 2
+
+
 # --- select_candidates: no automatic retry (item H) ----------------------
 
 

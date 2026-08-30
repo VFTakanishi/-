@@ -43,11 +43,13 @@ def test_trim_concat_filter_supports_single_and_triple_segment_candidates():
     assert render._trim_concat_and_verticalize_filter(three).count("[0:v]trim=start=") == 3
 
 
-def test_apply_text_overlays_never_builds_a_cta_spec(monkeypatch, tmp_path):
-    """cta_end_text was retired entirely (an AI-authored closing CTA risked
+def test_apply_text_overlays_only_ever_burns_in_the_watermark(monkeypatch, tmp_path):
+    """The hook-text overlay was retired entirely (per user decision: the
+    only in-video text should be the always-on watermark), and
+    cta_end_text was retired earlier (an AI-authored closing CTA risked
     asserting unverified claims about the full episode). This pins that
-    apply_text_overlays only ever burns in the watermark and hook_text --
-    never a third, end-of-clip spec -- so no such subtitle can reappear.
+    apply_text_overlays burns in exactly one spec -- the watermark -- and
+    never a hook or end-of-clip spec, so neither can reappear.
     """
     captured = {}
 
@@ -62,9 +64,34 @@ def test_apply_text_overlays_never_builds_a_cta_spec(monkeypatch, tmp_path):
     render.apply_text_overlays(Path("intermediate.mp4"), candidate, tmp_path, tmp_path)
 
     specs = captured["specs"]
-    assert len(specs) == 2
+    assert len(specs) == 1
     assert specs[0].text == config.WATERMARK_TEXT
-    assert specs[1].text == candidate.hook_text
+
+
+def test_watermark_spec_is_prominent_and_always_on(monkeypatch, tmp_path):
+    """Pins the more-prominent styling (bigger, fully-opaque, bottom-center
+    safe area) and that it's never time-gated (always visible for the
+    whole clip, unlike the retired hook overlay).
+    """
+    captured = {}
+
+    def fake_chain(input_label, output_label, specs, tmp_dir):
+        captured["specs"] = specs
+        return f"[{input_label}]null[{output_label}]", []
+
+    monkeypatch.setattr(render.text_overlay, "chain_drawtext_filters", fake_chain)
+    monkeypatch.setattr(render, "_run_ffmpeg", lambda cmd: None)
+
+    candidate = _candidate([UsedSegment(role="hook", start=0.0, end=2.0, text="a")])
+    render.apply_text_overlays(Path("intermediate.mp4"), candidate, tmp_path, tmp_path)
+
+    watermark = captured["specs"][0]
+    assert watermark.enable_expr is None  # always on, no time window
+    assert watermark.fontsize >= 48  # bigger than the old fontsize=36
+    assert watermark.fontcolor == "white"  # fully opaque, not translucent
+    assert watermark.box is True
+    assert "(w-text_w)/2" == watermark.x_expr  # horizontally centered
+    assert "h-text_h" in watermark.y_expr  # bottom safe area
 
 
 @requires_ffmpeg

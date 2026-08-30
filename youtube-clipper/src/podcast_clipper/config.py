@@ -29,10 +29,21 @@ MAX_SEGMENTS_PER_CANDIDATE = 3
 DEFAULT_SEGMENTS_PER_CANDIDATE = 2
 
 # Below this, a candidate's *spoken* opening (the real transcript text of
-# its first/hook segment, not the on-screen hook_text overlay) is treated
-# as too weak and triggers the same feedback+retry pass as an out-of-range
-# duration (see clip_selector.select_candidates).
+# its first/hook segment) is treated as too weak and triggers the same
+# feedback+retry pass as an out-of-range duration (see
+# clip_selector.select_candidates).
 MIN_OPENING_HOOK_STRENGTH = 60
+
+# Ending completeness: if a candidate's last segment looks cut off
+# mid-utterance, clip_selector extends into following transcript segments
+# (see clip_selector._extend_to_natural_ending) rather than ending on an
+# incomplete thought. Bounded so a bad heuristic match can't run away.
+MAX_END_EXTENSION_SEGMENTS = 3
+# A gap this short between transcript segments is treated as the same
+# breath/utterance continuing (faster-whisper's VAD only splits segments
+# on detected silence, so a short gap is itself a continuity signal)
+# rather than a real pause marking a completed thought.
+END_EXTENSION_MAX_GAP_SEC = 0.8
 
 # Bump this whenever clip_selector.py's Claude prompt text or Structured
 # Outputs schema changes in a way that makes previously-cached Stage1/Stage2
@@ -88,8 +99,9 @@ VERTICAL_HEIGHT = 1920
 BACKGROUND_BLUR_SIGMA = 20
 
 # --- Text overlays (absolute condition #8) ------------------------------
+# The only in-video text is this always-on watermark -- no hook-text
+# overlay, no end-of-clip CTA subtitle.
 WATERMARK_TEXT = os.environ.get("PODCAST_CLIPPER_WATERMARK_TEXT", "VF高西で検索！")
-HOOK_TEXT_DISPLAY_SEC = 2.0
 
 RELATED_VIDEO_INSTRUCTIONS = (
     "YouTubeへアップロード後、YouTube Studioでこのショートの「関連動画」に"

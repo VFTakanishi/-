@@ -7,7 +7,7 @@ source frame could be masked by the overlay text sitting on top of it):
   1. extract + concat the candidate's segments from the source video
   2. convert to vertical (blurred background fit)      -> intermediate mp4
   3. [qa.py video Content QA runs on the intermediate]   (called by caller)
-  4. burn in hook_text / watermark                       -> final mp4
+  4. burn in the watermark                               -> final mp4
   5. [qa.py technical + audio/speech QA runs on the final] (called by caller)
 
 This module only produces the two video files and a RenderManifest
@@ -96,29 +96,23 @@ def apply_text_overlays(
     out_dir: Path,
     tmp_dir: Path,
 ) -> Path:
-    """Step 4: burn in hook_text (first HOOK_TEXT_DISPLAY_SEC) and the
-    always-on watermark. No end-of-clip CTA text is burned in -- the main
-    funnel to the full episode is the YouTube Studio "related video"
-    setting, not an in-video subtitle (an AI-authored closing CTA risked
-    asserting unverified claims about the full episode's content).
+    """Step 4: burn in the always-on watermark. No hook-text overlay and no
+    end-of-clip CTA text is burned in -- the only in-video text is the
+    watermark; the main funnel to the full episode is the YouTube Studio
+    "related video" setting, not an in-video subtitle. candidate.hook_text
+    remains a data field (real transcript text, used only around
+    candidate selection) but is not drawn into the video.
     """
     specs = [
         text_overlay.TextOverlaySpec(
             text=config.WATERMARK_TEXT,
-            x_expr="w-text_w-24",
-            y_expr="h-text_h-24",
-            fontsize=36,
-            fontcolor="white@0.85",
-            box=True,
-            box_color="black@0.35",
-        ),
-        text_overlay.TextOverlaySpec(
-            text=candidate.hook_text,
             x_expr="(w-text_w)/2",
-            y_expr="h*0.10",
-            fontsize=64,
+            y_expr="h-text_h-140",
+            fontsize=56,
+            fontcolor="white",
             box=True,
-            enable_expr=f"between(t,0,{config.HOOK_TEXT_DISPLAY_SEC})",
+            box_color="black@0.55",
+            box_borderw=18,
         ),
     ]
 

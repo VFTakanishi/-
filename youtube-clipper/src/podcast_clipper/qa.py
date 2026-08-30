@@ -5,10 +5,15 @@ show exactly what failed rather than one opaque pass/fail.
 Ordering matters (plan fix #7): `video_content_qa` must be run by the
 caller against the *intermediate* (pre-text) video from render.py, before
 text is burned in. Everything else here runs against the *final* mp4.
-Nothing in this module re-decides whether Claude's semantic selection was
-good — `boundary_integrity_qa`/`speech_start_alignment_qa` only verify
-render.py actually used the exact edit points boundary.py computed
-(self-consistency, not a fresh audio/semantic judgement).
+Most of this module does not re-decide whether Claude's semantic
+selection was good — `boundary_integrity_qa`/`speech_start_alignment_qa`
+only verify render.py actually used the exact edit points boundary.py
+computed (self-consistency, not a fresh audio/semantic judgement).
+`utterance_completeness_qa` is the one exception: like
+`video_content_qa`, it's a real judgment call, existing as a safety net
+against a stale cached Stage2 result (from before this check or
+clip_selector.py's end-of-clip extension existed) slipping through a
+cache hit, which skips clip_selector's own filtering entirely.
 """
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import boundary, config
+from . import boundary, clip_selector, config
 from .models import RawClipCandidate, RenderManifest, Transcript
 
 
@@ -369,6 +374,31 @@ def speech_start_alignment_qa(
     )
 
 
+def utterance_completeness_qa(
+    raw_candidate: RawClipCandidate, transcript: Transcript, manifest: RenderManifest
+) -> QACheck:
+    """Verifies the clip's last segment doesn't end mid-utterance. Unlike
+    boundary_integrity_qa/speech_start_alignment_qa (self-consistency
+    checks against boundary.py's numbers), this is a real judgment call --
+    it exists as a safety net for a stale cached Stage2 result (from
+    before this check or clip_selector.py's end-of-clip extension
+    existed) that a cache hit in select_candidates would never re-run
+    through _filter_local_quality.
+    """
+    last_text = manifest.segments[-1].text
+    complete = clip_selector.is_natural_sentence_ending(last_text)
+    return QACheck(
+        name="発話完結性チェック",
+        passed=complete,
+        critical=True,
+        detail=(
+            ""
+            if complete
+            else f"最後のsegmentが発話途中で終わっている可能性があります: 「{last_text[-30:]}」"
+        ),
+    )
+
+
 # --- Thumbnails -----------------------------------------------------------
 
 
@@ -417,6 +447,7 @@ def run_full_qa(
     checks += technical_qa(final_path, manifest.total_duration)
     checks += audio_presence_qa(final_path)
     checks.append(speech_start_alignment_qa(raw_candidate, transcript, manifest))
+    checks.append(utterance_completeness_qa(raw_candidate, transcript, manifest))
     checks.append(boundary_integrity_qa(raw_candidate, transcript, manifest))
 
     thumbnails = extract_thumbnails(
