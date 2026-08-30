@@ -16,66 +16,52 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Literal
 
 import anthropic
+from pydantic import BaseModel, Field
 
 from . import boundary, cache, config
-from .models import (
-    MalformedCandidateError,
-    RawClipCandidate,
-    RawUsedSegment,
-    Transcript,
-    TranscriptSegment,
-    describe_value,
-    require_dict,
-)
+from .models import RawClipCandidate, RawUsedSegment, Transcript, TranscriptSegment
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
 
-_CANDIDATE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "hook_type": {
-            "type": "string",
-            "enum": ["open_loop", "strong_take", "surprising_fact", "story"],
-        },
-        "segments": {
-            "type": "array",
-            "minItems": 1,
-            "maxItems": 3,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "role": {
-                        "type": "string",
-                        "enum": ["hook", "context", "answer", "payoff"],
-                    },
-                    "start_segment_id": {"type": "integer"},
-                    "end_segment_id": {"type": "integer"},
-                },
-                "required": ["role", "start_segment_id", "end_segment_id"],
-            },
-        },
-        "hook_text": {"type": "string"},
-        "opening_hook_strength": {"type": "integer", "minimum": 0, "maximum": 100},
-        "title": {"type": "string"},
-        "description": {"type": "string"},
-        "score": {"type": "integer", "minimum": 0, "maximum": 100},
-        "reasoning": {"type": "string"},
-        "caveats": {"type": "string"},
-    },
-    "required": [
-        "hook_type",
-        "segments",
-        "hook_text",
-        "opening_hook_strength",
-        "title",
-        "description",
-        "score",
-        "reasoning",
-        "caveats",
-    ],
-}
+
+class CandidateSegmentOutput(BaseModel):
+    """One segment of a Claude-proposed candidate, as returned by Structured
+    Outputs. Distinct from the internal `RawUsedSegment` dataclass -- this
+    class exists purely to parse/validate Claude's response shape.
+    """
+
+    role: Literal["hook", "context", "answer", "payoff"]
+    start_segment_id: int
+    end_segment_id: int
+
+
+class CandidateOutput(BaseModel):
+    """One candidate as returned by Claude via Structured Outputs. Distinct
+    from the internal `RawClipCandidate` dataclass -- conversion between the
+    two happens explicitly in `_raw_candidate_from_output`.
+    """
+
+    hook_type: Literal["open_loop", "strong_take", "surprising_fact", "story"]
+    segments: list[CandidateSegmentOutput] = Field(min_length=1, max_length=3)
+    hook_text: str
+    opening_hook_strength: int = Field(ge=0, le=100)
+    title: str
+    description: str
+    score: int = Field(ge=0, le=100)
+    reasoning: str
+    caveats: str
+
+
+class Stage1Output(BaseModel):
+    candidates: list[CandidateOutput] = Field(min_length=0, max_length=3)
+
+
+class Stage2Output(BaseModel):
+    candidates: list[CandidateOutput] = Field(min_length=3, max_length=3)
+
 
 # Weak "warm-up" openings explicitly called out as unacceptable: a mechanical
 # safety net that backs up Claude's own opening_hook_strength self-rating by
@@ -103,38 +89,6 @@ def _force_first_segment_is_hook(raw: RawClipCandidate) -> None:
         raw.segments[0].role = "hook"
 
 
-def _normalize_json_array(value: object, *, context: str) -> list:
-    """Normalizes a value that should be a JSON array (Claude's tool_use
-    `candidates`, or a candidate's `segments`) but was observed on a real
-    machine to sometimes arrive JSON-encoded as a *string* instead of an
-    already-parsed list -- e.g. `input["candidates"]` being the literal
-    string "[{...}, {...}]" rather than a list, which made
-    `for c in ...["candidates"]` iterate the string character by character
-    (candidates[0] == "[") and crash deep inside with an undiagnosable
-    "string indices must be integers, not 'str'".
-
-    Decodes via `json.loads` exactly once (never `eval`/`ast.literal_eval`)
-    when `value` is a string, then requires the result to be a list either
-    way. Never silently coerces anything else -- invalid JSON, or valid
-    JSON that isn't a list, is a hard MalformedCandidateError, not a
-    silently-substituted empty list.
-    """
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError as exc:
-            raise MalformedCandidateError(
-                f"{context}: expected a JSON array, but the string isn't valid JSON: "
-                f"{describe_value(value)}"
-            ) from exc
-
-    if not isinstance(value, list):
-        raise MalformedCandidateError(
-            f"{context}: expected a list, got {type(value).__name__}: {describe_value(value)}"
-        )
-    return value
-
-
 def _client() -> anthropic.Anthropic:
     return anthropic.Anthropic()
 
@@ -147,49 +101,29 @@ def _format_segments(segments: list[TranscriptSegment]) -> str:
     return "\n".join(lines)
 
 
-def _raw_candidate_from_tool_input(
-    d: dict, *, stage: str, candidate_index: int
-) -> RawClipCandidate:
-    """Parses one candidate from Claude's real tool_use response.
-
-    Diagnostic-only (2026-08-30 incident): a real-machine analyze job
-    failed with a bare "TypeError: string indices must be integers, not
-    'str'" and no traceback (jobs.py only persisted str(exc)). Reproducing
-    it showed this exact function raises that exact message whenever `d`
-    (or one of its `segments` items) isn't a dict -- most plausibly because
-    Claude's structured response didn't match the schema for one item. The
-    require_dict() calls below turn that into a message naming the stage,
-    the candidate/segment index, and the actual type/value, so the next
-    real occurrence is diagnosable without manual reproduction. This does
-    NOT change what's accepted -- still raises on the same malformed input,
-    just with a better error -- and does not add any retry/repair behavior.
+def _raw_candidate_from_output(c: CandidateOutput) -> RawClipCandidate:
+    """Converts a Claude Structured Outputs candidate (already validated by
+    Pydantic) into the internal `RawClipCandidate` pipeline dataclass. No
+    format/type checking happens here -- `CandidateOutput` already
+    guarantees the shape, so this is a pure field-by-field conversion.
     """
-    require_dict(d, context=f"{stage} candidates[{candidate_index}]")
-    segments_payload = _normalize_json_array(
-        d["segments"], context=f"{stage} candidates[{candidate_index}].segments"
-    )
-    segments = []
-    for seg_index, s in enumerate(segments_payload):
-        require_dict(
-            s, context=f"{stage} candidates[{candidate_index}].segments[{seg_index}]"
-        )
-        segments.append(
-            RawUsedSegment(
-                role=s["role"],
-                start_segment_id=s["start_segment_id"],
-                end_segment_id=s["end_segment_id"],
-            )
-        )
     return RawClipCandidate(
-        hook_type=d["hook_type"],
-        segments=segments,
-        hook_text=d["hook_text"],
-        opening_hook_strength=d["opening_hook_strength"],
-        title=d["title"],
-        description=d["description"],
-        score=d["score"],
-        reasoning=d["reasoning"],
-        caveats=d["caveats"],
+        hook_type=c.hook_type,
+        segments=[
+            RawUsedSegment(
+                role=s.role,
+                start_segment_id=s.start_segment_id,
+                end_segment_id=s.end_segment_id,
+            )
+            for s in c.segments
+        ],
+        hook_text=c.hook_text,
+        opening_hook_strength=c.opening_hook_strength,
+        title=c.title,
+        description=c.description,
+        score=c.score,
+        reasoning=c.reasoning,
+        caveats=c.caveats,
     )
 
 
@@ -235,41 +169,14 @@ def extract_candidates_for_chunk(
         f"# 文字起こし（このチャンクのみ）\n{_format_segments(chunk_segments)}"
     )
 
-    tool = {
-        "name": "submit_chunk_candidates",
-        "description": "このチャンクから抽出した切り抜き候補を提出する",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "candidates": {
-                    "type": "array",
-                    "maxItems": 3,
-                    "items": _CANDIDATE_SCHEMA,
-                }
-            },
-            "required": ["candidates"],
-        },
-    }
-
-    response = _client().messages.create(
+    response = _client().messages.parse(
         model=config.ANTHROPIC_MODEL,
         max_tokens=4096,
         system=system_prompt,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": "submit_chunk_candidates"},
         messages=[{"role": "user", "content": user_content}],
+        output_format=Stage1Output,
     )
-
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "submit_chunk_candidates":
-            candidates_payload = _normalize_json_array(
-                block.input["candidates"], context="Stage1 candidates"
-            )
-            return [
-                _raw_candidate_from_tool_input(c, stage="Stage1", candidate_index=i)
-                for i, c in enumerate(candidates_payload)
-            ]
-    return []
+    return [_raw_candidate_from_output(c) for c in response.parsed_output.candidates]
 
 
 def run_stage1(
@@ -337,42 +244,14 @@ def rank_and_finalize(
     if feedback:
         user_content += f"\n\n# 修正依頼\n{feedback}"
 
-    tool = {
-        "name": "submit_final_candidates",
-        "description": "統合・重複排除・スコアリングを行った最終3候補を提出する",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "candidates": {
-                    "type": "array",
-                    "minItems": 3,
-                    "maxItems": 3,
-                    "items": _CANDIDATE_SCHEMA,
-                }
-            },
-            "required": ["candidates"],
-        },
-    }
-
-    response = _client().messages.create(
+    response = _client().messages.parse(
         model=config.ANTHROPIC_MODEL,
         max_tokens=4096,
         system=system_prompt,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": "submit_final_candidates"},
         messages=[{"role": "user", "content": user_content}],
+        output_format=Stage2Output,
     )
-
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "submit_final_candidates":
-            candidates_payload = _normalize_json_array(
-                block.input["candidates"], context="Stage2 candidates"
-            )
-            return [
-                _raw_candidate_from_tool_input(c, stage="Stage2", candidate_index=i)
-                for i, c in enumerate(candidates_payload)
-            ]
-    raise RuntimeError("Claude did not return submit_final_candidates")
+    return [_raw_candidate_from_output(c) for c in response.parsed_output.candidates]
 
 
 def _opening_text(raw: RawClipCandidate, transcript: Transcript) -> str:

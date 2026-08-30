@@ -35,13 +35,13 @@ DEFAULT_SEGMENTS_PER_CANDIDATE = 2
 # duration (see clip_selector.select_candidates).
 MIN_OPENING_HOOK_STRENGTH = 60
 
-# Bump this whenever clip_selector.py's Claude prompt text or JSON
-# tool-calling schema changes in a way that makes previously-cached
-# Stage1/Stage2 JSON stale/incompatible. cache.py stores this alongside the
-# cached data and treats a mismatch as a cache miss (falls back to a fresh
-# Stage1/Stage2 run) rather than trying to deserialize old-shape data. The
-# Whisper transcript cache has no dependency on this and is unaffected.
-CANDIDATE_SCHEMA_VERSION = 2
+# Bump this whenever clip_selector.py's Claude prompt text or Structured
+# Outputs schema changes in a way that makes previously-cached Stage1/Stage2
+# JSON stale/incompatible. cache.py stores this alongside the cached data
+# and treats a mismatch as a cache miss (falls back to a fresh Stage1/Stage2
+# run) rather than trying to deserialize old-shape data. The Whisper
+# transcript cache has no dependency on this and is unaffected.
+CANDIDATE_SCHEMA_VERSION = 3
 
 CHUNK_MINUTES = 10.0
 CHUNK_OVERLAP_MINUTES = 1.0

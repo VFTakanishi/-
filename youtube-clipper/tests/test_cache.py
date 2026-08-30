@@ -97,6 +97,44 @@ def test_stage2_with_stale_schema_version_is_treated_as_cache_miss():
     assert cache.load_stage2("vidB") is None
 
 
+def test_stage2_schema_v2_is_miss_and_v3_is_hit():
+    """The tool_use -> Structured Outputs migration bumped
+    CANDIDATE_SCHEMA_VERSION from 2 to 3. A cache written under the old
+    version 2 must be treated as a miss (forcing a fresh Stage2 run against
+    the new Claude-output access mechanism), while a cache written under
+    the current version 3 must hit normally.
+    """
+    assert config.CANDIDATE_SCHEMA_VERSION == 3
+
+    v2_payload = {
+        "schema_version": 2,
+        "candidates": [
+            {
+                "hook_type": "story",
+                "segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}],
+                "hook_text": "h", "opening_hook_strength": 80,
+                "title": "t", "description": "d", "score": 80,
+                "reasoning": "r", "caveats": "",
+            }
+        ],
+    }
+    cache.stage2_path("vidF").write_text(
+        json.dumps(v2_payload, ensure_ascii=False), encoding="utf-8"
+    )
+    assert cache.load_stage2("vidF") is None
+
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
+        hook_text="h", opening_hook_strength=80, title="t", description="d",
+        score=80, reasoning="r", caveats="",
+    )
+    cache.save_stage2("vidF", [raw, raw, raw])
+    loaded = cache.load_stage2("vidF")
+    assert loaded is not None
+    assert len(loaded) == 3
+
+
 def test_stage1_with_unversioned_legacy_shape_is_treated_as_cache_miss():
     """Even older caches (from before schema_version wrapping existed at
     all) were a bare list, not {"schema_version": ..., "chunks": [...]}.

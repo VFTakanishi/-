@@ -1,16 +1,16 @@
-import json
+from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from podcast_clipper import clip_selector, config
-from podcast_clipper.models import (
-    MalformedCandidateError,
-    RawClipCandidate,
-    RawUsedSegment,
-    Transcript,
-    TranscriptSegment,
-    TranscriptWord,
+from podcast_clipper.clip_selector import (
+    CandidateOutput,
+    CandidateSegmentOutput,
+    Stage1Output,
+    Stage2Output,
 )
+from podcast_clipper.models import RawClipCandidate, RawUsedSegment, Transcript, TranscriptSegment, TranscriptWord
 
 
 @pytest.fixture(autouse=True)
@@ -182,171 +182,138 @@ def test_select_candidates_caches_and_skips_recompute(monkeypatch):
     assert len(result) == 3
 
 
-# --- diagnostics for the 2026-08-30 "string indices must be integers, not
-# --- 'str'" incident: a malformed item from Claude's real tool_use
-# --- response reproduced that exact error with no traceback captured. These
-# --- pin that the parsing function now raises a diagnosable error naming
-# --- the stage, index, and actual type/value instead. No retry/repair
-# --- behavior is added -- this is diagnostics only.
+# --- Structured Outputs model tests (schema conformance is now guaranteed
+# --- by Claude's Structured Outputs at the API level; Pydantic is the local
+# --- enforcement of the constraints the API strips from the sent schema,
+# --- e.g. numeric ranges and array length -- see clip_selector.py's
+# --- CandidateOutput/Stage1Output/Stage2Output docstrings). No JSON-repair
+# --- code exists any more -- a malformed response is expected to raise a
+# --- pydantic.ValidationError (or be rejected by the SDK before it ever
+# --- reaches this code), not be silently patched up.
 
 
-def test_raw_candidate_from_tool_input_raises_diagnosable_error_when_candidate_is_str():
-    with pytest.raises(MalformedCandidateError) as exc_info:
-        clip_selector._raw_candidate_from_tool_input(
-            "oops not a dict", stage="Stage1", candidate_index=2
-        )
-    message = str(exc_info.value)
-    assert "Stage1" in message
-    assert "candidates[2]" in message
-    assert "str" in message
-    assert "oops not a dict" in message
+def _valid_segment_kwargs():
+    return {"role": "hook", "start_segment_id": 0, "end_segment_id": 0}
 
 
-def test_raw_candidate_from_tool_input_raises_diagnosable_error_when_segment_is_str():
-    malformed = {
-        "hook_type": "story",
-        "segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}, "bad segment"],
-        "hook_text": "h", "opening_hook_strength": 80,
-        "title": "t", "description": "d", "score": 80, "reasoning": "r", "caveats": "",
-    }
-    with pytest.raises(MalformedCandidateError) as exc_info:
-        clip_selector._raw_candidate_from_tool_input(
-            malformed, stage="Stage2", candidate_index=0
-        )
-    message = str(exc_info.value)
-    assert "Stage2" in message
-    assert "candidates[0].segments[1]" in message
-    assert "str" in message
-    assert "bad segment" in message
-
-
-# --- 2026-08-30 follow-up incident: real-machine diagnosis (job JSON's
-# --- error_traceback) confirmed the actual cause was
-# --- `block.input["candidates"]` arriving as a JSON-*encoded string*
-# --- (e.g. the literal text "[{...}, ...]") instead of an already-parsed
-# --- list, so `for c in ...["candidates"]` iterated the string character
-# --- by character and candidates[0] came out as "[". These tests use only
-# --- fixtures/mocks -- the autouse fixture above makes any accidental real
-# --- Anthropic call fail loudly instead of silently reaching the network.
-
-
-def _valid_candidate_dict():
+def _valid_candidate_kwargs():
     return {
         "hook_type": "story",
-        "segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}],
+        "segments": [_valid_segment_kwargs()],
         "hook_text": "h", "opening_hook_strength": 80,
         "title": "t", "description": "d", "score": 80, "reasoning": "r", "caveats": "",
     }
 
 
-# A: candidates is a normal list[dict] -> unaffected, still passes straight through
-def test_normalize_json_array_accepts_plain_list():
-    payload = [_valid_candidate_dict()]
-    assert clip_selector._normalize_json_array(payload, context="ctx") == payload
+# A: Stage1 may return 0 candidates
+def test_stage1_output_accepts_zero_candidates():
+    assert Stage1Output(candidates=[]).candidates == []
 
 
-# B: candidates is a JSON-encoded string of a valid array -> parsed successfully
-def test_normalize_json_array_decodes_valid_json_string_once():
-    payload = [_valid_candidate_dict(), _valid_candidate_dict()]
-    result = clip_selector._normalize_json_array(json.dumps(payload), context="ctx")
-    assert result == payload
+# B: Stage1 may return 1-3 candidates
+def test_stage1_output_accepts_one_to_three_candidates():
+    for n in (1, 2, 3):
+        out = Stage1Output(candidates=[CandidateOutput(**_valid_candidate_kwargs()) for _ in range(n)])
+        assert len(out.candidates) == n
 
 
-# C: candidates == "[" (the exact real-machine shape) -> diagnosable error
-def test_normalize_json_array_reproduces_the_reported_incident_shape():
-    with pytest.raises(MalformedCandidateError) as exc_info:
-        clip_selector._normalize_json_array("[", context="Stage1 candidates")
-    message = str(exc_info.value)
-    assert "Stage1 candidates" in message
-    assert "isn't valid JSON" in message
+def test_stage1_output_rejects_more_than_three_candidates():
+    with pytest.raises(ValidationError):
+        Stage1Output(candidates=[CandidateOutput(**_valid_candidate_kwargs()) for _ in range(4)])
 
 
-# D: candidates is a JSON string but decodes to a dict, not a list -> error
-def test_normalize_json_array_rejects_json_string_decoding_to_non_list():
-    with pytest.raises(MalformedCandidateError) as exc_info:
-        clip_selector._normalize_json_array(json.dumps({"not": "a list"}), context="ctx")
-    message = str(exc_info.value)
-    assert "ctx" in message
-    assert "dict" in message
+# C: Stage2 must return exactly 3 candidates
+def test_stage2_output_requires_exactly_three_candidates():
+    Stage2Output(candidates=[CandidateOutput(**_valid_candidate_kwargs()) for _ in range(3)])
+    with pytest.raises(ValidationError):
+        Stage2Output(candidates=[CandidateOutput(**_valid_candidate_kwargs()) for _ in range(2)])
+    with pytest.raises(ValidationError):
+        Stage2Output(candidates=[CandidateOutput(**_valid_candidate_kwargs()) for _ in range(4)])
 
 
-def test_normalize_json_array_rejects_non_list_non_str():
-    with pytest.raises(MalformedCandidateError):
-        clip_selector._normalize_json_array(123, context="ctx")
+# D: a candidate's segments must have 1-3 items
+def test_candidate_output_segments_length_bounds():
+    for n in (1, 2, 3):
+        kwargs = _valid_candidate_kwargs()
+        kwargs["segments"] = [_valid_segment_kwargs() for _ in range(n)]
+        CandidateOutput(**kwargs)
+
+    kwargs = _valid_candidate_kwargs()
+    kwargs["segments"] = []
+    with pytest.raises(ValidationError):
+        CandidateOutput(**kwargs)
+
+    kwargs = _valid_candidate_kwargs()
+    kwargs["segments"] = [_valid_segment_kwargs() for _ in range(4)]
+    with pytest.raises(ValidationError):
+        CandidateOutput(**kwargs)
 
 
-# E: candidate dict is fine, but its "segments" arrived as a JSON string -> parsed
-def test_raw_candidate_from_tool_input_accepts_segments_as_json_string():
-    payload = _valid_candidate_dict()
-    payload["segments"] = json.dumps(payload["segments"])
-    result = clip_selector._raw_candidate_from_tool_input(payload, stage="Stage1", candidate_index=0)
-    assert len(result.segments) == 1
-    assert result.segments[0].role == "hook"
+# E: opening_hook_strength must be within 0-100
+def test_candidate_output_opening_hook_strength_bounds():
+    for value in (0, 100):
+        kwargs = _valid_candidate_kwargs()
+        kwargs["opening_hook_strength"] = value
+        CandidateOutput(**kwargs)
+
+    for value in (-1, 101):
+        kwargs = _valid_candidate_kwargs()
+        kwargs["opening_hook_strength"] = value
+        with pytest.raises(ValidationError):
+            CandidateOutput(**kwargs)
 
 
-# F: "segments" is a broken JSON string -> diagnosable error
-def test_raw_candidate_from_tool_input_raises_for_malformed_segments_json_string():
-    payload = _valid_candidate_dict()
-    payload["segments"] = "not json at all ["
-    with pytest.raises(MalformedCandidateError) as exc_info:
-        clip_selector._raw_candidate_from_tool_input(payload, stage="Stage2", candidate_index=1)
-    message = str(exc_info.value)
-    assert "Stage2 candidates[1].segments" in message
-    assert "isn't valid JSON" in message
+# F: score must be within 0-100
+def test_candidate_output_score_bounds():
+    for value in (0, 100):
+        kwargs = _valid_candidate_kwargs()
+        kwargs["score"] = value
+        CandidateOutput(**kwargs)
+
+    for value in (-1, 101):
+        kwargs = _valid_candidate_kwargs()
+        kwargs["score"] = value
+        with pytest.raises(ValidationError):
+            CandidateOutput(**kwargs)
 
 
-# G: "segments" is a JSON string that decodes to something other than a list -> error
-def test_raw_candidate_from_tool_input_raises_when_segments_json_decodes_to_non_list():
-    payload = _valid_candidate_dict()
-    payload["segments"] = json.dumps({"role": "hook"})
-    with pytest.raises(MalformedCandidateError) as exc_info:
-        clip_selector._raw_candidate_from_tool_input(payload, stage="Stage1", candidate_index=0)
-    assert "segments" in str(exc_info.value)
+# G: an invalid hook_type must be rejected
+def test_candidate_output_rejects_invalid_hook_type():
+    kwargs = _valid_candidate_kwargs()
+    kwargs["hook_type"] = "not_a_real_hook_type"
+    with pytest.raises(ValidationError):
+        CandidateOutput(**kwargs)
 
 
-# H: the candidate item itself is a JSON-encoded object string -- must NOT be
-# silently json.loads()'d; the tolerance is scoped to the candidates/segments
-# *arrays* only, never to an individual item.
-def test_raw_candidate_from_tool_input_does_not_decode_a_json_string_candidate_itself():
-    single_candidate_as_json_string = json.dumps(_valid_candidate_dict())
-    with pytest.raises(MalformedCandidateError) as exc_info:
-        clip_selector._raw_candidate_from_tool_input(
-            single_candidate_as_json_string, stage="Stage1", candidate_index=0
-        )
-    assert "got str" in str(exc_info.value)
+# H: an invalid segment role must be rejected
+def test_candidate_segment_output_rejects_invalid_role():
+    with pytest.raises(ValidationError):
+        CandidateSegmentOutput(role="not_a_real_role", start_segment_id=0, end_segment_id=0)
 
 
-class _FakeToolUseBlock:
-    def __init__(self, type_, name, input_):
-        self.type = type_
-        self.name = name
-        self.input = input_
+# I: a wrongly-typed segment id must be rejected
+def test_candidate_segment_output_rejects_wrongly_typed_segment_id():
+    with pytest.raises(ValidationError):
+        CandidateSegmentOutput(role="hook", start_segment_id=["not", "an", "int"], end_segment_id=0)
 
 
-class _FakeResponse:
-    def __init__(self, content):
-        self.content = content
+class _FakeMessages:
+    def __init__(self, parsed_output):
+        self._parsed_output = parsed_output
+
+    def parse(self, **kwargs):
+        return SimpleNamespace(parsed_output=self._parsed_output)
 
 
-def test_extract_candidates_for_chunk_handles_candidates_as_json_string(monkeypatch):
-    """Stage1 end to end, with the Anthropic client fully mocked (no real
-    API call): the exact real-machine shape (`candidates` returned as a
-    JSON-encoded string) must resolve to real RawClipCandidate objects
-    instead of crashing.
-    """
-    fake_block = _FakeToolUseBlock(
-        "tool_use", "submit_chunk_candidates",
-        {"candidates": json.dumps([_valid_candidate_dict()])},
-    )
+class _FakeClient:
+    def __init__(self, parsed_output):
+        self.messages = _FakeMessages(parsed_output)
 
-    class _FakeMessages:
-        def create(self, **kwargs):
-            return _FakeResponse([fake_block])
 
-    class _FakeClient:
-        messages = _FakeMessages()
-
-    monkeypatch.setattr(clip_selector, "_client", lambda: _FakeClient())
+# J: Stage1 output converts correctly into RawClipCandidate
+def test_extract_candidates_for_chunk_converts_structured_output(monkeypatch):
+    parsed = Stage1Output(candidates=[CandidateOutput(**_valid_candidate_kwargs())])
+    monkeypatch.setattr(clip_selector, "_client", lambda: _FakeClient(parsed))
 
     segments = [_segment(0, start=0.0)]
     result = clip_selector.extract_candidates_for_chunk(segments, "タイトル")
@@ -354,28 +321,24 @@ def test_extract_candidates_for_chunk_handles_candidates_as_json_string(monkeypa
     assert len(result) == 1
     assert isinstance(result[0], RawClipCandidate)
     assert result[0].hook_type == "story"
+    assert result[0].segments[0].role == "hook"
 
 
-def test_rank_and_finalize_handles_candidates_as_json_string(monkeypatch):
-    """Stage2 end to end, with the Anthropic client fully mocked (no real
-    API call): same JSON-string `candidates` shape as Stage1.
-    """
-    three_candidates = [_valid_candidate_dict() for _ in range(3)]
-    fake_block = _FakeToolUseBlock(
-        "tool_use", "submit_final_candidates", {"candidates": json.dumps(three_candidates)}
-    )
-
-    class _FakeMessages:
-        def create(self, **kwargs):
-            return _FakeResponse([fake_block])
-
-    class _FakeClient:
-        messages = _FakeMessages()
-
-    monkeypatch.setattr(clip_selector, "_client", lambda: _FakeClient())
+# K: Stage2 output converts correctly into RawClipCandidate, exactly 3
+def test_rank_and_finalize_converts_structured_output(monkeypatch):
+    parsed = Stage2Output(candidates=[CandidateOutput(**_valid_candidate_kwargs()) for _ in range(3)])
+    monkeypatch.setattr(clip_selector, "_client", lambda: _FakeClient(parsed))
 
     transcript = _long_transcript(minutes=1)
     result = clip_selector.rank_and_finalize([_raw_candidate(0, 0)], transcript, "タイトル")
 
     assert len(result) == 3
     assert all(isinstance(c, RawClipCandidate) for c in result)
+
+
+# P: the real Anthropic client must never be constructed, even by the safety
+# net's own escape hatch -- confirms _forbid_real_anthropic_client actually
+# poisons the constructor rather than silently no-oping.
+def test_forbid_real_anthropic_client_fixture_actually_blocks_construction():
+    with pytest.raises(AssertionError):
+        clip_selector._client()
