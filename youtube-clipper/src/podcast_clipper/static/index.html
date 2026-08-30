@@ -30,6 +30,10 @@
       <p class="hint">文字起こしとStage1候補は再利用します。Claudeへの新規要求はStage2ランキング1回だけです。</p>
       <button id="refresh-candidates-btn">保存済み解析から候補を選び直す</button>
     </div>
+    <div id="refresh-stage1-box" class="hidden">
+      <p class="hint">文字起こしは再利用します。Stage1候補をClaudeで作り直し、必要ならStage2ランキングを1回実行します。Whisperは再実行しません。</p>
+      <button id="refresh-stage1-btn">文字起こしを再利用して候補解析をやり直す</button>
+    </div>
   </section>
 
   <section id="candidates-section" class="card hidden">

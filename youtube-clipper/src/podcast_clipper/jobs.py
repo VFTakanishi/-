@@ -64,7 +64,7 @@ def _now() -> str:
 @dataclass
 class Job:
     id: str
-    type: str  # "analyze" | "render" | "refresh_candidates"
+    type: str  # "analyze" | "render" | "refresh_candidates" | "refresh_stage1"
     status: str
     created_at: str
     updated_at: str

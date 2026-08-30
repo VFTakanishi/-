@@ -8,6 +8,11 @@ const HOOK_TYPE_LABELS = {
 const ROLE_LABELS = { hook: "フック", context: "文脈", answer: "答え", payoff: "核心" };
 
 let analyzeJobId = null;
+// Which action produced the currently-polled analyze-style job --
+// "analyze" | "refresh_candidates" | "refresh_stage1" -- used on failure
+// to decide which recovery button (if any) to offer next, so a failed
+// refresh_stage1 job doesn't loop back to offering the same actions again.
+let analyzeJobKind = "analyze";
 let analyzePollTimer = null;
 let renderPollTimer = null;
 
@@ -138,6 +143,8 @@ document.getElementById("analyze-btn").addEventListener("click", async () => {
   document.getElementById("candidates-section").classList.add("hidden");
   document.getElementById("render-section").classList.add("hidden");
   document.getElementById("refresh-candidates-box").classList.add("hidden");
+  document.getElementById("refresh-stage1-box").classList.add("hidden");
+  analyzeJobKind = "analyze";
 
   try {
     const { job_id } = await uploadAndAnalyze(selectedFile);
@@ -170,9 +177,20 @@ function pollAnalyze() {
         statusEl.textContent = `解析に失敗しました: ${job.error || "不明なエラー"}`;
         statusEl.className = "status error";
         // Retrying with the same "解析開始" button re-hits the same
-        // Stage2 cache and fails identically -- offer the low-cost
-        // candidate-only re-selection instead of a dead-end error.
-        document.getElementById("refresh-candidates-box").classList.remove("hidden");
+        // Stage2 cache and fails identically -- offer a cheaper recovery
+        // action instead of a dead-end error. Which one depends on what
+        // just failed: a first-time analyze failure offers the low-cost
+        // candidate-only re-selection; if *that* then fails because the
+        // cached Stage1 candidates themselves no longer meet the current
+        // quality bar, offer the next tier up (regenerate Stage1) instead
+        // of looping back to the same action. A failed refresh_stage1 job
+        // gets no further automatic escalation -- a full Whisper
+        // re-analysis stays a separate, manual action.
+        if (analyzeJobKind === "analyze") {
+          document.getElementById("refresh-candidates-box").classList.remove("hidden");
+        } else if (analyzeJobKind === "refresh_candidates") {
+          document.getElementById("refresh-stage1-box").classList.remove("hidden");
+        }
       }
     })
     .catch((e) => {
@@ -184,11 +202,30 @@ function pollAnalyze() {
 document.getElementById("refresh-candidates-btn").addEventListener("click", async () => {
   const statusEl = document.getElementById("analyze-status");
   document.getElementById("refresh-candidates-box").classList.add("hidden");
+  document.getElementById("refresh-stage1-box").classList.add("hidden");
   statusEl.className = "status";
   statusEl.textContent = "保存済みキャッシュから候補を選び直しています…";
+  analyzeJobKind = "refresh_candidates";
 
   try {
     const { job_id } = await postJSON(`/api/jobs/${analyzeJobId}/refresh-candidates`, {});
+    analyzeJobId = job_id;
+    pollAnalyze();
+  } catch (e) {
+    statusEl.textContent = `エラー: ${e.message}`;
+    statusEl.className = "status error";
+  }
+});
+
+document.getElementById("refresh-stage1-btn").addEventListener("click", async () => {
+  const statusEl = document.getElementById("analyze-status");
+  document.getElementById("refresh-stage1-box").classList.add("hidden");
+  statusEl.className = "status";
+  statusEl.textContent = "Stage1候補を作り直しています…";
+  analyzeJobKind = "refresh_stage1";
+
+  try {
+    const { job_id } = await postJSON(`/api/jobs/${analyzeJobId}/refresh-stage1`, {});
     analyzeJobId = job_id;
     pollAnalyze();
   } catch (e) {

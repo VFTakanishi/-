@@ -554,6 +554,21 @@ def select_candidates(
             f"（{config.NUM_CANDIDATES}件必要）。APIへの自動再要求は行いません。"
         )
 
+    return _rank_finalize_and_cache(filtered, transcript, video_title)
+
+
+def _rank_finalize_and_cache(
+    filtered: list[RawClipCandidate], transcript: Transcript, video_title: str
+) -> list[RawClipCandidate]:
+    """Stage2 ranking (at most once) -> finalize_candidates -> cache.save_stage2
+    on success only. Shared by select_candidates, refresh_candidates_only,
+    and refresh_stage1_and_candidates so all three apply the identical
+    final correction/caching rule instead of each re-implementing it. If
+    finalize_candidates raises (too few candidates remain eligible after
+    ending-completeness/duration re-validation), the Stage2 cache is never
+    touched -- callers only ever see either a full, cached, finalized
+    result or an exception, never a partially-written cache.
+    """
     id_map = {f"s1_c{i:03d}": c for i, c in enumerate(filtered)}
     ranked_ids = rank_candidates(id_map, transcript, video_title)
     top_ids = ranked_ids[: config.NUM_CANDIDATES]
@@ -626,16 +641,37 @@ def refresh_candidates_only(
             f"（{config.NUM_CANDIDATES}件必要）。完全な再解析が必要です。"
         )
 
-    id_map = {f"s1_c{i:03d}": c for i, c in enumerate(filtered)}
-    ranked_ids = rank_candidates(id_map, transcript, video_title)
-    top_ids = ranked_ids[: config.NUM_CANDIDATES]
-    if len(top_ids) < config.NUM_CANDIDATES:
+    return _rank_finalize_and_cache(filtered, transcript, video_title)
+
+
+def refresh_stage1_and_candidates(
+    transcript: Transcript, video_title: str
+) -> list[RawClipCandidate]:
+    """Mid-cost re-analysis: reuses the already-cached Transcript (never
+    re-runs Whisper) but regenerates Stage1 candidates for every chunk via
+    run_stage1(..., force_refresh=True) -- ignoring any existing Stage1
+    chunk cache entirely -- because the whole point of this path is that
+    the old Stage1 candidates no longer clear the current local quality
+    filter (refresh_candidates_only, which only reuses cached Stage1
+    results, can't fix that). Each chunk's new result is still saved the
+    moment it succeeds (run_stage1 -> cache.save_stage1_chunk), so a later
+    chunk's API failure never discards an earlier chunk's freshly-paid-for
+    result, and there are zero automatic retries either way
+    (structured_output.py's max_retries=0, unchanged).
+
+    After Stage1, the identical local quality filter runs, and if fewer
+    than config.NUM_CANDIDATES candidates survive, this raises *before*
+    ever calling Stage2 ranking -- a mid-cost re-analysis attempt must
+    never silently cascade into more API spend than Stage1 (chunk count)
+    + at most one Stage2 call.
+    """
+    stage1_candidates = run_stage1(transcript, video_title, force_refresh=True)
+    filtered = _filter_local_quality(stage1_candidates, transcript)
+    if len(filtered) < config.NUM_CANDIDATES:
         raise RuntimeError(
-            f"Stage2ランキングが有効な候補ID{len(top_ids)}件しか返しませんでした"
-            f"（{config.NUM_CANDIDATES}件必要）。APIへの自動再要求は行いません。"
+            f"Stage1を再解析しましたが、現在の品質基準を満たす候補が{len(filtered)}件しか"
+            f"ありませんでした（{config.NUM_CANDIDATES}件必要）。"
+            "Stage2ランキングは実行していません。"
         )
 
-    finalists = [id_map[cid] for cid in top_ids]
-    finalized = finalize_candidates(finalists, transcript)
-    cache.save_stage2(transcript.video_id, finalized)
-    return finalized
+    return _rank_finalize_and_cache(filtered, transcript, video_title)

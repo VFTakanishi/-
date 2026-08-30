@@ -902,3 +902,123 @@ def test_refresh_candidates_only_raises_without_stage2_call_when_too_few_pass_lo
 
     with pytest.raises(RuntimeError, match="ローカル品質フィルタ"):
         clip_selector.refresh_candidates_only(transcript, "タイトル")
+
+
+# --- refresh_stage1_and_candidates: mid-cost re-analysis (Stage1 rebuilt) -
+# (Transcript is reused, never re-transcribed; every Stage1 chunk is
+# regenerated via the Stage1 API regardless of existing chunk cache; Stage2
+# ranking runs at most once -- see web.py's /api/jobs/{id}/refresh-stage1,
+# the "Stage1からやり直す" UI action)
+
+
+def test_refresh_stage1_and_candidates_ignores_existing_stage1_cache(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    # A stale cached chunk result that would fail the current quality
+    # filter (weak opening_hook_strength) -- refresh_stage1_and_candidates
+    # must never reuse this, only what a fresh Stage1 call returns.
+    stale_bad = [_raw_candidate(0, 0, opening_hook_strength=10)]
+    cache.save_stage1_chunk(transcript.video_id, 0, stale_bad)
+
+    fresh_good = [_raw_candidate(0, 2, opening_hook_strength=90) for _ in range(3)]
+    call_count = {"n": 0}
+
+    def _fake_extract(chunk_segments, video_title):
+        call_count["n"] += 1
+        return fresh_good
+
+    monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", _fake_extract)
+    monkeypatch.setattr(clip_selector, "rank_candidates", lambda id_map, t, title: list(id_map.keys()))
+
+    result = clip_selector.refresh_stage1_and_candidates(transcript, "タイトル")
+
+    assert len(result) == 3
+    assert call_count["n"] == 1  # exactly one chunk for a 1-minute transcript
+    # The stale, weak-opening candidate must be gone: Stage1 was fully
+    # regenerated, not reused from the existing (now-outdated) cache --
+    # and the chunk cache on disk is overwritten with the new result.
+    reloaded_chunk = cache.load_stage1_chunk(transcript.video_id, 0)
+    assert all(c.opening_hook_strength == 90 for c in reloaded_chunk)
+    # The finalized Stage2 result is saved too.
+    reloaded_stage2 = cache.load_stage2(transcript.video_id)
+    assert len(reloaded_stage2) == 3
+
+
+def test_refresh_stage1_and_candidates_keeps_earlier_chunk_success_on_later_failure(monkeypatch):
+    monkeypatch.setattr(config, "CHUNK_MINUTES", 10.0)
+    monkeypatch.setattr(config, "CHUNK_OVERLAP_MINUTES", 1.0)
+    transcript = _long_transcript(minutes=25)
+    chunks = clip_selector._build_chunks(clip_selector._usable_segments(transcript))
+    assert len(chunks) >= 2  # sanity: this test needs at least 2 chunks
+
+    good = [_raw_candidate(0, 2, opening_hook_strength=90)]
+    call_count = {"n": 0}
+
+    def _fake_extract(chunk_segments, video_title):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return good
+        raise RuntimeError("simulated Stage1 API failure on chunk 2")
+
+    monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", _fake_extract)
+    monkeypatch.setattr(
+        clip_selector, "rank_candidates",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("Stage2 must not be called")),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated Stage1 API failure"):
+        clip_selector.refresh_stage1_and_candidates(transcript, "タイトル")
+
+    # No retry on the failing chunk -- extract_candidates_for_chunk was
+    # called exactly once per chunk attempted (chunk 0 succeeded, chunk 1
+    # failed once and the exception propagated straight through).
+    assert call_count["n"] == 2
+    # The first chunk's freshly-generated result must still be on disk --
+    # a later chunk's failure never discards an earlier chunk's
+    # already-paid-for result.
+    assert cache.load_stage1_chunk(transcript.video_id, 0) is not None
+
+
+def test_refresh_stage1_and_candidates_raises_without_stage2_call_when_too_few_pass_local_filter(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
+    transcript = _long_transcript(minutes=1)
+    # Freshly "regenerated" Stage1 candidates that still don't clear the
+    # current quality filter -- Stage2 must never be reached (Anthropic
+    # API calls = 0 for this failure).
+    weak_candidates = [_raw_candidate(0, 0, opening_hook_strength=90)]
+
+    monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", lambda *a, **k: weak_candidates)
+    monkeypatch.setattr(
+        clip_selector, "rank_candidates",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("Stage2 must not be called")),
+    )
+
+    with pytest.raises(RuntimeError, match="現在の品質基準を満たす候補"):
+        clip_selector.refresh_stage1_and_candidates(transcript, "タイトル")
+
+
+def test_refresh_stage1_and_candidates_does_not_overwrite_stage2_cache_when_finalize_fails(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+
+    # Existing Stage2 cache from a prior successful run -- must survive
+    # completely untouched if this refresh's final gate fails.
+    old_stage2 = [_raw_candidate(0, 2, opening_hook_strength=90)] * 3
+    cache.save_stage2(transcript.video_id, old_stage2)
+
+    fresh_candidates = [_raw_candidate(0, 2, opening_hook_strength=90) for _ in range(3)]
+    monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", lambda *a, **k: fresh_candidates)
+    # Stage2 ranking runs (costs 1 API call) but returns only 2 valid ids --
+    # _rank_finalize_and_cache must raise before ever calling
+    # cache.save_stage2, leaving the old cache exactly as it was.
+    monkeypatch.setattr(clip_selector, "rank_candidates", lambda id_map, t, title: list(id_map.keys())[:2])
+
+    with pytest.raises(RuntimeError, match="有効な候補ID"):
+        clip_selector.refresh_stage1_and_candidates(transcript, "タイトル")
+
+    reloaded = cache.load_stage2(transcript.video_id)
+    assert len(reloaded) == 3
+    assert all(c.segments[0].end_segment_id == 2 for c in reloaded)  # untouched old cache

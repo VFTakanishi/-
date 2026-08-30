@@ -403,6 +403,78 @@ def test_refresh_candidates_endpoint_reuses_analyze_job_input_without_rerunning_
     assert refresh_job["result"]["video_id"] == job["input"]["video_id"]
 
 
+def test_refresh_stage1_endpoint_reuses_job_input_without_rerunning_whisper(monkeypatch):
+    """The mid-cost Stage1 re-analysis action must work off a *failed*
+    refresh-candidates job (the exact "cached Stage1 candidates no longer
+    meet the quality bar" scenario from the real-machine incident),
+    reusing only job.input (video_id/video_title) -- never job.result --
+    and must never re-run transcribe_video (Whisper), only
+    clip_selector.refresh_stage1_and_candidates.
+    """
+    monkeypatch.setattr(ingest, "_probe_duration", lambda path: 6.0)
+
+    def fake_transcribe(path, vid, force_refresh=False):
+        t = _fake_transcript(vid)
+        cache.save_transcript(t)
+        return t
+
+    def fake_select_candidates_failing(transcript, title, force_refresh=False):
+        raise RuntimeError("有効な3候補を確保できませんでした（テスト用）")
+
+    monkeypatch.setattr(transcribe, "transcribe_video", fake_transcribe)
+    monkeypatch.setattr(
+        "podcast_clipper.web.clip_selector.select_candidates", fake_select_candidates_failing
+    )
+
+    client = TestClient(web.app)
+    resp = client.post(
+        "/api/analyze",
+        files={"file": ("テスト番組5.mp4", io.BytesIO(_FAKE_VIDEO_BYTES), "video/mp4")},
+    )
+    analyze_job_id = resp.json()["job_id"]
+    job = _wait_for_status(client, f"/api/jobs/{analyze_job_id}", {"completed", "failed"})
+    assert job["status"] == "failed"
+
+    def fake_refresh_candidates_only_failing(transcript, title):
+        raise RuntimeError("保存済みStage1候補のうちローカル品質フィルタを通過したのは2件です（テスト用）")
+
+    monkeypatch.setattr(
+        "podcast_clipper.web.clip_selector.refresh_candidates_only", fake_refresh_candidates_only_failing
+    )
+
+    resp = client.post(f"/api/jobs/{analyze_job_id}/refresh-candidates")
+    refresh_job_id = resp.json()["job_id"]
+    refresh_job = _wait_for_status(client, f"/api/jobs/{refresh_job_id}", {"completed", "failed"})
+    assert refresh_job["status"] == "failed"
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("Whisper must not be re-run for the Stage1 re-analysis action")
+
+    monkeypatch.setattr(transcribe, "transcribe_video", fail_if_called)
+
+    def fake_refresh_stage1_and_candidates(transcript, title):
+        assert transcript.video_id == refresh_job["input"]["video_id"]
+        assert title == refresh_job["input"]["video_title"]
+        return [_fake_raw_candidate() for _ in range(3)]
+
+    monkeypatch.setattr(
+        "podcast_clipper.web.clip_selector.refresh_stage1_and_candidates",
+        fake_refresh_stage1_and_candidates,
+    )
+
+    # The Stage1 re-analysis button can be triggered off any prior
+    # analyze-style job in this chain -- here off the refresh_candidates
+    # job that itself just failed, matching the real UI flow.
+    resp = client.post(f"/api/jobs/{refresh_job_id}/refresh-stage1")
+    assert resp.status_code == 200
+    stage1_job_id = resp.json()["job_id"]
+
+    stage1_job = _wait_for_status(client, f"/api/jobs/{stage1_job_id}", {"completed", "failed"})
+    assert stage1_job["status"] == "completed", stage1_job.get("error")
+    assert len(stage1_job["result"]["candidates"]) == 3
+    assert stage1_job["result"]["video_id"] == refresh_job["input"]["video_id"]
+
+
 def test_serialize_candidate_includes_total_duration():
     """Low-level pin for the exact bug reported in real-machine E2E: the
     frontend called c.total_duration.toFixed(1), but total_duration is a

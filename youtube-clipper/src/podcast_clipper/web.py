@@ -163,6 +163,35 @@ def _run_refresh_candidates(job: jobs.Job) -> dict[str, Any]:
     }
 
 
+def _run_refresh_stage1(job: jobs.Job) -> dict[str, Any]:
+    """Mid-cost re-analysis: reuses the cached Transcript (never calls
+    transcribe.transcribe_video / Whisper) but regenerates Stage1 for
+    every chunk via clip_selector.refresh_stage1_and_candidates -- for
+    when the cached Stage1 candidates themselves no longer clear the
+    current local quality filter, which refresh_candidates_only (reusing
+    Stage1 cache as-is) can't fix. Same result shape as
+    _run_analyze/_run_refresh_candidates.
+    """
+    video_id = job.input["video_id"]
+    video_title = job.input["video_title"]
+
+    transcript = cache.load_transcript(video_id)
+    if transcript is None:
+        raise RuntimeError("文字起こしのキャッシュが見つかりません。最初から解析をやり直してください")
+
+    raw_candidates = clip_selector.refresh_stage1_and_candidates(transcript, video_title)
+    resolved = [
+        boundary.resolve_candidate(rc, transcript, candidate_id=f"c{i + 1}")
+        for i, rc in enumerate(raw_candidates)
+    ]
+
+    return {
+        "video_id": video_id,
+        "video_title": video_title,
+        "candidates": [_serialize_candidate(c) for c in resolved],
+    }
+
+
 @app.post("/api/analyze")
 def analyze(file: UploadFile = File(...), force_refresh: bool = Form(False)) -> dict[str, Any]:
     # Persisted to disk synchronously, before the background job is created:
@@ -230,6 +259,26 @@ def refresh_candidates(job_id: str) -> dict[str, Any]:
 
     new_job = jobs.create_job("refresh_candidates", dict(analyze_job.input))
     jobs.run_async(new_job, _run_refresh_candidates, running_status="analyzing")
+    return {"job_id": new_job.id}
+
+
+@app.post("/api/jobs/{job_id}/refresh-stage1")
+def refresh_stage1(job_id: str) -> dict[str, Any]:
+    """Kicks off the mid-cost Stage1 re-analysis (see _run_refresh_stage1)
+    against the same video an earlier analyze/refresh-candidates job
+    already processed -- reusing only job.input (video_id/video_title),
+    which works even when that job's own result was a RuntimeError (e.g.
+    "cached Stage1 candidates no longer meet the quality bar"). Never
+    issued automatically: the frontend only calls this when the user
+    explicitly clicks the "Stage1からやり直す" action, since it costs one
+    Anthropic API call per Stage1 chunk plus at most one Stage2 call.
+    """
+    analyze_job = jobs.get_job(job_id)
+    if analyze_job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    new_job = jobs.create_job("refresh_stage1", dict(analyze_job.input))
+    jobs.run_async(new_job, _run_refresh_stage1, running_status="analyzing")
     return {"job_id": new_job.id}
 
 
