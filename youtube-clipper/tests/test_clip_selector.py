@@ -387,6 +387,77 @@ def test_select_candidates_applies_ending_correction_to_cached_candidates(monkey
         assert c.segments[-1].end_segment_id == 2  # extended past the stale mid-utterance cutoff
 
 
+def test_select_candidates_cache_hit_rewrites_cache_with_finalized_candidates(monkeypatch):
+    """The Stage2 cache on disk must be normalized to the finalized
+    (ending-corrected/duration-validated) state the moment a cache hit
+    succeeds -- otherwise web.py's render path, which reads
+    cache.load_stage2 directly, would still see the stale pre-correction
+    candidates even though the UI already showed the corrected ones.
+    """
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
+    )
+    stale_cached_candidate = _raw_candidate(0, 1, opening_hook_strength=90)
+    cache.save_stage2(transcript.video_id, [stale_cached_candidate] * 3)
+
+    result = clip_selector.select_candidates(transcript, "タイトル")
+    assert all(c.segments[-1].end_segment_id == 2 for c in result)
+
+    # Re-reading the cache from scratch (a fresh load, simulating what
+    # web._run_render would see) must return the already-finalized state,
+    # not the original stale end_segment_id=1.
+    reloaded = cache.load_stage2(transcript.video_id)
+    assert all(c.segments[-1].end_segment_id == 2 for c in reloaded)
+
+
+def test_select_candidates_cache_hit_does_not_rewrite_cache_when_insufficient_valid(monkeypatch):
+    """When a cache hit doesn't have enough eligible candidates after
+    finalization, select_candidates must raise *without* touching the
+    on-disk cache -- never overwrite it with a known-insufficient result,
+    and never silently discard the original (potentially still-useful for
+    diagnosis, or for a future local-rule change) cached data.
+    """
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 5.0)
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
+    )
+    stale_cached_candidate = _raw_candidate(0, 1, opening_hook_strength=90)
+    cache.save_stage2(transcript.video_id, [stale_cached_candidate] * 3)
+
+    with pytest.raises(RuntimeError, match="有効な"):
+        clip_selector.select_candidates(transcript, "タイトル")
+
+    # The cache must be completely untouched -- still the original 3
+    # stale candidates, not overwritten with an empty/partial result.
+    reloaded = cache.load_stage2(transcript.video_id)
+    assert len(reloaded) == 3
+    assert all(c.segments[-1].end_segment_id == 1 for c in reloaded)
+
+
+def test_select_candidates_fresh_path_saves_finalized_candidates_to_cache(monkeypatch):
+    """The fresh (non-cache-hit) path must also save the finalized
+    (post-extension) candidates to disk, not the raw Stage2 picks --
+    cache.save_stage2 must run *after* finalize_candidates, never before.
+    """
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
+    )
+    candidate = _raw_candidate(0, 1, opening_hook_strength=90)
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: [candidate] * 4)
+    monkeypatch.setattr(clip_selector, "rank_candidates", lambda id_map, t, title: list(id_map.keys()))
+
+    result = clip_selector.select_candidates(transcript, "タイトル")
+    assert all(c.segments[-1].end_segment_id == 2 for c in result)
+
+    reloaded = cache.load_stage2(transcript.video_id)
+    assert all(c.segments[-1].end_segment_id == 2 for c in reloaded)
+
+
 def test_select_candidates_raises_when_all_cached_candidates_exceed_hard_max_after_extension(monkeypatch):
     """D: a cached candidate is never kept just because there's no
     substitute -- reaching a natural ending past DURATION_HARD_MAX_SEC
@@ -763,3 +834,71 @@ def test_select_candidates_calls_stage2_at_most_once(monkeypatch):
     monkeypatch.setattr(clip_selector, "rank_candidates", _fake_rank_candidates)
     clip_selector.select_candidates(transcript, "タイトル")
     assert call_count["n"] == 1
+
+
+# --- refresh_candidates_only: low-cost re-selection from cache only ------
+# (reuses the already-cached Transcript + Stage1 chunk cache, never calls
+# the Stage1 API, calls Stage2 ranking at most once -- see web.py's
+# /api/jobs/{id}/refresh-candidates, the "候補だけ再選定" UI action)
+
+
+def test_refresh_candidates_only_calls_stage2_exactly_once_with_enough_stage1_cache(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    candidates = [_raw_candidate(0, 2, opening_hook_strength=90) for _ in range(3)]
+    cache.save_stage1_chunk(transcript.video_id, 0, candidates)
+
+    call_count = {"n": 0}
+
+    def _fake_rank_candidates(id_map, t, title):
+        call_count["n"] += 1
+        return list(id_map.keys())
+
+    monkeypatch.setattr(clip_selector, "rank_candidates", _fake_rank_candidates)
+    monkeypatch.setattr(
+        clip_selector, "extract_candidates_for_chunk",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("Stage1 API must not be called")),
+    )
+
+    result = clip_selector.refresh_candidates_only(transcript, "タイトル")
+
+    assert len(result) == 3
+    assert call_count["n"] == 1
+    # The finalized result is saved to the same Stage2 cache
+    # select_candidates uses, so a subsequent render sees it too.
+    reloaded = cache.load_stage2(transcript.video_id)
+    assert len(reloaded) == 3
+
+
+def test_refresh_candidates_only_raises_without_stage2_call_when_stage1_cache_incomplete(monkeypatch):
+    # No Stage1 chunk cache saved at all -- refresh_candidates_only must
+    # never call the Stage1 API to fill the gap, and must never reach
+    # Stage2 ranking either (Anthropic API calls = 0 for this failure).
+    transcript = _long_transcript(minutes=1)
+    monkeypatch.setattr(
+        clip_selector, "rank_candidates",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("Stage2 must not be called")),
+    )
+
+    with pytest.raises(RuntimeError, match="Stage1候補キャッシュ"):
+        clip_selector.refresh_candidates_only(transcript, "タイトル")
+
+
+def test_refresh_candidates_only_raises_without_stage2_call_when_too_few_pass_local_filter(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
+    transcript = _long_transcript(minutes=1)
+    # single 2-second segment candidates -- far below the 20s hard minimum,
+    # so none survive _filter_local_quality and Stage2 must never be
+    # reached (Anthropic API calls = 0 for this failure too).
+    candidates = [_raw_candidate(0, 0, opening_hook_strength=90) for _ in range(3)]
+    cache.save_stage1_chunk(transcript.video_id, 0, candidates)
+
+    monkeypatch.setattr(
+        clip_selector, "rank_candidates",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("Stage2 must not be called")),
+    )
+
+    with pytest.raises(RuntimeError, match="ローカル品質フィルタ"):
+        clip_selector.refresh_candidates_only(transcript, "タイトル")

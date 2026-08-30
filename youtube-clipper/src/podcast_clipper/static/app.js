@@ -137,6 +137,7 @@ document.getElementById("analyze-btn").addEventListener("click", async () => {
   statusEl.textContent = "解析を開始しています…";
   document.getElementById("candidates-section").classList.add("hidden");
   document.getElementById("render-section").classList.add("hidden");
+  document.getElementById("refresh-candidates-box").classList.add("hidden");
 
   try {
     const { job_id } = await uploadAndAnalyze(selectedFile);
@@ -168,6 +169,10 @@ function pollAnalyze() {
       } else if (job.status === "failed") {
         statusEl.textContent = `解析に失敗しました: ${job.error || "不明なエラー"}`;
         statusEl.className = "status error";
+        // Retrying with the same "解析開始" button re-hits the same
+        // Stage2 cache and fails identically -- offer the low-cost
+        // candidate-only re-selection instead of a dead-end error.
+        document.getElementById("refresh-candidates-box").classList.remove("hidden");
       }
     })
     .catch((e) => {
@@ -175,6 +180,22 @@ function pollAnalyze() {
       statusEl.className = "status error";
     });
 }
+
+document.getElementById("refresh-candidates-btn").addEventListener("click", async () => {
+  const statusEl = document.getElementById("analyze-status");
+  document.getElementById("refresh-candidates-box").classList.add("hidden");
+  statusEl.className = "status";
+  statusEl.textContent = "保存済みキャッシュから候補を選び直しています…";
+
+  try {
+    const { job_id } = await postJSON(`/api/jobs/${analyzeJobId}/refresh-candidates`, {});
+    analyzeJobId = job_id;
+    pollAnalyze();
+  } catch (e) {
+    statusEl.textContent = `エラー: ${e.message}`;
+    statusEl.className = "status error";
+  }
+});
 
 function renderCandidates(candidates) {
   const section = document.getElementById("candidates-section");

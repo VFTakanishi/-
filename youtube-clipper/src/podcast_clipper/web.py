@@ -102,6 +102,16 @@ def _run_render(job: jobs.Job) -> dict[str, Any]:
     if transcript is None or raw_candidates is None:
         raise RuntimeError("文字起こし/候補のキャッシュが見つかりません。解析をやり直してください")
 
+    # Never index into the raw cache read directly: cache.load_stage2 can
+    # return a pre-correction result (an older cache file written before
+    # this normalization existed, or any other path that saved candidates
+    # without going through clip_selector.select_candidates/
+    # refresh_candidates_only). Re-applying finalize_candidates here makes
+    # this self-healing and guarantees render always uses the identical
+    # ending-corrected/duration-validated/opening-trimmed candidate the UI
+    # showed -- never a stale, mid-utterance-ending raw one.
+    raw_candidates = clip_selector.finalize_candidates(raw_candidates, transcript)
+
     try:
         idx = int(candidate_id.lstrip("c")) - 1
         raw_candidate = raw_candidates[idx]
@@ -120,6 +130,36 @@ def _run_render(job: jobs.Job) -> dict[str, Any]:
         "download_allowed": qa_report.download_allowed,
         "final_video_path": manifest.final_video_path,
         "related_video_instructions": config.RELATED_VIDEO_INSTRUCTIONS,
+    }
+
+
+def _run_refresh_candidates(job: jobs.Job) -> dict[str, Any]:
+    """Low-cost re-selection: reuses the Transcript and Stage1 chunk cache
+    from a prior analyze run (never re-runs Whisper, never calls the
+    Stage1 API) and re-derives Stage2 candidates via
+    clip_selector.refresh_candidates_only -- at most one Anthropic API
+    call (Stage2 ranking), only if enough valid Stage1 candidates already
+    exist in cache. Returns the identical result shape _run_analyze does
+    (video_id/video_title/candidates) so the frontend can reuse its
+    existing analyze-result rendering path unchanged.
+    """
+    video_id = job.input["video_id"]
+    video_title = job.input["video_title"]
+
+    transcript = cache.load_transcript(video_id)
+    if transcript is None:
+        raise RuntimeError("文字起こしのキャッシュが見つかりません。最初から解析をやり直してください")
+
+    raw_candidates = clip_selector.refresh_candidates_only(transcript, video_title)
+    resolved = [
+        boundary.resolve_candidate(rc, transcript, candidate_id=f"c{i + 1}")
+        for i, rc in enumerate(raw_candidates)
+    ]
+
+    return {
+        "video_id": video_id,
+        "video_title": video_title,
+        "candidates": [_serialize_candidate(c) for c in resolved],
     }
 
 
@@ -172,6 +212,25 @@ def start_render(job_id: str, req: RenderRequest) -> dict[str, Any]:
     )
     jobs.run_async(render_job, _run_render, running_status="rendering")
     return {"render_id": render_job.id}
+
+
+@app.post("/api/jobs/{job_id}/refresh-candidates")
+def refresh_candidates(job_id: str) -> dict[str, Any]:
+    """Kicks off the low-cost candidate-only re-selection (see
+    _run_refresh_candidates) against the same video an earlier analyze
+    job already processed -- including one whose result was a
+    RuntimeError (e.g. "insufficient eligible candidates") -- since only
+    job.input (video_id/video_title), not job.result, is needed here.
+    Never issued automatically: the frontend only calls this when the
+    user explicitly clicks the "候補だけ再選定" action.
+    """
+    analyze_job = jobs.get_job(job_id)
+    if analyze_job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    new_job = jobs.create_job("refresh_candidates", dict(analyze_job.input))
+    jobs.run_async(new_job, _run_refresh_candidates, running_status="analyzing")
+    return {"job_id": new_job.id}
 
 
 @app.get("/api/jobs/{job_id}/render/{render_id}")

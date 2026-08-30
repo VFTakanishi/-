@@ -26,6 +26,10 @@
     </div>
     <div id="upload-progress" class="status hidden"></div>
     <div id="analyze-status" class="status"></div>
+    <div id="refresh-candidates-box" class="hidden">
+      <p class="hint">文字起こしとStage1候補は再利用します。Claudeへの新規要求はStage2ランキング1回だけです。</p>
+      <button id="refresh-candidates-btn">保存済み解析から候補を選び直す</button>
+    </div>
   </section>
 
   <section id="candidates-section" class="card hidden">

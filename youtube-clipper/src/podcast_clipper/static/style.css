@@ -67,6 +67,8 @@ button:disabled {
 .status { margin-top: 10px; color: var(--muted); white-space: pre-wrap; }
 .status.error { color: var(--danger); }
 
+.hint { color: var(--muted); font-size: 0.9rem; margin: 4px 0; }
+
 .candidates {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));

@@ -305,7 +305,7 @@ def extend_to_natural_ending(
     Always returns a RawClipCandidate -- the input unchanged if it
     already looks complete or can't be safely extended further, never
     None. This never checks duration itself: every caller (both
-    _filter_local_quality and _finalize_candidates) re-checks duration
+    _filter_local_quality and finalize_candidates) re-checks duration
     bounds afterward and drops the candidate if extension pushed it past
     DURATION_HARD_MAX_SEC -- the rule is identical regardless of whether
     an alternative candidate happens to be available. No Claude API call
@@ -354,7 +354,7 @@ def has_confident_natural_ending(raw: RawClipCandidate, transcript: Transcript) 
     ran out of budget, ran off the end of the transcript, or hit a gap
     too large to bridge while the text was still confidently incomplete.
     A pause (of any length) is never, by itself, evidence of completeness
-    for such text -- callers (_filter_local_quality, _finalize_candidates,
+    for such text -- callers (_filter_local_quality, finalize_candidates,
     qa.utterance_completeness_qa) must call this *after*
     extend_to_natural_ending and drop/fail the candidate if it returns
     False, rather than accepting whatever ending extension happened to
@@ -464,7 +464,7 @@ def rank_candidates(
     return ranked
 
 
-def _finalize_candidates(
+def finalize_candidates(
     candidates: list[RawClipCandidate], transcript: Transcript
 ) -> list[RawClipCandidate]:
     """Re-applies extend_to_natural_ending, re-checks
@@ -481,20 +481,25 @@ def _finalize_candidates(
     substitute -- "no substitute available" is a reason to fail loudly,
     not a reason to accept an out-of-range or incomplete clip.
 
-    select_candidates calls this on both of its return paths, so cached
-    and freshly-selected candidates always go through the identical
-    correction before reaching render. For the fresh path,
-    _filter_local_quality already enforced these same bounds before
-    Stage2 ran, so this check is normally a no-op there; for a cache hit,
-    this is the first time the bounds are enforced against the
-    (possibly-extended) result.
+    select_candidates and refresh_candidates_only both call this on every
+    return path -- and, critically, *before* cache.save_stage2 rather than
+    after -- so the Stage2 cache on disk always holds the finalized
+    (extended/duration-validated) result, never the raw pre-correction
+    one. web.py's render path (_run_render) also re-applies this
+    defensively to whatever it reads back from cache.load_stage2, so a
+    cached or in-flight raw candidate can never reach render/QA without
+    going through the identical correction the UI already showed.
 
     If fewer than config.NUM_CANDIDATES remain eligible after this,
     raises immediately -- there is no substitute available without
     re-running Stage1/Stage2 against the Claude API, which this function
     must never do. The caller (re-analyzing an already-cached video)
     needs an explicit signal that a fresh analysis is required, not a
-    silently short candidate list.
+    silently short candidate list. Callers must not call
+    cache.save_stage2 until *after* this returns successfully: a raise
+    here must never leave a partially-corrected or unresolvable result
+    written to disk, so an already-cached-but-now-insufficient candidate
+    set is left completely untouched on disk when this raises.
     """
     finalized = []
     for c in candidates:
@@ -524,15 +529,22 @@ def select_candidates(
     Neither stage retries automatically: if the local filter leaves too
     few candidates, or Stage2 doesn't return enough valid ids, this raises
     immediately rather than requesting more from the API. Every return
-    path goes through _finalize_candidates, so a cache hit never bypasses
-    the ending-completeness correction or the hard duration bounds --
-    the same rule applies whether the candidates are freshly selected or
-    loaded from cache.
+    path calls finalize_candidates *before* cache.save_stage2 (never
+    after), so the Stage2 cache on disk always holds the finalized
+    (ending-corrected, duration-validated) result -- a cache hit never
+    bypasses that correction, and render.py's cache.load_stage2 reads
+    (see web._run_render) always see the same finalized state the UI
+    already showed. A cache hit whose candidates are no longer
+    sufficiently valid (finalize_candidates raises) leaves the on-disk
+    cache completely untouched -- it is never overwritten with a
+    known-bad/insufficient result.
     """
     if not force_refresh:
         cached = cache.load_stage2(transcript.video_id)
         if cached is not None:
-            return _finalize_candidates(cached, transcript)
+            finalized = finalize_candidates(cached, transcript)
+            cache.save_stage2(transcript.video_id, finalized)
+            return finalized
 
     stage1_candidates = run_stage1(transcript, video_title, force_refresh=force_refresh)
     filtered = _filter_local_quality(stage1_candidates, transcript)
@@ -552,5 +564,78 @@ def select_candidates(
         )
 
     finalists = [id_map[cid] for cid in top_ids]
-    cache.save_stage2(transcript.video_id, finalists)
-    return _finalize_candidates(finalists, transcript)
+    finalized = finalize_candidates(finalists, transcript)
+    cache.save_stage2(transcript.video_id, finalized)
+    return finalized
+
+
+def _load_stage1_from_cache_only(transcript: Transcript) -> list[RawClipCandidate] | None:
+    """Like run_stage1, but never calls the Stage1 API under any
+    circumstance -- used by refresh_candidates_only, which must reuse
+    only what's already on disk. Returns None the moment any chunk's
+    cache entry is missing (including "no chunks at all"), so the caller
+    can tell "cache fully covers this transcript" apart from "at least
+    one Stage1 API call would be needed to fill a gap" and refuse to make
+    that call itself.
+    """
+    chunks = _build_chunks(_usable_segments(transcript))
+    if not chunks:
+        return None
+    all_candidates: list[RawClipCandidate] = []
+    for chunk_index, _ in chunks:
+        cached = cache.load_stage1_chunk(transcript.video_id, chunk_index)
+        if cached is None:
+            return None
+        all_candidates.extend(cached)
+    return all_candidates
+
+
+def refresh_candidates_only(
+    transcript: Transcript, video_title: str
+) -> list[RawClipCandidate]:
+    """Low-cost re-selection: reuses the already-cached Transcript (passed
+    in by the caller) and Stage1 chunk cache, re-applies the current local
+    quality filter (opening trim / natural ending / duration / hook
+    strength), and -- only if that leaves enough candidates -- runs
+    Stage2 ranking exactly once. Never calls the Stage1 API and never
+    re-runs Whisper: this exists specifically so a candidate set that's
+    become insufficient after a local-rule change (e.g. the ending-
+    completeness fix) can be re-derived without paying for a full
+    Stage1+Stage2 re-analysis.
+
+    Ignores any existing Stage2 cache -- a fresh Stage2 ranking always
+    runs here -- but that Stage2 call is the *only* Anthropic API request
+    this function can ever make, and only after confirming enough valid
+    Stage1 candidates exist locally. Both failure paths below (missing
+    Stage1 cache, too few candidates after the local filter) raise before
+    ever calling rank_candidates, so they're guaranteed to cost 0 API
+    calls. A full re-analysis (Stage1 from scratch) is never triggered
+    automatically -- the caller must request that separately.
+    """
+    stage1_candidates = _load_stage1_from_cache_only(transcript)
+    if stage1_candidates is None:
+        raise RuntimeError(
+            "保存済みのStage1候補キャッシュが見つからないか不完全です。"
+            "完全な再解析（Stage1からのやり直し）が必要です。"
+        )
+
+    filtered = _filter_local_quality(stage1_candidates, transcript)
+    if len(filtered) < config.NUM_CANDIDATES:
+        raise RuntimeError(
+            f"保存済みStage1候補のうちローカル品質フィルタを通過したのは{len(filtered)}件です"
+            f"（{config.NUM_CANDIDATES}件必要）。完全な再解析が必要です。"
+        )
+
+    id_map = {f"s1_c{i:03d}": c for i, c in enumerate(filtered)}
+    ranked_ids = rank_candidates(id_map, transcript, video_title)
+    top_ids = ranked_ids[: config.NUM_CANDIDATES]
+    if len(top_ids) < config.NUM_CANDIDATES:
+        raise RuntimeError(
+            f"Stage2ランキングが有効な候補ID{len(top_ids)}件しか返しませんでした"
+            f"（{config.NUM_CANDIDATES}件必要）。APIへの自動再要求は行いません。"
+        )
+
+    finalists = [id_map[cid] for cid in top_ids]
+    finalized = finalize_candidates(finalists, transcript)
+    cache.save_stage2(transcript.video_id, finalized)
+    return finalized
