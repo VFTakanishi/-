@@ -21,10 +21,12 @@ import anthropic
 
 from . import boundary, cache, config
 from .models import (
+    MalformedCandidateError,
     RawClipCandidate,
     RawUsedSegment,
     Transcript,
     TranscriptSegment,
+    describe_value,
     require_dict,
 )
 
@@ -101,6 +103,38 @@ def _force_first_segment_is_hook(raw: RawClipCandidate) -> None:
         raw.segments[0].role = "hook"
 
 
+def _normalize_json_array(value: object, *, context: str) -> list:
+    """Normalizes a value that should be a JSON array (Claude's tool_use
+    `candidates`, or a candidate's `segments`) but was observed on a real
+    machine to sometimes arrive JSON-encoded as a *string* instead of an
+    already-parsed list -- e.g. `input["candidates"]` being the literal
+    string "[{...}, {...}]" rather than a list, which made
+    `for c in ...["candidates"]` iterate the string character by character
+    (candidates[0] == "[") and crash deep inside with an undiagnosable
+    "string indices must be integers, not 'str'".
+
+    Decodes via `json.loads` exactly once (never `eval`/`ast.literal_eval`)
+    when `value` is a string, then requires the result to be a list either
+    way. Never silently coerces anything else -- invalid JSON, or valid
+    JSON that isn't a list, is a hard MalformedCandidateError, not a
+    silently-substituted empty list.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise MalformedCandidateError(
+                f"{context}: expected a JSON array, but the string isn't valid JSON: "
+                f"{describe_value(value)}"
+            ) from exc
+
+    if not isinstance(value, list):
+        raise MalformedCandidateError(
+            f"{context}: expected a list, got {type(value).__name__}: {describe_value(value)}"
+        )
+    return value
+
+
 def _client() -> anthropic.Anthropic:
     return anthropic.Anthropic()
 
@@ -131,8 +165,11 @@ def _raw_candidate_from_tool_input(
     just with a better error -- and does not add any retry/repair behavior.
     """
     require_dict(d, context=f"{stage} candidates[{candidate_index}]")
+    segments_payload = _normalize_json_array(
+        d["segments"], context=f"{stage} candidates[{candidate_index}].segments"
+    )
     segments = []
-    for seg_index, s in enumerate(d["segments"]):
+    for seg_index, s in enumerate(segments_payload):
         require_dict(
             s, context=f"{stage} candidates[{candidate_index}].segments[{seg_index}]"
         )
@@ -225,9 +262,12 @@ def extract_candidates_for_chunk(
 
     for block in response.content:
         if block.type == "tool_use" and block.name == "submit_chunk_candidates":
+            candidates_payload = _normalize_json_array(
+                block.input["candidates"], context="Stage1 candidates"
+            )
             return [
                 _raw_candidate_from_tool_input(c, stage="Stage1", candidate_index=i)
-                for i, c in enumerate(block.input["candidates"])
+                for i, c in enumerate(candidates_payload)
             ]
     return []
 
@@ -325,9 +365,12 @@ def rank_and_finalize(
 
     for block in response.content:
         if block.type == "tool_use" and block.name == "submit_final_candidates":
+            candidates_payload = _normalize_json_array(
+                block.input["candidates"], context="Stage2 candidates"
+            )
             return [
                 _raw_candidate_from_tool_input(c, stage="Stage2", candidate_index=i)
-                for i, c in enumerate(block.input["candidates"])
+                for i, c in enumerate(candidates_payload)
             ]
     raise RuntimeError("Claude did not return submit_final_candidates")
 
