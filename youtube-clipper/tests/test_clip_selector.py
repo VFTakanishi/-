@@ -5,21 +5,20 @@ from pydantic import ValidationError
 
 from podcast_clipper import clip_selector, config
 from podcast_clipper.clip_selector import (
-    CandidateOutput,
-    CandidateSegmentOutput,
+    Stage1CandidateOutput,
     Stage1Output,
-    Stage2Output,
+    Stage1SegmentOutput,
+    Stage2RankingOutput,
 )
 from podcast_clipper.models import RawClipCandidate, RawUsedSegment, Transcript, TranscriptSegment, TranscriptWord
 
 
 @pytest.fixture(autouse=True)
 def _forbid_real_anthropic_client(monkeypatch):
-    """Every test in this module must go through a mocked client (e.g. via
-    clip_selector._client, or by mocking rank_and_finalize/run_stage1
-    higher up) -- never a real anthropic.Anthropic(). Poisoning the
-    constructor turns an accidental real API call into an immediate, loud
-    test failure instead of a silent live call to Anthropic.
+    """Every test in this module must go through a mocked client -- never a
+    real anthropic.Anthropic(). Poisoning the constructor turns an
+    accidental real API call into an immediate, loud test failure instead
+    of a silent live call to Anthropic.
     """
 
     def _forbidden(*args, **kwargs):
@@ -28,10 +27,11 @@ def _forbid_real_anthropic_client(monkeypatch):
     monkeypatch.setattr(clip_selector.anthropic, "Anthropic", _forbidden)
 
 
-def _segment(i, start):
+def _segment(i, start, text=None):
+    text = text if text is not None else f"segment {i}"
     return TranscriptSegment(
-        id=i, start=start, end=start + 2.0, text=f"segment {i}",
-        words=[TranscriptWord(start=start, end=start + 2.0, text=f"seg{i}")],
+        id=i, start=start, end=start + 2.0, text=text,
+        words=[TranscriptWord(start=start, end=start + 2.0, text=text)],
     )
 
 
@@ -47,8 +47,7 @@ def test_build_chunks_covers_whole_transcript_with_overlap(monkeypatch):
 
     chunks = clip_selector._build_chunks(transcript.segments)
 
-    assert len(chunks) >= 3  # 25 min / (10 min window, 1 min stride overlap) needs multiple chunks
-    # every segment must be covered by at least one chunk
+    assert len(chunks) >= 3
     covered_ids = {s.id for _, segs in chunks for s in segs}
     assert covered_ids == {s.id for s in transcript.segments}
 
@@ -67,105 +66,121 @@ def test_usable_segments_excludes_only_when_explicitly_configured(monkeypatch):
     assert len(usable) < len(transcript.segments)
 
 
-def _raw_candidate(start_id, end_id, role="hook", opening_hook_strength=80):
+def _raw_candidate(start_id, end_id, role="hook", opening_hook_strength=80, score=80):
     return RawClipCandidate(
         hook_type="story",
         segments=[RawUsedSegment(role=role, start_segment_id=start_id, end_segment_id=end_id)],
-        hook_text="h", opening_hook_strength=opening_hook_strength, title="t", description="d",
-        score=80, reasoning="r", caveats="",
+        hook_text="h", opening_hook_strength=opening_hook_strength, title="", description="",
+        score=score, reasoning="", caveats="",
     )
 
 
-def test_select_candidates_retries_once_on_out_of_range_duration(monkeypatch):
-    transcript = _long_transcript(minutes=1)  # 3 short segments
+# --- _filter_local_quality (item G) --------------------------------------
 
-    monkeypatch.setattr(config, "MAX_STAGE2_RETRIES", 1)
+
+def test_filter_local_quality_keeps_strong_candidates(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    candidates = [_raw_candidate(0, 2, opening_hook_strength=90)]
+
+    kept = clip_selector._filter_local_quality(candidates, transcript)
+    assert len(kept) == 1
+
+
+def test_filter_local_quality_drops_out_of_range_duration(monkeypatch):
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
-
-    monkeypatch.setattr(
-        clip_selector, "run_stage1",
-        lambda t, title, force_refresh=False: [{"chunk_index": 0, "candidates": [_raw_candidate(0, 0)]}],
-    )
-
-    call_count = {"n": 0}
-
-    def fake_rank_and_finalize(all_candidates, transcript, video_title, feedback=None):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            # too short: 2s segment duration, way below 20s hard minimum
-            return [_raw_candidate(0, 0), _raw_candidate(0, 0), _raw_candidate(0, 0)]
-        # second call (after feedback) returns a longer, in-range candidate
-        return [_raw_candidate(0, 2), _raw_candidate(0, 2), _raw_candidate(0, 2)]
-
-    monkeypatch.setattr(clip_selector, "rank_and_finalize", fake_rank_and_finalize)
-
-    result = clip_selector.select_candidates(transcript, "タイトル")
-
-    assert call_count["n"] == 2  # exactly one retry, per config.MAX_STAGE2_RETRIES=1
-    assert len(result) == 3
-
-
-def test_select_candidates_retries_when_opening_hook_is_weak(monkeypatch):
-    """Stage2 must not settle for a candidate whose *actual spoken* opening
-    is weak, even if its overall score/duration look fine -- it should
-    retry with feedback and prefer a candidate whose real transcript
-    opening is strong.
-    """
-    transcript = _long_transcript(minutes=1)  # segments 0/1/2, 20s apart
-    # give segment 0 a literal weak "warm-up" opening the prefix list catches
-    transcript.segments[0].text = "今回はトランプ関税について話していきます"
-
-    monkeypatch.setattr(config, "MAX_STAGE2_RETRIES", 1)
-    monkeypatch.setattr(
-        clip_selector, "run_stage1",
-        lambda t, title, force_refresh=False: [
-            {"chunk_index": 0, "candidates": [_raw_candidate(0, 0), _raw_candidate(2, 2)]}
-        ],
-    )
-
-    call_count = {"n": 0}
-
-    def fake_rank_and_finalize(all_candidates, transcript, video_title, feedback=None):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            # weak spoken opening (segment 0's literal "warm-up" text)
-            return [_raw_candidate(0, 0) for _ in range(3)]
-        # after feedback: a strong opening (segment 2, untouched text)
-        return [_raw_candidate(2, 2) for _ in range(3)]
-
-    monkeypatch.setattr(clip_selector, "rank_and_finalize", fake_rank_and_finalize)
-
-    result = clip_selector.select_candidates(transcript, "タイトル")
-
-    assert call_count["n"] == 2  # exactly one retry
-    assert all(c.segments[0].start_segment_id == 2 for c in result)
-
-
-def test_select_candidates_forces_first_segment_role_to_hook(monkeypatch):
-    """segments[0].role must always be "hook" in the final candidates, even
-    if Claude tagged it differently -- this is a labeling/consistency fix,
-    not a semantic re-decision, so it's corrected mechanically rather than
-    triggering a retry.
-    """
     transcript = _long_transcript(minutes=1)
+    # single 2-second segment -- far below the 20s hard minimum
+    candidates = [_raw_candidate(0, 0, opening_hook_strength=90)]
 
+    kept = clip_selector._filter_local_quality(candidates, transcript)
+    assert kept == []
+
+
+def test_filter_local_quality_drops_weak_opening_hook_strength(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    monkeypatch.setattr(config, "MIN_OPENING_HOOK_STRENGTH", 60)
+    transcript = _long_transcript(minutes=1)
+    candidates = [_raw_candidate(0, 2, opening_hook_strength=10)]
+
+    kept = clip_selector._filter_local_quality(candidates, transcript)
+    assert kept == []
+
+
+def test_filter_local_quality_drops_literal_weak_opening_text(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    transcript.segments[0].text = "今回はトランプ関税について話していきます"
+    candidates = [_raw_candidate(0, 2, opening_hook_strength=90)]
+
+    kept = clip_selector._filter_local_quality(candidates, transcript)
+    assert kept == []
+
+
+def test_filter_local_quality_drops_nonexistent_segment_ids(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    candidates = [_raw_candidate(9999, 9999, opening_hook_strength=90)]
+
+    kept = clip_selector._filter_local_quality(candidates, transcript)
+    assert kept == []
+
+
+def test_filter_local_quality_forces_first_segment_role_to_hook(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    candidates = [_raw_candidate(0, 2, role="context", opening_hook_strength=90)]
+
+    kept = clip_selector._filter_local_quality(candidates, transcript)
+    assert len(kept) == 1
+    assert kept[0].segments[0].role == "hook"
+
+
+# --- select_candidates: no automatic retry (item H) ----------------------
+
+
+def test_select_candidates_raises_without_calling_stage2_when_too_few_filtered(monkeypatch):
+    transcript = _long_transcript(minutes=1)
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: [_raw_candidate(0, 0)])  # too short -> filtered out
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
     monkeypatch.setattr(
-        clip_selector, "run_stage1",
-        lambda t, title, force_refresh=False: [
-            {"chunk_index": 0, "candidates": [_raw_candidate(0, 0)]}
-        ],
+        clip_selector, "rank_candidates",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("Stage2 must not be called")),
     )
-    monkeypatch.setattr(
-        clip_selector, "rank_and_finalize",
-        lambda all_candidates, transcript, video_title, feedback=None: [
-            _raw_candidate(0, 0, role="context") for _ in range(3)
-        ],
-    )
+
+    with pytest.raises(RuntimeError, match="ローカル品質フィルタ"):
+        clip_selector.select_candidates(transcript, "タイトル")
+
+
+def test_select_candidates_raises_when_stage2_returns_too_few_ids(monkeypatch):
+    transcript = _long_transcript(minutes=1)
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    candidates = [_raw_candidate(0, 2), _raw_candidate(0, 2), _raw_candidate(0, 2)]
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: candidates)
+    monkeypatch.setattr(clip_selector, "rank_candidates", lambda id_map, t, title: list(id_map.keys())[:1])
+
+    with pytest.raises(RuntimeError, match="Stage2ランキング"):
+        clip_selector.select_candidates(transcript, "タイトル")
+
+
+def test_select_candidates_happy_path(monkeypatch):
+    transcript = _long_transcript(minutes=1)
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    candidates = [_raw_candidate(0, 2, score=s) for s in (10, 20, 30, 40)]
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: candidates)
+    monkeypatch.setattr(clip_selector, "rank_candidates", lambda id_map, t, title: list(id_map.keys()))
 
     result = clip_selector.select_candidates(transcript, "タイトル")
-
-    assert all(c.segments[0].role == "hook" for c in result)
+    assert len(result) == config.NUM_CANDIDATES
 
 
 def test_select_candidates_caches_and_skips_recompute(monkeypatch):
@@ -182,14 +197,25 @@ def test_select_candidates_caches_and_skips_recompute(monkeypatch):
     assert len(result) == 3
 
 
-# --- Structured Outputs model tests (schema conformance is now guaranteed
-# --- by Claude's Structured Outputs at the API level; Pydantic is the local
-# --- enforcement of the constraints the API strips from the sent schema,
-# --- e.g. numeric ranges and array length -- see clip_selector.py's
-# --- CandidateOutput/Stage1Output/Stage2Output docstrings). No JSON-repair
-# --- code exists any more -- a malformed response is expected to raise a
-# --- pydantic.ValidationError (or be rejected by the SDK before it ever
-# --- reaches this code), not be silently patched up.
+# --- Structured Outputs models (schema is minimal: AI only ever produces
+# --- segment_id ranges + a few scores, never display text) --------------
+
+
+def test_stage1_candidate_output_field_set_excludes_ai_authored_text():
+    # N: Claude structurally cannot produce hook_text/title/description/
+    # reasoning/caveats any more -- they're not even fields on the model.
+    fields = set(Stage1CandidateOutput.model_fields)
+    assert fields == {"hook_type", "segments", "opening_hook_strength", "score"}
+    assert "hook_text" not in fields
+    assert "title" not in fields
+    assert "description" not in fields
+    assert "reasoning" not in fields
+    assert "caveats" not in fields
+
+
+def test_stage2_ranking_output_field_set_is_just_ranked_ids():
+    # D/E: Stage2 output is nothing but an ordered list of candidate ids.
+    assert set(Stage2RankingOutput.model_fields) == {"ranked_candidate_ids"}
 
 
 def _valid_segment_kwargs():
@@ -198,212 +224,251 @@ def _valid_segment_kwargs():
 
 def _valid_candidate_kwargs():
     return {
-        "hook_type": "story",
-        "segments": [_valid_segment_kwargs()],
-        "hook_text": "h", "opening_hook_strength": 80,
-        "title": "t", "description": "d", "score": 80, "reasoning": "r", "caveats": "",
+        "hook_type": "story", "segments": [_valid_segment_kwargs()],
+        "opening_hook_strength": 80, "score": 80,
     }
 
 
-# A: Stage1 may return 0 candidates
-def test_stage1_output_accepts_zero_candidates():
+def test_stage1_output_accepts_zero_to_three_candidates():
     assert Stage1Output(candidates=[]).candidates == []
-
-
-# B: Stage1 may return 1-3 candidates
-def test_stage1_output_accepts_one_to_three_candidates():
     for n in (1, 2, 3):
-        out = Stage1Output(candidates=[CandidateOutput(**_valid_candidate_kwargs()) for _ in range(n)])
+        out = Stage1Output(candidates=[Stage1CandidateOutput(**_valid_candidate_kwargs()) for _ in range(n)])
         assert len(out.candidates) == n
-
-
-def test_stage1_output_rejects_more_than_three_candidates():
     with pytest.raises(ValidationError):
-        Stage1Output(candidates=[CandidateOutput(**_valid_candidate_kwargs()) for _ in range(4)])
+        Stage1Output(candidates=[Stage1CandidateOutput(**_valid_candidate_kwargs()) for _ in range(4)])
 
 
-# C: Stage2 must return exactly 3 candidates
-def test_stage2_output_requires_exactly_three_candidates():
-    Stage2Output(candidates=[CandidateOutput(**_valid_candidate_kwargs()) for _ in range(3)])
-    with pytest.raises(ValidationError):
-        Stage2Output(candidates=[CandidateOutput(**_valid_candidate_kwargs()) for _ in range(2)])
-    with pytest.raises(ValidationError):
-        Stage2Output(candidates=[CandidateOutput(**_valid_candidate_kwargs()) for _ in range(4)])
-
-
-# D: a candidate's segments must have 1-3 items
-def test_candidate_output_segments_length_bounds():
+def test_stage1_candidate_output_segments_length_bounds():
     for n in (1, 2, 3):
         kwargs = _valid_candidate_kwargs()
         kwargs["segments"] = [_valid_segment_kwargs() for _ in range(n)]
-        CandidateOutput(**kwargs)
-
-    kwargs = _valid_candidate_kwargs()
-    kwargs["segments"] = []
-    with pytest.raises(ValidationError):
-        CandidateOutput(**kwargs)
-
-    kwargs = _valid_candidate_kwargs()
-    kwargs["segments"] = [_valid_segment_kwargs() for _ in range(4)]
-    with pytest.raises(ValidationError):
-        CandidateOutput(**kwargs)
-
-
-# E: opening_hook_strength must be within 0-100
-def test_candidate_output_opening_hook_strength_bounds():
-    for value in (0, 100):
+        Stage1CandidateOutput(**kwargs)
+    for n in (0, 4):
         kwargs = _valid_candidate_kwargs()
-        kwargs["opening_hook_strength"] = value
-        CandidateOutput(**kwargs)
-
-    for value in (-1, 101):
-        kwargs = _valid_candidate_kwargs()
-        kwargs["opening_hook_strength"] = value
+        kwargs["segments"] = [_valid_segment_kwargs() for _ in range(n)]
         with pytest.raises(ValidationError):
-            CandidateOutput(**kwargs)
+            Stage1CandidateOutput(**kwargs)
 
 
-# F: score must be within 0-100
-def test_candidate_output_score_bounds():
-    for value in (0, 100):
-        kwargs = _valid_candidate_kwargs()
-        kwargs["score"] = value
-        CandidateOutput(**kwargs)
+def test_stage1_candidate_output_opening_hook_strength_and_score_bounds():
+    for field in ("opening_hook_strength", "score"):
+        for value in (0, 100):
+            kwargs = _valid_candidate_kwargs()
+            kwargs[field] = value
+            Stage1CandidateOutput(**kwargs)
+        for value in (-1, 101):
+            kwargs = _valid_candidate_kwargs()
+            kwargs[field] = value
+            with pytest.raises(ValidationError):
+                Stage1CandidateOutput(**kwargs)
 
-    for value in (-1, 101):
-        kwargs = _valid_candidate_kwargs()
-        kwargs["score"] = value
-        with pytest.raises(ValidationError):
-            CandidateOutput(**kwargs)
 
-
-# G: an invalid hook_type must be rejected
-def test_candidate_output_rejects_invalid_hook_type():
+def test_stage1_candidate_output_rejects_invalid_hook_type():
     kwargs = _valid_candidate_kwargs()
     kwargs["hook_type"] = "not_a_real_hook_type"
     with pytest.raises(ValidationError):
-        CandidateOutput(**kwargs)
+        Stage1CandidateOutput(**kwargs)
 
 
-# H: an invalid segment role must be rejected
-def test_candidate_segment_output_rejects_invalid_role():
+def test_stage1_segment_output_rejects_invalid_role():
     with pytest.raises(ValidationError):
-        CandidateSegmentOutput(role="not_a_real_role", start_segment_id=0, end_segment_id=0)
+        Stage1SegmentOutput(role="not_a_real_role", start_segment_id=0, end_segment_id=0)
 
 
-# I: a wrongly-typed segment id must be rejected
-def test_candidate_segment_output_rejects_wrongly_typed_segment_id():
+def test_stage1_segment_output_rejects_wrongly_typed_segment_id():
     with pytest.raises(ValidationError):
-        CandidateSegmentOutput(role="hook", start_segment_id=["not", "an", "int"], end_segment_id=0)
+        Stage1SegmentOutput(role="hook", start_segment_id=["not", "an", "int"], end_segment_id=0)
+
+
+def test_stage1_candidate_output_rejects_unknown_fields():
+    # extra="forbid" -> additionalProperties: false in the schema sent to
+    # Claude, and the same strictness applies locally.
+    kwargs = _valid_candidate_kwargs()
+    kwargs["hook_text"] = "should not be accepted"
+    with pytest.raises(ValidationError):
+        Stage1CandidateOutput(**kwargs)
+
+
+# --- _deterministic_hook_text (item M) ------------------------------------
+
+
+def test_deterministic_hook_text_uses_real_transcript_text():
+    segments = [_segment(0, start=0.0, text="これは実際の発言です")]
+    assert clip_selector._deterministic_hook_text(0, segments) == "これは実際の発言です"
+
+
+def test_deterministic_hook_text_truncates_by_character_count_only(monkeypatch):
+    monkeypatch.setattr(config, "HOOK_TEXT_MAX_CHARS", 5)
+    segments = [_segment(0, start=0.0, text="abcdefghij")]
+    result = clip_selector._deterministic_hook_text(0, segments)
+    assert result == "abcde…"
+
+
+# --- _client(): SDK-level retries disabled (item J) -----------------------
+
+
+def test_client_disables_sdk_level_retries(monkeypatch):
+    captured = {}
+
+    def _spy(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(clip_selector.anthropic, "Anthropic", _spy)
+    clip_selector._client()
+    assert captured.get("max_retries") == 0
+
+
+# --- _structured_output: stop_reason checked before JSON parsing ---------
+# (items A, B, C -- no messages.parse(), no JSON repair)
+
+
+class _FakeTextBlock:
+    def __init__(self, text):
+        self.type = "text"
+        self.text = text
+
+
+class _FakeResponse:
+    def __init__(self, *, stop_reason, content):
+        self.stop_reason = stop_reason
+        self.content = content
 
 
 class _FakeMessages:
-    def __init__(self, parsed_output):
-        self._parsed_output = parsed_output
+    def __init__(self, response):
+        self._response = response
+        self.calls = []
 
-    def parse(self, **kwargs):
-        return SimpleNamespace(parsed_output=self._parsed_output)
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self._response
 
 
 class _FakeClient:
-    def __init__(self, parsed_output):
-        self.messages = _FakeMessages(parsed_output)
+    def __init__(self, response):
+        self.messages = _FakeMessages(response)
 
 
-# J: Stage1 output converts correctly into RawClipCandidate
+def test_structured_output_returns_parsed_model_on_end_turn(monkeypatch):
+    valid_json = Stage1Output(candidates=[]).model_dump_json()
+    response = _FakeResponse(stop_reason="end_turn", content=[_FakeTextBlock(valid_json)])
+    monkeypatch.setattr(clip_selector, "_client", lambda: _FakeClient(response))
+
+    result = clip_selector._structured_output(
+        Stage1Output, stage="Stage1", system_prompt="sys", user_content="user", max_tokens=100
+    )
+    assert result.candidates == []
+
+
+def test_structured_output_raises_without_parsing_when_stop_reason_is_max_tokens(monkeypatch):
+    # B: stop_reason != "end_turn" -> must fail before ever attempting to
+    # parse JSON. Feed clearly-truncated JSON to prove parsing never runs
+    # (a parse attempt would raise a different error than the one we expect).
+    truncated_json = '{"candidates": [{"hook_type": "surprising_fact"'
+    response = _FakeResponse(stop_reason="max_tokens", content=[_FakeTextBlock(truncated_json)])
+    monkeypatch.setattr(clip_selector, "_client", lambda: _FakeClient(response))
+
+    with pytest.raises(clip_selector.StructuredOutputError, match="stop_reason"):
+        clip_selector._structured_output(
+            Stage1Output, stage="Stage1", system_prompt="sys", user_content="user", max_tokens=100
+        )
+
+
+def test_structured_output_raises_on_invalid_json_without_repair(monkeypatch):
+    # C: stop_reason == "end_turn" but the completed text isn't valid JSON
+    # for the schema -- must fail immediately, never attempt any repair.
+    truncated_json = '{"candidates": [{"hook_type": "surprising_fact"'
+    response = _FakeResponse(stop_reason="end_turn", content=[_FakeTextBlock(truncated_json)])
+    monkeypatch.setattr(clip_selector, "_client", lambda: _FakeClient(response))
+
+    with pytest.raises(clip_selector.StructuredOutputError, match="schema validation"):
+        clip_selector._structured_output(
+            Stage1Output, stage="Stage1", system_prompt="sys", user_content="user", max_tokens=100
+        )
+
+
+def test_structured_output_raises_when_no_text_block_present(monkeypatch):
+    response = _FakeResponse(stop_reason="end_turn", content=[])
+    monkeypatch.setattr(clip_selector, "_client", lambda: _FakeClient(response))
+
+    with pytest.raises(clip_selector.StructuredOutputError):
+        clip_selector._structured_output(
+            Stage1Output, stage="Stage1", system_prompt="sys", user_content="user", max_tokens=100
+        )
+
+
+# --- extract_candidates_for_chunk / rank_candidates: real wiring ---------
+
+
 def test_extract_candidates_for_chunk_converts_structured_output(monkeypatch):
-    parsed = Stage1Output(candidates=[CandidateOutput(**_valid_candidate_kwargs())])
-    monkeypatch.setattr(clip_selector, "_client", lambda: _FakeClient(parsed))
+    output = Stage1Output(candidates=[Stage1CandidateOutput(**_valid_candidate_kwargs())])
+    monkeypatch.setattr(
+        clip_selector, "_structured_output",
+        lambda schema_model, **kwargs: output,
+    )
 
-    segments = [_segment(0, start=0.0)]
+    segments = [_segment(0, start=0.0, text="強い発言です")]
     result = clip_selector.extract_candidates_for_chunk(segments, "タイトル")
 
     assert len(result) == 1
     assert isinstance(result[0], RawClipCandidate)
     assert result[0].hook_type == "story"
-    assert result[0].segments[0].role == "hook"
+    assert result[0].hook_text == "強い発言です"
+    assert result[0].title == ""
+    assert result[0].description == ""
+    assert result[0].reasoning == ""
+    assert result[0].caveats == ""
 
 
-# K: Stage2 output converts correctly into RawClipCandidate, exactly 3
-def test_rank_and_finalize_converts_structured_output(monkeypatch):
-    parsed = Stage2Output(candidates=[CandidateOutput(**_valid_candidate_kwargs()) for _ in range(3)])
-    monkeypatch.setattr(clip_selector, "_client", lambda: _FakeClient(parsed))
-
+def test_rank_candidates_returns_ranked_known_ids_only(monkeypatch):
     transcript = _long_transcript(minutes=1)
-    result = clip_selector.rank_and_finalize([_raw_candidate(0, 0)], transcript, "タイトル")
+    id_map = {"s1_c000": _raw_candidate(0, 2), "s1_c001": _raw_candidate(0, 2)}
+    output = Stage2RankingOutput(ranked_candidate_ids=["s1_c001", "unknown_id", "s1_c000", "s1_c001"])
+    monkeypatch.setattr(clip_selector, "_structured_output", lambda schema_model, **kwargs: output)
 
-    assert len(result) == 3
-    assert all(isinstance(c, RawClipCandidate) for c in result)
+    ranked = clip_selector.rank_candidates(id_map, transcript, "タイトル")
+    assert ranked == ["s1_c001", "s1_c000"]  # unknown id dropped, duplicate id de-duped, order preserved
 
 
-# P: the real Anthropic client must never be constructed, even by the safety
-# net's own escape hatch -- confirms _forbid_real_anthropic_client actually
-# poisons the constructor rather than silently no-oping.
+def test_rank_candidates_does_not_send_full_transcript(monkeypatch):
+    # F: Stage2 only sees a compact summary of the filtered candidates --
+    # an unreferenced transcript segment's distinctive text must never
+    # appear in what gets sent to the API.
+    transcript = _long_transcript(minutes=5)
+    transcript.segments[-1].text = "この文言はどの候補にも含まれない特徴的な発言マーカーXYZ123"
+    id_map = {"s1_c000": _raw_candidate(0, 2)}
+
+    captured = {}
+
+    def _spy(schema_model, *, stage, system_prompt, user_content, max_tokens):
+        captured["user_content"] = user_content
+        return Stage2RankingOutput(ranked_candidate_ids=["s1_c000"])
+
+    monkeypatch.setattr(clip_selector, "_structured_output", _spy)
+    clip_selector.rank_candidates(id_map, transcript, "タイトル")
+
+    assert "マーカーXYZ123" not in captured["user_content"]
+
+
+def test_select_candidates_calls_stage2_at_most_once(monkeypatch):
+    transcript = _long_transcript(minutes=1)
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    candidates = [_raw_candidate(0, 2) for _ in range(3)]
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: candidates)
+
+    call_count = {"n": 0}
+
+    def _fake_rank_candidates(id_map, t, title):
+        call_count["n"] += 1
+        return list(id_map.keys())
+
+    monkeypatch.setattr(clip_selector, "rank_candidates", _fake_rank_candidates)
+    clip_selector.select_candidates(transcript, "タイトル")
+    assert call_count["n"] == 1
+
+
 def test_forbid_real_anthropic_client_fixture_actually_blocks_construction():
     with pytest.raises(AssertionError):
         clip_selector._client()
-
-
-# --- _require_parsed_output: Structured Outputs' parsed_output is Optional
-# --- and must never be dereferenced unconditionally (real-machine incident:
-# --- "'NoneType' object has no attribute 'candidates'"). These test the
-# --- helper directly against fake response objects -- no real API call.
-
-
-class _FakeUsage:
-    def __init__(self, output_tokens):
-        self.output_tokens = output_tokens
-
-
-class _FakeParseResponse:
-    def __init__(self, *, parsed_output=None, stop_reason="end_turn", content=None, usage=None):
-        self.parsed_output = parsed_output
-        self.stop_reason = stop_reason
-        self.content = content if content is not None else []
-        self.usage = usage
-
-
-def test_require_parsed_output_returns_it_when_present():
-    parsed = Stage1Output(candidates=[])
-    response = _FakeParseResponse(parsed_output=parsed, stop_reason="end_turn")
-    assert clip_selector._require_parsed_output(response, stage="Stage1") is parsed
-
-
-def test_require_parsed_output_raises_on_max_tokens():
-    response = _FakeParseResponse(parsed_output=None, stop_reason="max_tokens", usage=_FakeUsage(8192))
-    with pytest.raises(clip_selector.StructuredOutputError, match="max_tokens"):
-        clip_selector._require_parsed_output(response, stage="Stage1")
-
-
-def test_require_parsed_output_raises_on_refusal():
-    response = _FakeParseResponse(parsed_output=None, stop_reason="refusal")
-    with pytest.raises(clip_selector.StructuredOutputError, match="refus"):
-        clip_selector._require_parsed_output(response, stage="Stage2")
-
-
-def test_require_parsed_output_raises_on_context_window_exceeded():
-    response = _FakeParseResponse(parsed_output=None, stop_reason="model_context_window_exceeded")
-    with pytest.raises(clip_selector.StructuredOutputError, match="context window"):
-        clip_selector._require_parsed_output(response, stage="Stage1")
-
-
-def test_require_parsed_output_raises_on_unexplained_none():
-    """parsed_output is None but stop_reason is a normal-looking end_turn --
-    an undocumented/unexpected case that must still fail loudly rather than
-    silently continuing with a missing result.
-    """
-    response = _FakeParseResponse(parsed_output=None, stop_reason="end_turn")
-    with pytest.raises(clip_selector.StructuredOutputError):
-        clip_selector._require_parsed_output(response, stage="Stage2")
-
-
-def test_require_parsed_output_does_not_crash_on_empty_content():
-    response = _FakeParseResponse(parsed_output=None, stop_reason="max_tokens", content=[])
-    with pytest.raises(clip_selector.StructuredOutputError):
-        clip_selector._require_parsed_output(response, stage="Stage1")
-
-
-def test_require_parsed_output_does_not_crash_on_missing_usage():
-    response = _FakeParseResponse(parsed_output=None, stop_reason="refusal", usage=None)
-    with pytest.raises(clip_selector.StructuredOutputError):
-        clip_selector._require_parsed_output(response, stage="Stage2")

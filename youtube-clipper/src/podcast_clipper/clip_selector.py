@@ -1,16 +1,40 @@
 """Two-stage AI candidate selection (absolute condition #12).
 
-Stage 1 (per-chunk extraction) and Stage 2 (merge/dedupe/final ranking)
-both ask Claude to choose *transcript segment IDs* only (absolute
-condition #11) — never raw seconds. boundary.py later turns those IDs
-into actual edit points.
+Basic philosophy: Claude's *only* job is deciding which real spoken words
+to use ("which segment_ids make a good Shorts clip"). Everything else --
+candidate IDs, hook_text, title/description/reasoning/caveats, duration
+math, quality filtering, caching, UI/render/QA -- is the program's job.
+Claude is never asked to author display text, so there is nothing for it
+to invent or get factually wrong, and its structured-output schemas stay
+small and cheap.
+
+Stage 1 (per-chunk extraction) proposes candidates as segment_id ranges
+only (absolute condition #11) -- never raw seconds, never prose.
+boundary.py later turns those IDs into actual edit points. A local quality
+filter (duration bounds + spoken-opening strength) runs before Stage 2, so
+weak candidates never reach Claude a second time.
+
+Stage 2 (ranking) sees only a compact summary of the Stage1 survivors
+(candidate_id/hook_type/opening_hook_strength/score/duration/segment
+text) -- never the full transcript, since Stage 1 already narrowed the
+search space and Stage 2 only has to compare a handful of candidates
+against each other. It returns nothing but an ordered list of candidate
+ids; the program takes the top NUM_CANDIDATES.
+
+Neither stage retries automatically on a Structured Outputs failure or on
+insufficient candidates -- see StructuredOutputError and
+select_candidates. API usage per analyze is therefore predictable: one
+call per not-yet-cached Stage1 chunk, plus at most one Stage2 call.
 
 Long transcripts are chunked (config.CHUNK_MINUTES, with
 config.CHUNK_OVERLAP_MINUTES of overlap) before Stage 1 rather than sent
 whole: Claude's context window is large enough to fit a full 60-90 minute
 transcript, but long-context recall degrades for "find every good moment
 in this document" style tasks, so chunking trades a bit of latency/cost
-for materially better recall across the whole episode.
+for materially better recall across the whole episode. Each chunk's result
+is cached the moment it succeeds (cache.save_stage1_chunk), so a failure
+partway through a long video never discards chunks that already cost API
+calls to produce.
 """
 from __future__ import annotations
 
@@ -19,7 +43,7 @@ from pathlib import Path
 from typing import Literal
 
 import anthropic
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import boundary, cache, config
 from .models import RawClipCandidate, RawUsedSegment, Transcript, TranscriptSegment
@@ -27,40 +51,101 @@ from .models import RawClipCandidate, RawUsedSegment, Transcript, TranscriptSegm
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
 
 
-class CandidateSegmentOutput(BaseModel):
-    """One segment of a Claude-proposed candidate, as returned by Structured
-    Outputs. Distinct from the internal `RawUsedSegment` dataclass -- this
-    class exists purely to parse/validate Claude's response shape.
-    """
+# --- Claude output models (Structured Outputs) --------------------------
+# Deliberately minimal: Claude only ever produces segment_id ranges plus
+# the small set of scores needed for filtering/ranking. `extra="forbid"`
+# makes model_json_schema() emit `additionalProperties: false`, which
+# Structured Outputs requires.
+
+
+class Stage1SegmentOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
     role: Literal["hook", "context", "answer", "payoff"]
     start_segment_id: int
     end_segment_id: int
 
 
-class CandidateOutput(BaseModel):
-    """One candidate as returned by Claude via Structured Outputs. Distinct
-    from the internal `RawClipCandidate` dataclass -- conversion between the
-    two happens explicitly in `_raw_candidate_from_output`.
-    """
+class Stage1CandidateOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
     hook_type: Literal["open_loop", "strong_take", "surprising_fact", "story"]
-    segments: list[CandidateSegmentOutput] = Field(min_length=1, max_length=3)
-    hook_text: str
+    segments: list[Stage1SegmentOutput] = Field(min_length=1, max_length=3)
     opening_hook_strength: int = Field(ge=0, le=100)
-    title: str
-    description: str
     score: int = Field(ge=0, le=100)
-    reasoning: str
-    caveats: str
 
 
 class Stage1Output(BaseModel):
-    candidates: list[CandidateOutput] = Field(min_length=0, max_length=3)
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: list[Stage1CandidateOutput] = Field(min_length=0, max_length=3)
 
 
-class Stage2Output(BaseModel):
-    candidates: list[CandidateOutput] = Field(min_length=3, max_length=3)
+class Stage2RankingOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ranked_candidate_ids: list[str]
+
+
+# --- Structured Outputs plumbing (no messages.parse(), no JSON repair) --
+
+
+class StructuredOutputError(RuntimeError):
+    """Raised when a Claude Structured Outputs response either stopped
+    before completing (stop_reason != "end_turn") or its completed text
+    failed schema validation. Checked in that order -- stop_reason is
+    inspected before any JSON parsing is attempted, so a response
+    truncated mid-string (stop_reason == "max_tokens") is diagnosed as a
+    truncation, never as a parse failure. Never retried automatically.
+    """
+
+
+def _text_from_response(response) -> str:
+    parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
+    if not parts:
+        types = ", ".join(getattr(b, "type", type(b).__name__) for b in response.content)
+        raise StructuredOutputError(f"no text content block in response (content_blocks=[{types}])")
+    return "".join(parts)
+
+
+def _structured_output(
+    schema_model: type[BaseModel],
+    *,
+    stage: str,
+    system_prompt: str,
+    user_content: str,
+    max_tokens: int,
+):
+    """Calls Claude with a raw Structured Outputs JSON schema (never
+    tools/tool_choice, never .messages.parse()) and returns a validated
+    instance of schema_model. stop_reason is checked before any JSON
+    parsing is attempted; a non-"end_turn" stop or JSON that fails schema
+    validation both raise StructuredOutputError immediately -- no repair,
+    no retry.
+    """
+    response = _client().messages.create(
+        model=config.ANTHROPIC_MODEL,
+        max_tokens=max_tokens,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_content}],
+        output_config={"format": {"type": "json_schema", "schema": schema_model.model_json_schema()}},
+    )
+    if response.stop_reason != "end_turn":
+        raise StructuredOutputError(
+            f"{stage}: stopped before completing structured output (stop_reason={response.stop_reason!r})"
+        )
+    text = _text_from_response(response)
+    try:
+        return schema_model.model_validate_json(text)
+    except ValidationError as exc:
+        raise StructuredOutputError(f"{stage}: response text failed schema validation: {exc}") from exc
+
+
+def _client() -> anthropic.Anthropic:
+    # max_retries=0: a single "解析開始" click must never turn into several
+    # hidden API calls -- SDK-level 429/5xx auto-retry is disabled here,
+    # same as the no-automatic-retry rule for our own Stage1/Stage2 logic.
+    return anthropic.Anthropic(max_retries=0)
 
 
 # Weak "warm-up" openings explicitly called out as unacceptable: a mechanical
@@ -89,10 +174,6 @@ def _force_first_segment_is_hook(raw: RawClipCandidate) -> None:
         raw.segments[0].role = "hook"
 
 
-def _client() -> anthropic.Anthropic:
-    return anthropic.Anthropic()
-
-
 def _format_segments(segments: list[TranscriptSegment]) -> str:
     lines = []
     for seg in segments:
@@ -101,79 +182,41 @@ def _format_segments(segments: list[TranscriptSegment]) -> str:
     return "\n".join(lines)
 
 
-def _raw_candidate_from_output(c: CandidateOutput) -> RawClipCandidate:
-    """Converts a Claude Structured Outputs candidate (already validated by
-    Pydantic) into the internal `RawClipCandidate` pipeline dataclass. No
-    format/type checking happens here -- `CandidateOutput` already
-    guarantees the shape, so this is a pure field-by-field conversion.
+def _deterministic_hook_text(segment_id: int, segments: list[TranscriptSegment]) -> str:
+    """hook_text is never AI-authored. It's the real transcript text of
+    whatever plays first (the candidate's first segment), truncated to a
+    safe on-screen length by character count only -- never rewritten,
+    embellished, or invented.
     """
+    text = next(s.text for s in segments if s.id == segment_id).strip()
+    if len(text) > config.HOOK_TEXT_MAX_CHARS:
+        return text[: config.HOOK_TEXT_MAX_CHARS].rstrip() + "…"
+    return text
+
+
+def _raw_candidate_from_stage1_output(
+    c: Stage1CandidateOutput, chunk_segments: list[TranscriptSegment]
+) -> RawClipCandidate:
+    """Converts Claude's minimal Stage1 output into the internal
+    RawClipCandidate pipeline dataclass. title/description/reasoning/
+    caveats are always empty -- the program never asks Claude to generate
+    display copy, so there's nothing to carry over for those fields.
+    """
+    segments = [
+        RawUsedSegment(role=s.role, start_segment_id=s.start_segment_id, end_segment_id=s.end_segment_id)
+        for s in c.segments
+    ]
     return RawClipCandidate(
         hook_type=c.hook_type,
-        segments=[
-            RawUsedSegment(
-                role=s.role,
-                start_segment_id=s.start_segment_id,
-                end_segment_id=s.end_segment_id,
-            )
-            for s in c.segments
-        ],
-        hook_text=c.hook_text,
+        segments=segments,
+        hook_text=_deterministic_hook_text(segments[0].start_segment_id, chunk_segments),
         opening_hook_strength=c.opening_hook_strength,
-        title=c.title,
-        description=c.description,
+        title="",
+        description="",
         score=c.score,
-        reasoning=c.reasoning,
-        caveats=c.caveats,
+        reasoning="",
+        caveats="",
     )
-
-
-class StructuredOutputError(RuntimeError):
-    """Raised when a Claude Structured Outputs response has no usable
-    parsed_output (truncated by max_tokens, refused, context window
-    exceeded, or another undocumented reason). Never retried automatically
-    -- the caller (jobs.py) surfaces this as a failed job with a full
-    traceback via its existing error_traceback field.
-    """
-
-
-def _describe_content_block_types(response) -> str:
-    try:
-        return ", ".join(getattr(b, "type", type(b).__name__) for b in response.content)
-    except Exception:
-        return "<unavailable>"
-
-
-def _require_parsed_output(response, *, stage: str):
-    """Structured Outputs' `parsed_output` is Optional -- it's None whenever
-    Claude's response didn't end up schema-conformant (truncated by
-    max_tokens, refused, context window exceeded, ...). Dereferencing it
-    unconditionally crashes with an undiagnosable "'NoneType' object has no
-    attribute 'candidates'". This surfaces the real reason instead, without
-    ever retrying the API call itself -- that's the caller's decision, not
-    this function's.
-    """
-    if response.parsed_output is not None:
-        return response.parsed_output
-
-    stop_reason = getattr(response, "stop_reason", None)
-    output_tokens = getattr(getattr(response, "usage", None), "output_tokens", None)
-    detail = (
-        f"{stage}: Structured Outputs returned no parsed_output "
-        f"(stop_reason={stop_reason!r}, output_tokens={output_tokens!r}, "
-        f"max_tokens={config.STRUCTURED_OUTPUT_MAX_TOKENS}, "
-        f"content_blocks=[{_describe_content_block_types(response)}])"
-    )
-
-    if stop_reason == "max_tokens":
-        raise StructuredOutputError(
-            f"{detail}. Truncated by max_tokens before completing structured output."
-        )
-    if stop_reason == "refusal":
-        stop_details = getattr(response, "stop_details", None)
-        raise StructuredOutputError(f"{detail}. Claude refused. stop_details={stop_details!r}")
-    if stop_reason == "model_context_window_exceeded":
-        raise StructuredOutputError(f"{detail}. Model context window exceeded.")
-    raise StructuredOutputError(f"{detail}. Unexpected: no parsed_output for this stop_reason.")
 
 
 def _usable_segments(transcript: Transcript) -> list[TranscriptSegment]:
@@ -218,33 +261,36 @@ def extract_candidates_for_chunk(
         f"# 文字起こし（このチャンクのみ）\n{_format_segments(chunk_segments)}"
     )
 
-    response = _client().messages.parse(
-        model=config.ANTHROPIC_MODEL,
-        max_tokens=config.STRUCTURED_OUTPUT_MAX_TOKENS,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_content}],
-        output_format=Stage1Output,
+    parsed = _structured_output(
+        Stage1Output,
+        stage="Stage1",
+        system_prompt=system_prompt,
+        user_content=user_content,
+        max_tokens=config.STAGE1_MAX_OUTPUT_TOKENS,
     )
-    parsed = _require_parsed_output(response, stage="Stage1")
-    return [_raw_candidate_from_output(c) for c in parsed.candidates]
+    return [_raw_candidate_from_stage1_output(c, chunk_segments) for c in parsed.candidates]
 
 
 def run_stage1(
     transcript: Transcript, video_title: str, force_refresh: bool = False
-) -> list[dict]:
-    if not force_refresh:
-        cached = cache.load_stage1(transcript.video_id)
-        if cached is not None:
-            return cached
+) -> list[RawClipCandidate]:
+    """Runs Stage1 chunk by chunk, caching each chunk's result the moment
+    it succeeds (cache.save_stage1_chunk) -- so if a later chunk's API
+    call fails, the already-paid-for results from earlier chunks are not
+    discarded, and a subsequent run only re-requests the missing chunk(s).
+    """
+    all_candidates: list[RawClipCandidate] = []
+    for chunk_index, chunk_segments in _build_chunks(_usable_segments(transcript)):
+        if not force_refresh:
+            cached = cache.load_stage1_chunk(transcript.video_id, chunk_index)
+            if cached is not None:
+                all_candidates.extend(cached)
+                continue
 
-    chunks = _build_chunks(_usable_segments(transcript))
-    results = []
-    for chunk_index, chunk_segments in chunks:
         candidates = extract_candidates_for_chunk(chunk_segments, video_title)
-        results.append({"chunk_index": chunk_index, "candidates": candidates})
-
-    cache.save_stage1(transcript.video_id, results)
-    return results
+        cache.save_stage1_chunk(transcript.video_id, chunk_index, candidates)
+        all_candidates.extend(candidates)
+    return all_candidates
 
 
 def _candidate_duration(raw: RawClipCandidate, transcript: Transcript) -> float:
@@ -252,143 +298,128 @@ def _candidate_duration(raw: RawClipCandidate, transcript: Transcript) -> float:
     return resolved.total_duration
 
 
-def rank_and_finalize(
-    all_candidates: list[RawClipCandidate],
-    transcript: Transcript,
-    video_title: str,
-    feedback: str | None = None,
-) -> list[RawClipCandidate]:
-    system_prompt = (_PROMPTS_DIR / "rank_and_finalize.md").read_text(encoding="utf-8")
-
-    candidates_json = json.dumps(
-        [
-            {
-                "hook_type": c.hook_type,
-                "segments": [
-                    {
-                        "role": s.role,
-                        "start_segment_id": s.start_segment_id,
-                        "end_segment_id": s.end_segment_id,
-                    }
-                    for s in c.segments
-                ],
-                "hook_text": c.hook_text,
-                "opening_hook_strength": c.opening_hook_strength,
-                "title": c.title,
-                "description": c.description,
-                "score": c.score,
-                "reasoning": c.reasoning,
-                "caveats": c.caveats,
-            }
-            for c in all_candidates
-        ],
-        ensure_ascii=False,
-        indent=2,
-    )
-
-    user_content = (
-        f"# 番組タイトル\n{video_title}\n\n"
-        f"# Stage1で抽出された候補一覧（重複あり得る）\n{candidates_json}\n\n"
-        f"# 参考: 文字起こし全体（segment_idの意味確認用）\n{_format_segments(transcript.segments)}"
-    )
-    if feedback:
-        user_content += f"\n\n# 修正依頼\n{feedback}"
-
-    response = _client().messages.parse(
-        model=config.ANTHROPIC_MODEL,
-        max_tokens=config.STRUCTURED_OUTPUT_MAX_TOKENS,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_content}],
-        output_format=Stage2Output,
-    )
-    parsed = _require_parsed_output(response, stage="Stage2")
-    return [_raw_candidate_from_output(c) for c in parsed.candidates]
-
-
 def _opening_text(raw: RawClipCandidate, transcript: Transcript) -> str:
     return transcript.segment_by_id(raw.segments[0].start_segment_id).text
 
 
-def _find_issues(
-    finalists: list[RawClipCandidate], transcript: Transcript
-) -> list[str]:
-    """Mechanical validation the AI's own judgement can't be fully trusted
-    to self-enforce: duration range (unchanged from before) and spoken
-    opening strength (new). Both feed the same feedback+retry pass rather
-    than separate mechanisms.
+def _filter_local_quality(
+    candidates: list[RawClipCandidate], transcript: Transcript
+) -> list[RawClipCandidate]:
+    """Mechanical quality gate that runs before Stage2, so weak candidates
+    never cost a second API call: duration range, spoken opening strength,
+    and referential integrity (segment_ids must actually exist -- a Stage1
+    chunk only ever sees its own segment_ids, but this stays defensive).
+    Candidates that fail any check are dropped silently; no feedback is
+    sent back to Claude and no retry happens here.
     """
-    issues = []
-    for i, c in enumerate(finalists):
+    kept = []
+    for c in candidates:
+        try:
+            for s in c.segments:
+                transcript.segment_by_id(s.start_segment_id)
+                transcript.segment_by_id(s.end_segment_id)
+        except KeyError:
+            continue
+
+        _force_first_segment_is_hook(c)
+
         dur = _candidate_duration(c, transcript)
         if not (config.DURATION_HARD_MIN_SEC <= dur <= config.DURATION_HARD_MAX_SEC):
-            issues.append(
-                f"候補{i + 1}の合計尺が{dur:.1f}秒で、目標範囲"
-                f"({config.DURATION_HARD_MIN_SEC:.0f}〜{config.DURATION_HARD_MAX_SEC:.0f}秒)"
-                "から外れています。区間の取り方を見直してください。"
-            )
+            continue
 
-        opening_text = _opening_text(c, transcript)
-        if c.opening_hook_strength < config.MIN_OPENING_HOOK_STRENGTH or _looks_like_weak_opening(
-            opening_text
-        ):
-            issues.append(
-                f"候補{i + 1}: 冒頭の実際の発言「{opening_text}」が弱い"
-                f"（助走・前置き的、または opening_hook_strength={c.opening_hook_strength} が低すぎます）。"
-                "最初の1〜3秒で強い主張・意外な事実・明確な疑問・結論先出し・"
-                "具体的で続きを聞きたくなる一言・強い違和感/対立/問題提起のいずれかを満たす"
-                "実際の発言から始まるsegment_idを選び直してください。"
-                "元動画の時系列上の最初から始める必要はありません。"
-            )
-    return issues
+        if c.opening_hook_strength < config.MIN_OPENING_HOOK_STRENGTH:
+            continue
+        if _looks_like_weak_opening(_opening_text(c, transcript)):
+            continue
+
+        kept.append(c)
+    return kept
+
+
+def _stage2_summary(candidate_id: str, raw: RawClipCandidate, transcript: Transcript) -> dict:
+    """Builds the compact per-candidate summary Stage2 sees -- never the
+    full transcript. Stage1 already narrowed the search space to a
+    handful of candidates, so Stage2 only needs enough to rank/dedupe
+    them: the real text they'd actually use, their duration, and their
+    Stage1 scores.
+    """
+    resolved = boundary.resolve_candidate(raw, transcript, candidate_id=candidate_id)
+    segments_text = "\n".join(f"[{s.role}] {s.text}" for s in resolved.segments)
+    return {
+        "candidate_id": candidate_id,
+        "hook_type": raw.hook_type,
+        "opening_hook_strength": raw.opening_hook_strength,
+        "score": raw.score,
+        "duration_sec": round(resolved.total_duration, 1),
+        "segments_text": segments_text,
+    }
+
+
+def rank_candidates(
+    id_map: dict[str, RawClipCandidate], transcript: Transcript, video_title: str
+) -> list[str]:
+    """Stage2: ranking only. Claude sees compact per-candidate summaries
+    (never the full transcript) and returns nothing but an ordered list of
+    candidate ids -- no new title/description/reasoning/caveats/hook_text
+    is generated here. Unknown or duplicate ids in the response are
+    filtered out (referential-integrity check, not JSON repair); the
+    caller decides what to do if too few valid ids remain.
+    """
+    system_prompt = (_PROMPTS_DIR / "rank_and_finalize.md").read_text(encoding="utf-8")
+    summaries = [_stage2_summary(cid, c, transcript) for cid, c in id_map.items()]
+    user_content = (
+        f"# 番組タイトル\n{video_title}\n\n"
+        f"# Stage1候補一覧（重複あり得る）\n{json.dumps(summaries, ensure_ascii=False, indent=2)}"
+    )
+
+    parsed = _structured_output(
+        Stage2RankingOutput,
+        stage="Stage2",
+        system_prompt=system_prompt,
+        user_content=user_content,
+        max_tokens=config.STAGE2_MAX_OUTPUT_TOKENS,
+    )
+
+    seen: set[str] = set()
+    ranked: list[str] = []
+    for cid in parsed.ranked_candidate_ids:
+        if cid in id_map and cid not in seen:
+            seen.add(cid)
+            ranked.append(cid)
+    return ranked
 
 
 def select_candidates(
     transcript: Transcript, video_title: str, force_refresh: bool = False
 ) -> list[RawClipCandidate]:
-    """Runs Stage1 -> Stage2 (with caching) and returns exactly 3 candidates,
-    validating their total duration against config.DURATION_HARD_*_SEC and
-    their spoken opening strength against config.MIN_OPENING_HOOK_STRENGTH,
-    retrying Stage2 (once) with feedback if any candidate fails either check.
+    """Runs Stage1 (per-chunk cached) -> local quality filter -> Stage2
+    (ranking only) and returns exactly config.NUM_CANDIDATES candidates.
+    Neither stage retries automatically: if the local filter leaves too
+    few candidates, or Stage2 doesn't return enough valid ids, this raises
+    immediately rather than requesting more from the API.
     """
     if not force_refresh:
         cached = cache.load_stage2(transcript.video_id)
         if cached is not None:
             return cached
 
-    stage1_results = run_stage1(transcript, video_title, force_refresh=force_refresh)
-    all_candidates = [c for chunk in stage1_results for c in chunk["candidates"]]
-    if not all_candidates:
-        raise RuntimeError("Stage1 produced no candidates for this video")
-
-    finalists = rank_and_finalize(all_candidates, transcript, video_title)
-    for c in finalists:
-        _force_first_segment_is_hook(c)
-
-    for attempt in range(config.MAX_STAGE2_RETRIES):
-        issues = _find_issues(finalists, transcript)
-        if not issues:
-            break
-        finalists = rank_and_finalize(
-            all_candidates, transcript, video_title, feedback="\n".join(issues)
+    stage1_candidates = run_stage1(transcript, video_title, force_refresh=force_refresh)
+    filtered = _filter_local_quality(stage1_candidates, transcript)
+    if len(filtered) < config.NUM_CANDIDATES:
+        raise RuntimeError(
+            f"ローカル品質フィルタを通過した候補が{len(filtered)}件しかありません"
+            f"（{config.NUM_CANDIDATES}件必要）。APIへの自動再要求は行いません。"
         )
-        for c in finalists:
-            _force_first_segment_is_hook(c)
-    else:
-        # Retries exhausted; keep the result but flag any still-failing
-        # candidate's caveats so the UI surfaces it to the user, rather than
-        # crashing the whole analyze job over a still-imperfect candidate.
-        for i, c in enumerate(finalists):
-            dur = _candidate_duration(c, transcript)
-            notes = []
-            if not (config.DURATION_HARD_MIN_SEC <= dur <= config.DURATION_HARD_MAX_SEC):
-                notes.append(f"尺が目標範囲外（{dur:.1f}秒）")
-            opening_text = _opening_text(c, transcript)
-            if c.opening_hook_strength < config.MIN_OPENING_HOOK_STRENGTH or _looks_like_weak_opening(
-                opening_text
-            ):
-                notes.append("冒頭の発言が弱い可能性")
-            if notes:
-                c.caveats = (c.caveats + " / " + " / ".join(notes)).strip(" /")
 
+    id_map = {f"s1_c{i:03d}": c for i, c in enumerate(filtered)}
+    ranked_ids = rank_candidates(id_map, transcript, video_title)
+    top_ids = ranked_ids[: config.NUM_CANDIDATES]
+    if len(top_ids) < config.NUM_CANDIDATES:
+        raise RuntimeError(
+            f"Stage2ランキングが有効な候補ID{len(top_ids)}件しか返しませんでした"
+            f"（{config.NUM_CANDIDATES}件必要）。APIへの自動再要求は行いません。"
+        )
+
+    finalists = [id_map[cid] for cid in top_ids]
     cache.save_stage2(transcript.video_id, finalists)
     return finalists

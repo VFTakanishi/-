@@ -26,6 +26,15 @@ def _transcript():
     )
 
 
+def _raw_candidate(hook_type="open_loop", caveats=""):
+    return RawClipCandidate(
+        hook_type=hook_type,
+        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
+        hook_text="h", opening_hook_strength=80, title="", description="",
+        score=70, reasoning="", caveats=caveats,
+    )
+
+
 def test_transcript_round_trip():
     original = _transcript()
     cache.save_transcript(original)
@@ -41,27 +50,66 @@ def test_transcript_missing_returns_none():
     assert cache.load_transcript("does-not-exist") is None
 
 
-def test_stage1_round_trip():
-    raw = RawClipCandidate(
-        hook_type="open_loop",
-        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
-        hook_text="h", opening_hook_strength=80, title="t", description="d",
-        score=70, reasoning="r", caveats="",
-    )
-    cache.save_stage1("vidA", [{"chunk_index": 0, "candidates": [raw]}])
-    loaded = cache.load_stage1("vidA")
+# --- Stage1: per-chunk incremental cache ---------------------------------
+
+
+def test_stage1_chunk_round_trip():
+    raw = _raw_candidate(hook_type="open_loop")
+    cache.save_stage1_chunk("vidA", 0, [raw])
+    loaded = cache.load_stage1_chunk("vidA", 0)
 
     assert loaded is not None
-    assert loaded[0]["chunk_index"] == 0
-    assert loaded[0]["candidates"][0].hook_type == "open_loop"
+    assert loaded[0].hook_type == "open_loop"
+
+
+def test_stage1_missing_chunk_returns_none():
+    assert cache.load_stage1_chunk("vid-never-cached", 0) is None
+
+
+def test_stage1_chunk_partial_failure_keeps_earlier_successful_chunks():
+    """chunk0 succeeds and is cached, chunk1 succeeds and is cached, chunk2
+    fails (never saved) -- chunk0/1's already-paid-for results must survive
+    on disk, and the still-missing chunk2 must read back as a plain miss,
+    not raise or corrupt the file.
+    """
+    cache.save_stage1_chunk("vidChunks", 0, [_raw_candidate(hook_type="open_loop")])
+    cache.save_stage1_chunk("vidChunks", 1, [_raw_candidate(hook_type="strong_take")])
+    # chunk 2's API call "failed" -- save_stage1_chunk is simply never called for it.
+
+    assert cache.load_stage1_chunk("vidChunks", 0)[0].hook_type == "open_loop"
+    assert cache.load_stage1_chunk("vidChunks", 1)[0].hook_type == "strong_take"
+    assert cache.load_stage1_chunk("vidChunks", 2) is None
+
+
+def test_stage1_chunk_save_does_not_overwrite_other_chunks():
+    cache.save_stage1_chunk("vidG", 0, [_raw_candidate(hook_type="open_loop")])
+    cache.save_stage1_chunk("vidG", 1, [_raw_candidate(hook_type="strong_take")])
+    # re-saving chunk 0 (e.g. force_refresh) must not disturb chunk 1
+    cache.save_stage1_chunk("vidG", 0, [_raw_candidate(hook_type="surprising_fact")])
+
+    assert cache.load_stage1_chunk("vidG", 0)[0].hook_type == "surprising_fact"
+    assert cache.load_stage1_chunk("vidG", 1)[0].hook_type == "strong_take"
+
+
+def test_stage1_with_unversioned_legacy_shape_is_treated_as_cache_miss():
+    """Even older caches (from before schema_version wrapping existed at
+    all) were a bare list, not {"schema_version": ..., "chunks": {...}}.
+    """
+    cache.stage1_path("vidC").write_text(
+        json.dumps([{"chunk_index": 0, "candidates": []}]), encoding="utf-8"
+    )
+    assert cache.load_stage1_chunk("vidC", 0) is None
+
+
+# --- Stage2: whole-file cache (unchanged shape; only ranking runs once) --
 
 
 def test_stage2_round_trip():
     raw = RawClipCandidate(
         hook_type="strong_take",
         segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
-        hook_text="h", opening_hook_strength=80, title="t", description="d",
-        score=90, reasoning="r", caveats="注意",
+        hook_text="h", opening_hook_strength=80, title="", description="",
+        score=90, reasoning="", caveats="注意",
     )
     cache.save_stage2("vidA", [raw, raw, raw])
     loaded = cache.load_stage2("vidA")
@@ -73,7 +121,6 @@ def test_stage2_round_trip():
 
 def test_stage2_with_stale_schema_version_is_treated_as_cache_miss():
     """A cache written by an older clip_selector.py schema/prompt version
-    (e.g. one that still had cta_end_text instead of opening_hook_strength)
     must never be deserialized against the new RawClipCandidate shape --
     that would raise KeyError deep inside select_candidates. It must be
     treated as a plain cache miss instead, so the caller recomputes fresh.
@@ -97,17 +144,18 @@ def test_stage2_with_stale_schema_version_is_treated_as_cache_miss():
     assert cache.load_stage2("vidB") is None
 
 
-def test_stage2_schema_v2_is_miss_and_v3_is_hit():
-    """The tool_use -> Structured Outputs migration bumped
-    CANDIDATE_SCHEMA_VERSION from 2 to 3. A cache written under the old
-    version 2 must be treated as a miss (forcing a fresh Stage2 run against
-    the new Claude-output access mechanism), while a cache written under
-    the current version 3 must hit normally.
+def test_schema_v3_is_miss_and_v4_is_hit():
+    """The tool_use/messages.parse() -> minimal-schema Structured Outputs
+    migration bumped CANDIDATE_SCHEMA_VERSION from 3 to 4 (Stage1's cache
+    file shape itself changed: per-chunk dict instead of a chunk list). A
+    cache written under version 3 must be treated as a miss on both
+    stage1 and stage2, while a cache written under the current version 4
+    must hit normally.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 3
+    assert config.CANDIDATE_SCHEMA_VERSION == 4
 
-    v2_payload = {
-        "schema_version": 2,
+    v3_stage2_payload = {
+        "schema_version": 3,
         "candidates": [
             {
                 "hook_type": "story",
@@ -119,30 +167,27 @@ def test_stage2_schema_v2_is_miss_and_v3_is_hit():
         ],
     }
     cache.stage2_path("vidF").write_text(
-        json.dumps(v2_payload, ensure_ascii=False), encoding="utf-8"
+        json.dumps(v3_stage2_payload, ensure_ascii=False), encoding="utf-8"
     )
     assert cache.load_stage2("vidF") is None
 
-    raw = RawClipCandidate(
-        hook_type="story",
-        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
-        hook_text="h", opening_hook_strength=80, title="t", description="d",
-        score=80, reasoning="r", caveats="",
+    v3_stage1_payload = {
+        "schema_version": 3,
+        "chunks": [{"chunk_index": 0, "candidates": []}],
+    }
+    cache.stage1_path("vidH").write_text(
+        json.dumps(v3_stage1_payload, ensure_ascii=False), encoding="utf-8"
     )
+    assert cache.load_stage1_chunk("vidH", 0) is None
+
+    raw = _raw_candidate(hook_type="story")
     cache.save_stage2("vidF", [raw, raw, raw])
     loaded = cache.load_stage2("vidF")
     assert loaded is not None
     assert len(loaded) == 3
 
-
-def test_stage1_with_unversioned_legacy_shape_is_treated_as_cache_miss():
-    """Even older caches (from before schema_version wrapping existed at
-    all) were a bare list, not {"schema_version": ..., "chunks": [...]}.
-    """
-    cache.stage1_path("vidC").write_text(
-        json.dumps([{"chunk_index": 0, "candidates": []}]), encoding="utf-8"
-    )
-    assert cache.load_stage1("vidC") is None
+    cache.save_stage1_chunk("vidH", 0, [raw])
+    assert cache.load_stage1_chunk("vidH", 0) is not None
 
 
 def test_transcript_cache_is_unaffected_by_candidate_schema_versioning():
@@ -157,12 +202,12 @@ def test_transcript_cache_is_unaffected_by_candidate_schema_versioning():
     assert cache.load_transcript("vidA") is not None
 
 
-# --- diagnostics for the 2026-08-30 "string indices must be integers, not
-# --- 'str'" incident (see clip_selector.py's matching tests). A cache file
-# --- that DOES report the current schema_version but contains a malformed
-# --- (non-dict) candidate entry -- e.g. hand-edited or corrupted on disk --
-# --- must raise a diagnosable error naming the cache file/index, not a bare
-# --- TypeError. No repair/retry behavior is added -- diagnostics only.
+# --- diagnostics for malformed cached candidates (retained from earlier
+# --- incidents). A cache file that DOES report the current schema_version
+# --- but contains a malformed (non-dict) candidate entry -- e.g.
+# --- hand-edited or corrupted on disk -- must raise a diagnosable error
+# --- naming the cache file/index, not a bare TypeError. No repair/retry
+# --- behavior is added -- diagnostics only.
 
 
 def test_load_stage2_raises_diagnosable_error_for_malformed_cached_candidate():
@@ -181,12 +226,11 @@ def test_load_stage2_raises_diagnosable_error_for_malformed_cached_candidate():
     assert "str" in message
 
 
-def test_load_stage1_raises_diagnosable_error_for_malformed_cached_segment():
+def test_load_stage1_chunk_raises_diagnosable_error_for_malformed_cached_segment():
     payload = {
         "schema_version": config.CANDIDATE_SCHEMA_VERSION,
-        "chunks": [
-            {
-                "chunk_index": 0,
+        "chunks": {
+            "0": {
                 "candidates": [
                     {
                         "hook_type": "story",
@@ -197,12 +241,12 @@ def test_load_stage1_raises_diagnosable_error_for_malformed_cached_segment():
                     }
                 ],
             }
-        ],
+        },
     }
     cache.stage1_path("vidE").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
     with pytest.raises(MalformedCandidateError) as exc_info:
-        cache.load_stage1("vidE")
+        cache.load_stage1_chunk("vidE", 0)
     message = str(exc_info.value)
     assert "stage1" in message
     assert "vidE" in message

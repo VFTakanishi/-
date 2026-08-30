@@ -104,3 +104,14 @@ CLIは`python -m podcast_clipper.cli analyze-file "C:\path\podcast.mp4"`に変�
 - `cta_end_text`（末尾CTA字幕）は仕様として完全に廃止した。モデル・Claude出力スキーマ・prompt・render.py・testsから削除済み。「本編で詳しく説明しています」等、元動画の内容について未検証の主張を含む字幕を生成・表示することは禁止。
 - 動画上の誘導テキストは常時表示の「VF高西で検索！」のみ。本編への主要導線はYouTube Studioの「関連動画」設定であり、この方針は維持する。
 - 上記のプロンプト/スキーマ変更に伴い、Stage1/Stage2のキャッシュには`config.CANDIDATE_SCHEMA_VERSION`によるバージョンチェックを導入した（不一致時はキャッシュミス扱いで再計算）。Whisper文字起こしキャッシュ（`transcript.json`）はこの変更と無関係で、引き続き再利用される。
+
+## Claude API呼び出し設計・回数の予測可能性（2026-08-30追加）
+
+実機で連鎖したClaude応答形状の障害（tool_use inputのJSON文字列化、そのJSON自体の破損、`messages.parse()`の`parsed_output=None`、不完全JSONの`ValidationError`）を受け、Stage1/Stage2の設計を「AIは実在発言のsegment_idを選ぶだけ」に根本簡素化した。
+
+- Claudeが生成する項目はStage1が`hook_type`/`segments`/`opening_hook_strength`/`score`のみ、Stage2は`ranked_candidate_ids`（候補IDの順位リスト）のみ。`hook_text`/`title`/`description`/`reasoning`/`caveats`はAIに生成させず、プログラムが実transcriptから決定論的に生成する（`hook_text`）か空文字にする。
+- `client.messages.parse()`は使わない。生の`output_config={"format": {"type": "json_schema", ...}}`を`client.messages.create()`に渡し、`response.stop_reason`が`"end_turn"`であることを確認してから初めてテキストを`model_validate_json`する（stop_reason確認より前にJSONパースを試みない）。schema不一致・途中終了はその場で明示的エラーとして停止し、JSON修復や自動リトライは一切行わない。
+- Stage2には全文文字起こしを送らない。Stage1で品質フィルタ済みの候補について、候補ID・hook_type・スコア・尺・実際に使う発言テキストのみの要約を渡す。
+- Stage1のチャンクごとの結果は、成功した瞬間に個別キャッシュする（`cache.save_stage1_chunk`）。途中のチャンクでAPI呼び出しが失敗しても、既に成功した（課金済みの）チャンクの結果は破棄されず、再実行時は未取得チャンクのみAPIを呼ぶ。
+- 自動リトライは行わない: Stage2の内容フィードバック再選定ループは廃止し、ローカル品質フィルタ通過後の候補が3件未満、またはStage2ランキングの有効IDが3件未満の場合は、追加のAPI呼び出しをせずその場でエラー停止する。SDKレベルの自動リトライも`anthropic.Anthropic(max_retries=0)`で無効化している。
+- 通常の新規動画解析で発生するAPI呼び出し数: Stage1 = 未キャッシュのチャンク数だけ、Stage2 = 最大1回。合計呼び出し数は解析開始前から予測可能。同一動画の再解析は、成功済みのStage1チャンクキャッシュ・Stage2キャッシュをそのまま再利用する。

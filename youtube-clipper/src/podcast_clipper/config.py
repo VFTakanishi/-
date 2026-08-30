@@ -23,7 +23,6 @@ TARGET_DURATION_MAX_SEC = 45.0
 # pass to Claude before the candidate is accepted as-is.
 DURATION_HARD_MIN_SEC = 20.0
 DURATION_HARD_MAX_SEC = 50.0
-MAX_STAGE2_RETRIES = 1
 
 MIN_SEGMENTS_PER_CANDIDATE = 1
 MAX_SEGMENTS_PER_CANDIDATE = 3
@@ -41,20 +40,28 @@ MIN_OPENING_HOOK_STRENGTH = 60
 # and treats a mismatch as a cache miss (falls back to a fresh Stage1/Stage2
 # run) rather than trying to deserialize old-shape data. The Whisper
 # transcript cache has no dependency on this and is unaffected.
-CANDIDATE_SCHEMA_VERSION = 3
+CANDIDATE_SCHEMA_VERSION = 4
 
 CHUNK_MINUTES = 10.0
 CHUNK_OVERLAP_MINUTES = 1.0
 
 ANTHROPIC_MODEL = os.environ.get("PODCAST_CLIPPER_ANTHROPIC_MODEL", "claude-sonnet-5")
 
-# Ceiling for Stage1/Stage2 Structured Outputs responses. Each candidate
-# carries segments/hook_text/opening_hook_strength/title/description/score/
-# reasoning/caveats, and Stage2 always returns exactly 3 -- 4096 was
-# observed on a real machine to sometimes truncate before completion
-# (stop_reason == "max_tokens"). This is a ceiling, not a fixed cost: a
-# response that finishes naturally does not consume all of it.
-STRUCTURED_OUTPUT_MAX_TOKENS = 8192
+# Ceilings for Stage1/Stage2 Structured Outputs responses. Claude now only
+# generates hook_type/segments/opening_hook_strength/score per candidate
+# (Stage1) or a plain list of candidate ids (Stage2) -- everything else
+# (hook_text/title/description/reasoning/caveats) is filled in
+# deterministically by the program, so the schemas are small and these
+# ceilings are sized to match, not left at a large shared default. Each is
+# a ceiling, not a fixed cost: a response that finishes naturally does not
+# consume all of it.
+STAGE1_MAX_OUTPUT_TOKENS = 2048
+STAGE2_MAX_OUTPUT_TOKENS = 512
+
+# hook_text is the candidate's real opening transcript text (never
+# AI-authored -- see clip_selector.py's _deterministic_hook_text), truncated
+# to this many characters for on-screen display.
+HOOK_TEXT_MAX_CHARS = 40
 
 # --- Transcription --------------------------------------------------
 WHISPER_MODEL_SIZE = os.environ.get("PODCAST_CLIPPER_WHISPER_MODEL", "large-v3")

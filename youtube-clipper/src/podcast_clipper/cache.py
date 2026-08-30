@@ -84,28 +84,17 @@ def load_transcript(video_id: str) -> Transcript | None:
     return Transcript(video_id=raw["video_id"], language=raw["language"], segments=segments)
 
 
-# --- Stage1 (per-chunk raw candidates) -----------------------------------
-# Each chunk's extraction result is stored as
-# {"chunk_index": int, "candidates": [RawClipCandidate, ...]}
+# --- Stage1 (per-chunk raw candidates, cached incrementally) ------------
+# File shape: {"schema_version": int, "chunks": {"<chunk_index>": {"candidates": [...]}}}
+# Each chunk is written the moment it succeeds (save_stage1_chunk), via a
+# read-modify-write of the whole file -- still one atomic write per call,
+# so a crash mid-write never corrupts previously-saved chunks, it just
+# leaves the prior version in place. This means a run that fails partway
+# through a long video keeps every chunk result that already cost an API
+# call, and a retry only re-requests the chunks that are still missing.
 
 
-def save_stage1(video_id: str, chunk_results: list[dict]) -> None:
-    payload = {
-        "schema_version": config.CANDIDATE_SCHEMA_VERSION,
-        "chunks": [
-            {
-                "chunk_index": chunk["chunk_index"],
-                "candidates": [asdict(c) for c in chunk["candidates"]],
-            }
-            for chunk in chunk_results
-        ],
-    }
-    _atomic_write_text(
-        stage1_path(video_id), json.dumps(payload, ensure_ascii=False, indent=2)
-    )
-
-
-def load_stage1(video_id: str) -> list[dict] | None:
+def _load_stage1_payload(video_id: str) -> dict | None:
     path = stage1_path(video_id)
     if not path.exists():
         return None
@@ -116,22 +105,31 @@ def load_stage1(video_id: str) -> list[dict] | None:
         # caller recomputes Stage1 fresh, rather than trying to deserialize
         # old-shape data.
         return None
+    return raw
+
+
+def load_stage1_chunk(video_id: str, chunk_index: int) -> list[RawClipCandidate] | None:
+    payload = _load_stage1_payload(video_id)
+    if payload is None:
+        return None
+    chunk = payload.get("chunks", {}).get(str(chunk_index))
+    if chunk is None:
+        return None
     return [
-        {
-            "chunk_index": chunk["chunk_index"],
-            "candidates": [
-                _raw_candidate_from_dict(
-                    c,
-                    context=(
-                        f"cache stage1 video_id={video_id} "
-                        f"chunk[{chunk['chunk_index']}].candidates[{i}]"
-                    ),
-                )
-                for i, c in enumerate(chunk["candidates"])
-            ],
-        }
-        for chunk in raw["chunks"]
+        _raw_candidate_from_dict(
+            c, context=f"cache stage1 video_id={video_id} chunk[{chunk_index}].candidates[{i}]"
+        )
+        for i, c in enumerate(chunk["candidates"])
     ]
+
+
+def save_stage1_chunk(video_id: str, chunk_index: int, candidates: list[RawClipCandidate]) -> None:
+    payload = _load_stage1_payload(video_id) or {
+        "schema_version": config.CANDIDATE_SCHEMA_VERSION,
+        "chunks": {},
+    }
+    payload["chunks"][str(chunk_index)] = {"candidates": [asdict(c) for c in candidates]}
+    _atomic_write_text(stage1_path(video_id), json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 # --- Stage2 (final 3 candidates) -----------------------------------------
@@ -161,11 +159,10 @@ def load_stage2(video_id: str) -> list[RawClipCandidate] | None:
 
 
 def _raw_candidate_from_dict(d: dict, *, context: str) -> RawClipCandidate:
-    """Diagnostic-only (2026-08-30 incident, see clip_selector.py's
-    _raw_candidate_from_tool_input docstring): validates shape before
-    indexing so a malformed cached candidate raises a message naming
-    exactly which cache entry and what it actually was, instead of a bare
-    "TypeError: string indices must be integers, not 'str'".
+    """Diagnostic-only: validates shape before indexing so a malformed
+    cached candidate raises a message naming exactly which cache entry and
+    what it actually was, instead of a bare "TypeError: string indices
+    must be integers, not 'str'".
     """
     require_dict(d, context=context)
     segments = []

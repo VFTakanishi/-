@@ -203,16 +203,13 @@ function renderCandidates(candidates) {
     const openingLine = c.segments && c.segments.length > 0 ? c.segments[0].text : "";
 
     card.innerHTML = `
-      <h3>${escapeHtml(c.title)}</h3>
       <div class="opening-line"><strong>冒頭の実音声:</strong> ${escapeHtml(openingLine)}</div>
       <div class="meta">
         タイプ: ${HOOK_TYPE_LABELS[c.hook_type] || c.hook_type} /
         尺: ${totalDuration.toFixed(1)}秒 /
-        <span class="score">スコア: ${c.score}</span>
+        <span class="score">フック強度: ${c.opening_hook_strength} / スコア: ${c.score}</span>
       </div>
       <ul class="segments">${segmentsHtml}</ul>
-      <div><strong>選定理由:</strong> ${escapeHtml(c.reasoning)}</div>
-      ${c.caveats ? `<div class="caveats"><strong>注意点:</strong> ${escapeHtml(c.caveats)}</div>` : ""}
       <button class="select-btn" data-id="${c.id}">この候補で作成</button>
     `;
     container.appendChild(card);
