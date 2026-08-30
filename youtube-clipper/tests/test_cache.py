@@ -1,7 +1,10 @@
 import json
 
+import pytest
+
 from podcast_clipper import cache, config
 from podcast_clipper.models import (
+    MalformedCandidateError,
     RawClipCandidate,
     RawUsedSegment,
     Transcript,
@@ -114,3 +117,56 @@ def test_transcript_cache_is_unaffected_by_candidate_schema_versioning():
     raw = json.loads(cache.transcript_path("vidA").read_text(encoding="utf-8"))
     assert "schema_version" not in raw
     assert cache.load_transcript("vidA") is not None
+
+
+# --- diagnostics for the 2026-08-30 "string indices must be integers, not
+# --- 'str'" incident (see clip_selector.py's matching tests). A cache file
+# --- that DOES report the current schema_version but contains a malformed
+# --- (non-dict) candidate entry -- e.g. hand-edited or corrupted on disk --
+# --- must raise a diagnosable error naming the cache file/index, not a bare
+# --- TypeError. No repair/retry behavior is added -- diagnostics only.
+
+
+def test_load_stage2_raises_diagnosable_error_for_malformed_cached_candidate():
+    payload = {
+        "schema_version": config.CANDIDATE_SCHEMA_VERSION,
+        "candidates": ["not a candidate dict"],
+    }
+    cache.stage2_path("vidD").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(MalformedCandidateError) as exc_info:
+        cache.load_stage2("vidD")
+    message = str(exc_info.value)
+    assert "stage2" in message
+    assert "vidD" in message
+    assert "candidates[0]" in message
+    assert "str" in message
+
+
+def test_load_stage1_raises_diagnosable_error_for_malformed_cached_segment():
+    payload = {
+        "schema_version": config.CANDIDATE_SCHEMA_VERSION,
+        "chunks": [
+            {
+                "chunk_index": 0,
+                "candidates": [
+                    {
+                        "hook_type": "story",
+                        "segments": ["not a segment dict"],
+                        "hook_text": "h", "opening_hook_strength": 80,
+                        "title": "t", "description": "d", "score": 80,
+                        "reasoning": "r", "caveats": "",
+                    }
+                ],
+            }
+        ],
+    }
+    cache.stage1_path("vidE").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(MalformedCandidateError) as exc_info:
+        cache.load_stage1("vidE")
+    message = str(exc_info.value)
+    assert "stage1" in message
+    assert "vidE" in message
+    assert "candidates[0].segments[0]" in message
+    assert "str" in message

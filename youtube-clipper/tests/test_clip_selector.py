@@ -1,5 +1,8 @@
+import pytest
+
 from podcast_clipper import clip_selector, config
 from podcast_clipper.models import (
+    MalformedCandidateError,
     RawClipCandidate,
     RawUsedSegment,
     Transcript,
@@ -160,3 +163,41 @@ def test_select_candidates_caches_and_skips_recompute(monkeypatch):
 
     result = clip_selector.select_candidates(transcript, "タイトル")
     assert len(result) == 3
+
+
+# --- diagnostics for the 2026-08-30 "string indices must be integers, not
+# --- 'str'" incident: a malformed item from Claude's real tool_use
+# --- response reproduced that exact error with no traceback captured. These
+# --- pin that the parsing function now raises a diagnosable error naming
+# --- the stage, index, and actual type/value instead. No retry/repair
+# --- behavior is added -- this is diagnostics only.
+
+
+def test_raw_candidate_from_tool_input_raises_diagnosable_error_when_candidate_is_str():
+    with pytest.raises(MalformedCandidateError) as exc_info:
+        clip_selector._raw_candidate_from_tool_input(
+            "oops not a dict", stage="Stage1", candidate_index=2
+        )
+    message = str(exc_info.value)
+    assert "Stage1" in message
+    assert "candidates[2]" in message
+    assert "str" in message
+    assert "oops not a dict" in message
+
+
+def test_raw_candidate_from_tool_input_raises_diagnosable_error_when_segment_is_str():
+    malformed = {
+        "hook_type": "story",
+        "segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}, "bad segment"],
+        "hook_text": "h", "opening_hook_strength": 80,
+        "title": "t", "description": "d", "score": 80, "reasoning": "r", "caveats": "",
+    }
+    with pytest.raises(MalformedCandidateError) as exc_info:
+        clip_selector._raw_candidate_from_tool_input(
+            malformed, stage="Stage2", candidate_index=0
+        )
+    message = str(exc_info.value)
+    assert "Stage2" in message
+    assert "candidates[0].segments[1]" in message
+    assert "str" in message
+    assert "bad segment" in message

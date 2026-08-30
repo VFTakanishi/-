@@ -20,7 +20,13 @@ from pathlib import Path
 import anthropic
 
 from . import boundary, cache, config
-from .models import RawClipCandidate, RawUsedSegment, Transcript, TranscriptSegment
+from .models import (
+    RawClipCandidate,
+    RawUsedSegment,
+    Transcript,
+    TranscriptSegment,
+    require_dict,
+)
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
 
@@ -107,17 +113,39 @@ def _format_segments(segments: list[TranscriptSegment]) -> str:
     return "\n".join(lines)
 
 
-def _raw_candidate_from_tool_input(d: dict) -> RawClipCandidate:
-    return RawClipCandidate(
-        hook_type=d["hook_type"],
-        segments=[
+def _raw_candidate_from_tool_input(
+    d: dict, *, stage: str, candidate_index: int
+) -> RawClipCandidate:
+    """Parses one candidate from Claude's real tool_use response.
+
+    Diagnostic-only (2026-08-30 incident): a real-machine analyze job
+    failed with a bare "TypeError: string indices must be integers, not
+    'str'" and no traceback (jobs.py only persisted str(exc)). Reproducing
+    it showed this exact function raises that exact message whenever `d`
+    (or one of its `segments` items) isn't a dict -- most plausibly because
+    Claude's structured response didn't match the schema for one item. The
+    require_dict() calls below turn that into a message naming the stage,
+    the candidate/segment index, and the actual type/value, so the next
+    real occurrence is diagnosable without manual reproduction. This does
+    NOT change what's accepted -- still raises on the same malformed input,
+    just with a better error -- and does not add any retry/repair behavior.
+    """
+    require_dict(d, context=f"{stage} candidates[{candidate_index}]")
+    segments = []
+    for seg_index, s in enumerate(d["segments"]):
+        require_dict(
+            s, context=f"{stage} candidates[{candidate_index}].segments[{seg_index}]"
+        )
+        segments.append(
             RawUsedSegment(
                 role=s["role"],
                 start_segment_id=s["start_segment_id"],
                 end_segment_id=s["end_segment_id"],
             )
-            for s in d["segments"]
-        ],
+        )
+    return RawClipCandidate(
+        hook_type=d["hook_type"],
+        segments=segments,
         hook_text=d["hook_text"],
         opening_hook_strength=d["opening_hook_strength"],
         title=d["title"],
@@ -198,7 +226,8 @@ def extract_candidates_for_chunk(
     for block in response.content:
         if block.type == "tool_use" and block.name == "submit_chunk_candidates":
             return [
-                _raw_candidate_from_tool_input(c) for c in block.input["candidates"]
+                _raw_candidate_from_tool_input(c, stage="Stage1", candidate_index=i)
+                for i, c in enumerate(block.input["candidates"])
             ]
     return []
 
@@ -296,7 +325,10 @@ def rank_and_finalize(
 
     for block in response.content:
         if block.type == "tool_use" and block.name == "submit_final_candidates":
-            return [_raw_candidate_from_tool_input(c) for c in block.input["candidates"]]
+            return [
+                _raw_candidate_from_tool_input(c, stage="Stage2", candidate_index=i)
+                for i, c in enumerate(block.input["candidates"])
+            ]
     raise RuntimeError("Claude did not return submit_final_candidates")
 
 

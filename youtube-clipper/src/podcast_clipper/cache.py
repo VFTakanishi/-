@@ -20,6 +20,7 @@ from .models import (
     Transcript,
     TranscriptSegment,
     TranscriptWord,
+    require_dict,
 )
 
 
@@ -118,7 +119,16 @@ def load_stage1(video_id: str) -> list[dict] | None:
     return [
         {
             "chunk_index": chunk["chunk_index"],
-            "candidates": [_raw_candidate_from_dict(c) for c in chunk["candidates"]],
+            "candidates": [
+                _raw_candidate_from_dict(
+                    c,
+                    context=(
+                        f"cache stage1 video_id={video_id} "
+                        f"chunk[{chunk['chunk_index']}].candidates[{i}]"
+                    ),
+                )
+                for i, c in enumerate(chunk["candidates"])
+            ],
         }
         for chunk in raw["chunks"]
     ]
@@ -144,13 +154,27 @@ def load_stage2(video_id: str) -> list[RawClipCandidate] | None:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict) or raw.get("schema_version") != config.CANDIDATE_SCHEMA_VERSION:
         return None
-    return [_raw_candidate_from_dict(c) for c in raw["candidates"]]
+    return [
+        _raw_candidate_from_dict(c, context=f"cache stage2 video_id={video_id} candidates[{i}]")
+        for i, c in enumerate(raw["candidates"])
+    ]
 
 
-def _raw_candidate_from_dict(d: dict) -> RawClipCandidate:
+def _raw_candidate_from_dict(d: dict, *, context: str) -> RawClipCandidate:
+    """Diagnostic-only (2026-08-30 incident, see clip_selector.py's
+    _raw_candidate_from_tool_input docstring): validates shape before
+    indexing so a malformed cached candidate raises a message naming
+    exactly which cache entry and what it actually was, instead of a bare
+    "TypeError: string indices must be integers, not 'str'".
+    """
+    require_dict(d, context=context)
+    segments = []
+    for i, s in enumerate(d["segments"]):
+        require_dict(s, context=f"{context}.segments[{i}]")
+        segments.append(RawUsedSegment(**s))
     return RawClipCandidate(
         hook_type=d["hook_type"],
-        segments=[RawUsedSegment(**s) for s in d["segments"]],
+        segments=segments,
         hook_text=d["hook_text"],
         opening_hook_strength=d["opening_hook_strength"],
         title=d["title"],

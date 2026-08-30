@@ -17,6 +17,7 @@ import json
 import os
 import tempfile
 import threading
+import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -70,6 +71,13 @@ class Job:
     input: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] | None = None
     error: str | None = None
+    # Diagnostic-only (2026-08-30 incident): error alone (str(exc)) is
+    # sometimes too little to find the actual failure -- e.g. a bare
+    # "TypeError: string indices must be integers, not 'str'" carries no
+    # hint of which line raised it. Kept as a separate field (not merged
+    # into `error`) so the short summary the UI already shows stays short;
+    # this is for reading the job JSON file directly when diagnosing.
+    error_traceback: str | None = None
 
 
 def save_job(job: Job) -> None:
@@ -122,6 +130,7 @@ def run_async(job: Job, fn: Callable[[Job], dict[str, Any]], running_status: str
             latest = get_job(job.id) or job
             latest.status = "failed"
             latest.error = str(exc)
+            latest.error_traceback = traceback.format_exc()
             save_job(latest)
 
     _executor.submit(_worker)

@@ -19,6 +19,44 @@ from typing import Literal
 HookType = Literal["open_loop", "strong_take", "surprising_fact", "story"]
 SegmentRole = Literal["hook", "context", "answer", "payoff"]
 
+_MAX_VALUE_REPR_LEN = 200
+
+
+class MalformedCandidateError(TypeError):
+    """Raised when a candidate/segment item from Claude's tool_use response
+    (or from a cached candidate on disk) isn't the expected dict shape.
+
+    Both clip_selector.py (parsing Claude's real response) and cache.py
+    (parsing a cached candidate) share this so a plain `d["key"]` on an
+    unexpectedly non-dict item never surfaces as a bare, undiagnosable
+    "TypeError: string indices must be integers, not 'str'" -- the message
+    instead carries exactly which item (stage/context, index) and what it
+    actually was (type + a truncated repr).
+    """
+
+
+def describe_value(value: object) -> str:
+    """A repr of `value` safe to embed in an error message: truncated so a
+    very long/garbled string doesn't blow up the error text itself.
+    """
+    r = repr(value)
+    if len(r) > _MAX_VALUE_REPR_LEN:
+        r = r[:_MAX_VALUE_REPR_LEN] + "...(truncated)"
+    return r
+
+
+def require_dict(value: object, *, context: str) -> dict:
+    """Validates `value` is a dict before the caller does `value["key"]` on
+    it, raising MalformedCandidateError with `context` (e.g. "Stage1
+    candidates[2]" or "Stage2 candidates[0].segments[1]") plus the actual
+    type/value if not. Returns `value` unchanged when it is a dict.
+    """
+    if not isinstance(value, dict):
+        raise MalformedCandidateError(
+            f"{context}: expected a dict, got {type(value).__name__}: {describe_value(value)}"
+        )
+    return value
+
 
 @dataclass
 class TranscriptWord:

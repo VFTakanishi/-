@@ -32,6 +32,7 @@ def test_run_async_success_updates_status_and_result():
     latest = jobs.get_job(job.id)
     assert latest.result == {"ok": True, "job_id": job.id}
     assert latest.error is None
+    assert latest.error_traceback is None
 
 
 def test_run_async_failure_captures_error_not_raised_in_thread():
@@ -51,6 +52,34 @@ def test_run_async_failure_captures_error_not_raised_in_thread():
     latest = jobs.get_job(job.id)
     assert latest.status == "failed"
     assert "boom" in latest.error
+
+
+def test_run_async_failure_persists_full_traceback():
+    """Diagnostic-only (2026-08-30 incident): str(exc) alone was too little
+    to find the actual failure (e.g. a bare "TypeError: string indices must
+    be integers, not 'str'" names no file/line). error_traceback must carry
+    the full traceback so a future failure is diagnosable from the job JSON
+    file alone, without reproducing it by hand.
+    """
+    job = jobs.create_job("analyze", {})
+
+    def fn(_j):
+        raise TypeError("string indices must be integers, not 'str'")
+
+    jobs.run_async(job, fn, running_status="analyzing")
+
+    for _ in range(50):
+        latest = jobs.get_job(job.id)
+        if latest.status == "failed":
+            break
+        time.sleep(0.05)
+
+    latest = jobs.get_job(job.id)
+    assert latest.status == "failed"
+    assert latest.error_traceback is not None
+    assert "Traceback (most recent call last)" in latest.error_traceback
+    assert "in fn" in latest.error_traceback
+    assert "TypeError" in latest.error_traceback
 
 
 def test_recover_interrupted_jobs_only_flags_in_progress_states():
