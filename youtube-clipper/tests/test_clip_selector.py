@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import pytest
 from pydantic import ValidationError
 
@@ -15,16 +13,20 @@ from podcast_clipper.models import RawClipCandidate, RawUsedSegment, Transcript,
 
 @pytest.fixture(autouse=True)
 def _forbid_real_anthropic_client(monkeypatch):
-    """Every test in this module must go through a mocked client -- never a
-    real anthropic.Anthropic(). Poisoning the constructor turns an
-    accidental real API call into an immediate, loud test failure instead
-    of a silent live call to Anthropic.
+    """Every test in this module must go through a mocked structured_output
+    call -- never a real anthropic.Anthropic(). clip_selector.py no longer
+    imports anthropic itself (that lives in structured_output.py, the
+    dedicated API boundary module -- see tests/test_structured_output.py
+    for its own contract tests), so this reaches through to poison the
+    constructor there. Turns an accidental real API call into an
+    immediate, loud test failure instead of a silent live call to
+    Anthropic.
     """
 
     def _forbidden(*args, **kwargs):
         raise AssertionError("real anthropic.Anthropic() must not be instantiated in tests")
 
-    monkeypatch.setattr(clip_selector.anthropic, "Anthropic", _forbidden)
+    monkeypatch.setattr(clip_selector.structured_output.anthropic, "Anthropic", _forbidden)
 
 
 def _segment(i, start, text=None):
@@ -304,107 +306,18 @@ def test_deterministic_hook_text_truncates_by_character_count_only(monkeypatch):
     assert result == "abcde…"
 
 
-# --- _client(): SDK-level retries disabled (item J) -----------------------
-
-
-def test_client_disables_sdk_level_retries(monkeypatch):
-    captured = {}
-
-    def _spy(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace()
-
-    monkeypatch.setattr(clip_selector.anthropic, "Anthropic", _spy)
-    clip_selector._client()
-    assert captured.get("max_retries") == 0
-
-
-# --- _structured_output: stop_reason checked before JSON parsing ---------
-# (items A, B, C -- no messages.parse(), no JSON repair)
-
-
-class _FakeTextBlock:
-    def __init__(self, text):
-        self.type = "text"
-        self.text = text
-
-
-class _FakeResponse:
-    def __init__(self, *, stop_reason, content):
-        self.stop_reason = stop_reason
-        self.content = content
-
-
-class _FakeMessages:
-    def __init__(self, response):
-        self._response = response
-        self.calls = []
-
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        return self._response
-
-
-class _FakeClient:
-    def __init__(self, response):
-        self.messages = _FakeMessages(response)
-
-
-def test_structured_output_returns_parsed_model_on_end_turn(monkeypatch):
-    valid_json = Stage1Output(candidates=[]).model_dump_json()
-    response = _FakeResponse(stop_reason="end_turn", content=[_FakeTextBlock(valid_json)])
-    monkeypatch.setattr(clip_selector, "_client", lambda: _FakeClient(response))
-
-    result = clip_selector._structured_output(
-        Stage1Output, stage="Stage1", system_prompt="sys", user_content="user", max_tokens=100
-    )
-    assert result.candidates == []
-
-
-def test_structured_output_raises_without_parsing_when_stop_reason_is_max_tokens(monkeypatch):
-    # B: stop_reason != "end_turn" -> must fail before ever attempting to
-    # parse JSON. Feed clearly-truncated JSON to prove parsing never runs
-    # (a parse attempt would raise a different error than the one we expect).
-    truncated_json = '{"candidates": [{"hook_type": "surprising_fact"'
-    response = _FakeResponse(stop_reason="max_tokens", content=[_FakeTextBlock(truncated_json)])
-    monkeypatch.setattr(clip_selector, "_client", lambda: _FakeClient(response))
-
-    with pytest.raises(clip_selector.StructuredOutputError, match="stop_reason"):
-        clip_selector._structured_output(
-            Stage1Output, stage="Stage1", system_prompt="sys", user_content="user", max_tokens=100
-        )
-
-
-def test_structured_output_raises_on_invalid_json_without_repair(monkeypatch):
-    # C: stop_reason == "end_turn" but the completed text isn't valid JSON
-    # for the schema -- must fail immediately, never attempt any repair.
-    truncated_json = '{"candidates": [{"hook_type": "surprising_fact"'
-    response = _FakeResponse(stop_reason="end_turn", content=[_FakeTextBlock(truncated_json)])
-    monkeypatch.setattr(clip_selector, "_client", lambda: _FakeClient(response))
-
-    with pytest.raises(clip_selector.StructuredOutputError, match="schema validation"):
-        clip_selector._structured_output(
-            Stage1Output, stage="Stage1", system_prompt="sys", user_content="user", max_tokens=100
-        )
-
-
-def test_structured_output_raises_when_no_text_block_present(monkeypatch):
-    response = _FakeResponse(stop_reason="end_turn", content=[])
-    monkeypatch.setattr(clip_selector, "_client", lambda: _FakeClient(response))
-
-    with pytest.raises(clip_selector.StructuredOutputError):
-        clip_selector._structured_output(
-            Stage1Output, stage="Stage1", system_prompt="sys", user_content="user", max_tokens=100
-        )
-
-
 # --- extract_candidates_for_chunk / rank_candidates: real wiring ---------
+# (the Structured Outputs API boundary itself -- stop_reason handling,
+# max_retries=0, request-body contract -- is tested in
+# tests/test_structured_output.py; here we only verify clip_selector.py's
+# own use of that boundary: prompt/input construction and output
+# conversion)
 
 
 def test_extract_candidates_for_chunk_converts_structured_output(monkeypatch):
     output = Stage1Output(candidates=[Stage1CandidateOutput(**_valid_candidate_kwargs())])
     monkeypatch.setattr(
-        clip_selector, "_structured_output",
+        clip_selector.structured_output, "call",
         lambda schema_model, **kwargs: output,
     )
 
@@ -425,7 +338,7 @@ def test_rank_candidates_returns_ranked_known_ids_only(monkeypatch):
     transcript = _long_transcript(minutes=1)
     id_map = {"s1_c000": _raw_candidate(0, 2), "s1_c001": _raw_candidate(0, 2)}
     output = Stage2RankingOutput(ranked_candidate_ids=["s1_c001", "unknown_id", "s1_c000", "s1_c001"])
-    monkeypatch.setattr(clip_selector, "_structured_output", lambda schema_model, **kwargs: output)
+    monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
 
     ranked = clip_selector.rank_candidates(id_map, transcript, "タイトル")
     assert ranked == ["s1_c001", "s1_c000"]  # unknown id dropped, duplicate id de-duped, order preserved
@@ -445,7 +358,7 @@ def test_rank_candidates_does_not_send_full_transcript(monkeypatch):
         captured["user_content"] = user_content
         return Stage2RankingOutput(ranked_candidate_ids=["s1_c000"])
 
-    monkeypatch.setattr(clip_selector, "_structured_output", _spy)
+    monkeypatch.setattr(clip_selector.structured_output, "call", _spy)
     clip_selector.rank_candidates(id_map, transcript, "タイトル")
 
     assert "マーカーXYZ123" not in captured["user_content"]
@@ -467,8 +380,3 @@ def test_select_candidates_calls_stage2_at_most_once(monkeypatch):
     monkeypatch.setattr(clip_selector, "rank_candidates", _fake_rank_candidates)
     clip_selector.select_candidates(transcript, "タイトル")
     assert call_count["n"] == 1
-
-
-def test_forbid_real_anthropic_client_fixture_actually_blocks_construction():
-    with pytest.raises(AssertionError):
-        clip_selector._client()

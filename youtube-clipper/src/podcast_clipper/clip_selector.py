@@ -42,10 +42,9 @@ import json
 from pathlib import Path
 from typing import Literal
 
-import anthropic
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
-from . import boundary, cache, config
+from . import boundary, cache, config, structured_output
 from .models import RawClipCandidate, RawUsedSegment, Transcript, TranscriptSegment
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
@@ -85,67 +84,6 @@ class Stage2RankingOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ranked_candidate_ids: list[str]
-
-
-# --- Structured Outputs plumbing (no messages.parse(), no JSON repair) --
-
-
-class StructuredOutputError(RuntimeError):
-    """Raised when a Claude Structured Outputs response either stopped
-    before completing (stop_reason != "end_turn") or its completed text
-    failed schema validation. Checked in that order -- stop_reason is
-    inspected before any JSON parsing is attempted, so a response
-    truncated mid-string (stop_reason == "max_tokens") is diagnosed as a
-    truncation, never as a parse failure. Never retried automatically.
-    """
-
-
-def _text_from_response(response) -> str:
-    parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
-    if not parts:
-        types = ", ".join(getattr(b, "type", type(b).__name__) for b in response.content)
-        raise StructuredOutputError(f"no text content block in response (content_blocks=[{types}])")
-    return "".join(parts)
-
-
-def _structured_output(
-    schema_model: type[BaseModel],
-    *,
-    stage: str,
-    system_prompt: str,
-    user_content: str,
-    max_tokens: int,
-):
-    """Calls Claude with a raw Structured Outputs JSON schema (never
-    tools/tool_choice, never .messages.parse()) and returns a validated
-    instance of schema_model. stop_reason is checked before any JSON
-    parsing is attempted; a non-"end_turn" stop or JSON that fails schema
-    validation both raise StructuredOutputError immediately -- no repair,
-    no retry.
-    """
-    response = _client().messages.create(
-        model=config.ANTHROPIC_MODEL,
-        max_tokens=max_tokens,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_content}],
-        output_config={"format": {"type": "json_schema", "schema": schema_model.model_json_schema()}},
-    )
-    if response.stop_reason != "end_turn":
-        raise StructuredOutputError(
-            f"{stage}: stopped before completing structured output (stop_reason={response.stop_reason!r})"
-        )
-    text = _text_from_response(response)
-    try:
-        return schema_model.model_validate_json(text)
-    except ValidationError as exc:
-        raise StructuredOutputError(f"{stage}: response text failed schema validation: {exc}") from exc
-
-
-def _client() -> anthropic.Anthropic:
-    # max_retries=0: a single "解析開始" click must never turn into several
-    # hidden API calls -- SDK-level 429/5xx auto-retry is disabled here,
-    # same as the no-automatic-retry rule for our own Stage1/Stage2 logic.
-    return anthropic.Anthropic(max_retries=0)
 
 
 # Weak "warm-up" openings explicitly called out as unacceptable: a mechanical
@@ -261,7 +199,7 @@ def extract_candidates_for_chunk(
         f"# 文字起こし（このチャンクのみ）\n{_format_segments(chunk_segments)}"
     )
 
-    parsed = _structured_output(
+    parsed = structured_output.call(
         Stage1Output,
         stage="Stage1",
         system_prompt=system_prompt,
@@ -372,7 +310,7 @@ def rank_candidates(
         f"# Stage1候補一覧（重複あり得る）\n{json.dumps(summaries, ensure_ascii=False, indent=2)}"
     )
 
-    parsed = _structured_output(
+    parsed = structured_output.call(
         Stage2RankingOutput,
         stage="Stage2",
         system_prompt=system_prompt,
