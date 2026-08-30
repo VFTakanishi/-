@@ -246,7 +246,11 @@ def test_stage1_request_body_has_no_unsupported_constraint_keys():
     assert body["output_config"]["format"]["type"] == "json_schema"
     assert "tools" not in body
     assert "tool_choice" not in body
-    assert "thinking" not in body
+    # Extended thinking is explicitly disabled -- a model may default to
+    # adaptive thinking when this is omitted, consuming max_tokens before
+    # the (small) structured-output JSON is written (see the real
+    # stop_reason="max_tokens" incident this guards against).
+    assert body["thinking"] == {"type": "disabled"}
     assert body.get("stream") in (None, False)
 
     schema = body["output_config"]["format"]["schema"]
@@ -284,10 +288,82 @@ def test_stage2_request_body_has_no_unsupported_constraint_keys_and_no_tools():
     assert body["output_config"]["format"]["type"] == "json_schema"
     assert "tools" not in body
     assert "tool_choice" not in body
+    assert body["thinking"] == {"type": "disabled"}
 
     schema = body["output_config"]["format"]["schema"]
     _assert_no_unsupported_constraint_keys(schema)
     assert schema.get("additionalProperties") is False
+
+
+def test_thinking_is_disabled_for_sonnet_5():
+    """Regression guard: config.ANTHROPIC_MODEL is claude-sonnet-5, which
+    may default to adaptive extended thinking when `thinking` is omitted
+    (the real incident this task investigates). If a future edit drops
+    the explicit thinking={"type": "disabled"} from structured_output.call(),
+    this must fail.
+    """
+    from podcast_clipper import config
+
+    assert config.ANTHROPIC_MODEL == "claude-sonnet-5"
+
+    captured = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["request"] = request
+        return _message_response(text=json.dumps({"candidates": []}))
+
+    client = _client_with_mock_transport(handler)
+    real_client = structured_output._client
+    structured_output._client = lambda: client
+    try:
+        structured_output.call(
+            Stage1Output, stage="Stage1", system_prompt="sys",
+            user_content="user", max_tokens=2048,
+        )
+    finally:
+        structured_output._client = real_client
+
+    body = json.loads(captured["request"].content)
+    assert body["thinking"]["type"] == "disabled"
+
+
+def test_stage1_output_max_json_size_is_well_under_max_tokens():
+    """Documents and guards the audit finding that motivated disabling
+    thinking: the worst-case Stage1Output JSON (3 candidates, 3 segments
+    each, long enum values, 3-digit segment ids) is far smaller than
+    STAGE1_MAX_OUTPUT_TOKENS, so a stop_reason="max_tokens" truncation is
+    not explained by the final JSON itself -- it pointed at something else
+    consuming the token budget (adaptive thinking).
+    """
+    from podcast_clipper import config
+    from podcast_clipper.clip_selector import Stage1CandidateOutput, Stage1SegmentOutput
+
+    candidate = Stage1CandidateOutput(
+        hook_type="surprising_fact",
+        segments=[
+            Stage1SegmentOutput(role="hook", start_segment_id=123, end_segment_id=124),
+            Stage1SegmentOutput(role="context", start_segment_id=125, end_segment_id=126),
+            Stage1SegmentOutput(role="answer", start_segment_id=127, end_segment_id=128),
+        ],
+        opening_hook_strength=95,
+        score=92,
+    )
+    worst_case = Stage1Output(candidates=[candidate, candidate, candidate])
+    text = worst_case.model_dump_json()
+
+    char_count = len(text)
+    # Conservative (i.e. token-count-inflating) chars-per-token estimate --
+    # no offline Claude tokenizer ships with the anthropic package, and
+    # count_tokens requires a real API call, so this is a rough estimate,
+    # not an exact count.
+    estimated_tokens = char_count / 3.5
+
+    assert estimated_tokens < config.STAGE1_MAX_OUTPUT_TOKENS / 2, (
+        f"worst-case Stage1Output JSON is {char_count} chars (~{estimated_tokens:.0f} "
+        f"estimated tokens) -- unexpectedly close to STAGE1_MAX_OUTPUT_TOKENS="
+        f"{config.STAGE1_MAX_OUTPUT_TOKENS}; the max_tokens=2048 incident may no "
+        "longer be explained by non-JSON token consumption (e.g. thinking)."
+    )
 
 
 def test_mock_transport_stop_reason_max_tokens_raises_before_parsing():

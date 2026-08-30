@@ -19,6 +19,12 @@ The order here is fixed instead: messages.create() -> check stop_reason
 never retries automatically, at either the application level or the SDK
 level (max_retries=0).
 
+Extended thinking is explicitly disabled (thinking={"type": "disabled"}):
+a model may default to adaptive thinking when this is omitted, and
+thinking tokens count against max_tokens, which can truncate a small
+structured-output JSON before it's written even though the JSON itself
+is nowhere near the token ceiling.
+
 Schema handling: the raw output of a Pydantic model's model_json_schema()
 is never sent to the API directly -- it still contains constraints
 Structured Outputs' raw json_schema mode rejects outright (e.g.
@@ -83,6 +89,12 @@ def call(
         max_tokens=max_tokens,
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
+        # Explicitly disabled: a model may default to adaptive extended
+        # thinking when this is omitted, which counts against max_tokens
+        # and can truncate a small structured-output JSON before it's
+        # written -- observed on a real machine as stop_reason=="max_tokens"
+        # despite the schema being far smaller than the token ceiling.
+        thinking={"type": "disabled"},
         output_config={
             "format": {
                 "type": "json_schema",
