@@ -12,7 +12,7 @@ Stage 1 (per-chunk extraction) proposes candidates as segment_id ranges
 only (absolute condition #11) -- never raw seconds, never prose.
 boundary.py later turns those IDs into actual edit points. A local quality
 filter (duration bounds, spoken-opening strength, and ending completeness
--- see _extend_to_natural_ending) runs before Stage 2, so weak candidates
+-- see extend_to_natural_ending) runs before Stage 2, so weak candidates
 never reach Claude a second time.
 
 Stage 2 (ranking) sees only a compact summary of the Stage1 survivors
@@ -242,71 +242,63 @@ def _opening_text(raw: RawClipCandidate, transcript: Transcript) -> str:
     return transcript.segment_by_id(raw.segments[0].start_segment_id).text
 
 
-# Sentence-final punctuation. A weak signal alone (Whisper's Japanese
-# punctuation output isn't guaranteed), used together with the
-# continuation-suffix list and the inter-segment gap check below -- never
-# as the sole judge of completeness.
+# The only "confidently complete" text signal -- sentence-final
+# punctuation. Everything else about whether a candidate's ending is safe
+# is judged structurally (see extend_to_natural_ending): the gap to the
+# next transcript segment, not a fixed dictionary of Japanese
+# sentence-ending words/particles.
 _SENTENCE_END_MARKERS = ("。", "！", "？", "!", "?", "」", "』")
 
-# Well-known non-final grammatical particles/conjunctions. Ending on one
-# of these (with no sentence-final punctuation) is a strong signal the
-# thought continues into the next transcript segment.
-_CONTINUATION_SUFFIXES = (
-    "ので", "のに", "けど", "けれど", "けれども", "という", "ということで",
-    "だから", "ですが", "ますが", "が", "し", "て", "で", "たら", "れば",
-)
 
-
-def is_natural_sentence_ending(text: str) -> bool:
-    """True if text plausibly ends at a complete thought: sentence-final
-    punctuation, or (absent that) not ending in a well-known non-final
-    particle/conjunction. Used both to decide whether
-    _extend_to_natural_ending needs to pull in more segments, and by
-    qa.utterance_completeness_qa as a post-render safety net.
-    """
+def _ends_with_terminal_punctuation(text: str) -> bool:
     stripped = text.strip()
-    if not stripped:
-        return True
-    if stripped.endswith(_SENTENCE_END_MARKERS):
-        return True
-    return not stripped.endswith(_CONTINUATION_SUFFIXES)
+    return bool(stripped) and stripped.endswith(_SENTENCE_END_MARKERS)
 
 
-def _extend_to_natural_ending(
+def extend_to_natural_ending(
     raw: RawClipCandidate, transcript: Transcript
-) -> RawClipCandidate | None:
-    """If the candidate's last segment looks cut off mid-utterance, pulls
-    in following transcript segments (up to
+) -> RawClipCandidate:
+    """If the candidate's last segment doesn't confidently end at a
+    complete sentence, pulls in following transcript segments (up to
     config.MAX_END_EXTENSION_SEGMENTS) as long as each is a plausible
-    continuation of the same utterance -- the gap to the next segment is
-    at most config.END_EXTENSION_MAX_GAP_SEC. A real pause (which is how
-    faster-whisper's VAD splits segments in the first place) means the
-    next segment is a new thought, not a safe continuation.
+    continuation of the same utterance: the gap to the next segment is at
+    most config.END_EXTENSION_MAX_GAP_SEC. faster-whisper's VAD only
+    splits segments on detected silence, so a short gap is itself a
+    continuity signal; a real pause, or no next segment at all, is taken
+    as the best available evidence that this *was* an intentional
+    stopping point even without punctuation -- forcing an extension
+    across a real pause would be worse than accepting an
+    unpunctuated-but-paused-after ending.
 
-    Returns a new RawClipCandidate (input untouched) with the last
-    segment's end_segment_id extended, the original candidate unchanged
-    if it already ends naturally, or None if a natural ending can't be
-    reached within the extension budget -- the caller should reject the
-    candidate rather than cut it off mid-utterance anyway. This never
-    calls the Claude API and never re-decides *which* segments to use
-    semantically, only whether to include a couple more of the segments
-    Claude already had available.
+    Always returns a RawClipCandidate -- the input unchanged if it
+    already looks complete or can't be safely extended further, never
+    None. Callers that have alternative candidates to fall back on (e.g.
+    _filter_local_quality, which has many Stage1 candidates to choose
+    from) should additionally re-check duration bounds afterward and drop
+    the candidate if extension pushed it past DURATION_HARD_MAX_SEC.
+    Callers with no alternative (a cached final candidate, see
+    _finalize_candidates) should accept the result as-is rather than cut
+    it off mid-utterance. No Claude API call is made either way, and this
+    never re-decides *which* segments to use semantically -- only whether
+    to include a couple more of the segments Claude already had
+    available. Used identically by qa.utterance_completeness_qa as a
+    safety net, so the primary fix and the QA backstop can never disagree.
     """
     last = raw.segments[-1]
     end_id = last.end_segment_id
     extensions = 0
     while True:
         current = transcript.segment_by_id(end_id)
-        if is_natural_sentence_ending(current.text):
+        if _ends_with_terminal_punctuation(current.text):
             break
         if extensions >= config.MAX_END_EXTENSION_SEGMENTS:
-            return None
+            break
         next_index = transcript.segment_index(end_id) + 1
         if next_index >= len(transcript.segments):
-            return None
+            break
         next_segment = transcript.segments[next_index]
         if next_segment.start - current.end > config.END_EXTENSION_MAX_GAP_SEC:
-            return None
+            break
         end_id = next_segment.id
         extensions += 1
 
@@ -327,12 +319,11 @@ def _filter_local_quality(
     chunk only ever sees its own segment_ids, but this stays defensive).
     Candidates that fail any check are dropped silently; no feedback is
     sent back to Claude and no retry happens here. Ending completeness
-    (see _extend_to_natural_ending) is checked here too: a candidate that
-    can't reach a natural ending within its extension budget is dropped
-    rather than rendered mid-utterance, and the hard duration bounds are
-    re-checked *after* extension -- a natural ending that pushes the clip
-    past DURATION_HARD_MAX_SEC drops the candidate rather than cutting it
-    off early to hit the ceiling.
+    (see extend_to_natural_ending) is applied here too, and the hard
+    duration bounds are re-checked *after* extension -- since Stage1
+    produced many candidates, one whose natural ending pushes it past
+    DURATION_HARD_MAX_SEC is simply dropped in favor of another rather
+    than cut off early to hit the ceiling.
     """
     kept = []
     for c in candidates:
@@ -344,11 +335,7 @@ def _filter_local_quality(
             continue
 
         _force_first_segment_is_hook(c)
-
-        extended = _extend_to_natural_ending(c, transcript)
-        if extended is None:
-            continue
-        c = extended
+        c = extend_to_natural_ending(c, transcript)
 
         dur = _candidate_duration(c, transcript)
         if not (config.DURATION_HARD_MIN_SEC <= dur <= config.DURATION_HARD_MAX_SEC):
@@ -416,6 +403,27 @@ def rank_candidates(
     return ranked
 
 
+def _finalize_candidates(
+    candidates: list[RawClipCandidate], transcript: Transcript
+) -> list[RawClipCandidate]:
+    """Re-applies extend_to_natural_ending to a final candidate list
+    regardless of where it came from -- a fresh Stage2 selection or a
+    cache hit. A cache hit must never skip this just because the cached
+    result predates this fix: select_candidates calls this on both of its
+    return paths, so cached and freshly-selected candidates always go
+    through the identical correction before reaching render.
+
+    Unlike _filter_local_quality (which has many Stage1 alternatives to
+    fall back on), there is no substitute candidate here and no
+    additional API call is made -- so a natural ending is always
+    preferred even if, in the rare case a cached candidate still needs
+    extension, it ends up slightly past DURATION_HARD_MAX_SEC. Cutting a
+    clip off mid-utterance remains strictly forbidden, and there is no
+    way to ask Claude for a replacement without discarding the cache.
+    """
+    return [extend_to_natural_ending(c, transcript) for c in candidates]
+
+
 def select_candidates(
     transcript: Transcript, video_title: str, force_refresh: bool = False
 ) -> list[RawClipCandidate]:
@@ -423,12 +431,14 @@ def select_candidates(
     (ranking only) and returns exactly config.NUM_CANDIDATES candidates.
     Neither stage retries automatically: if the local filter leaves too
     few candidates, or Stage2 doesn't return enough valid ids, this raises
-    immediately rather than requesting more from the API.
+    immediately rather than requesting more from the API. Every return
+    path goes through _finalize_candidates, so a cache hit never bypasses
+    the ending-completeness correction.
     """
     if not force_refresh:
         cached = cache.load_stage2(transcript.video_id)
         if cached is not None:
-            return cached
+            return _finalize_candidates(cached, transcript)
 
     stage1_candidates = run_stage1(transcript, video_title, force_refresh=force_refresh)
     filtered = _filter_local_quality(stage1_candidates, transcript)
@@ -449,4 +459,4 @@ def select_candidates(
 
     finalists = [id_map[cid] for cid in top_ids]
     cache.save_stage2(transcript.video_id, finalists)
-    return finalists
+    return _finalize_candidates(finalists, transcript)

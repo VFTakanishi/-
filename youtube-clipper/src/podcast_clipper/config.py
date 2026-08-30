@@ -36,7 +36,7 @@ MIN_OPENING_HOOK_STRENGTH = 60
 
 # Ending completeness: if a candidate's last segment looks cut off
 # mid-utterance, clip_selector extends into following transcript segments
-# (see clip_selector._extend_to_natural_ending) rather than ending on an
+# (see clip_selector.extend_to_natural_ending) rather than ending on an
 # incomplete thought. Bounded so a bad heuristic match can't run away.
 MAX_END_EXTENSION_SEGMENTS = 3
 # A gap this short between transcript segments is treated as the same

@@ -380,13 +380,18 @@ def utterance_completeness_qa(
     """Verifies the clip's last segment doesn't end mid-utterance. Unlike
     boundary_integrity_qa/speech_start_alignment_qa (self-consistency
     checks against boundary.py's numbers), this is a real judgment call --
-    it exists as a safety net for a stale cached Stage2 result (from
-    before this check or clip_selector.py's end-of-clip extension
-    existed) that a cache hit in select_candidates would never re-run
-    through _filter_local_quality.
+    it exists as a safety net against any path reaching render() without
+    going through clip_selector.select_candidates (which always applies
+    this same correction to both fresh and cached candidates).
+
+    Re-runs clip_selector.extend_to_natural_ending -- the identical
+    structural logic (sentence-final punctuation, inter-segment gap) the
+    primary fix uses -- rather than a separate heuristic, so this backstop
+    can never disagree with the primary fix about what counts as complete.
     """
+    extended = clip_selector.extend_to_natural_ending(raw_candidate, transcript)
+    complete = extended.segments[-1].end_segment_id == raw_candidate.segments[-1].end_segment_id
     last_text = manifest.segments[-1].text
-    complete = clip_selector.is_natural_sentence_ending(last_text)
     return QACheck(
         name="発話完結性チェック",
         passed=complete,

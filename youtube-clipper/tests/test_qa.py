@@ -301,35 +301,59 @@ def test_speech_start_alignment_qa_uses_first_segment_only():
 # --- utterance completeness: the clip must not end mid-utterance --------
 
 
+def _transcript_with_gap(gap_sec, texts):
+    segments = []
+    t = 0.0
+    for i, text in enumerate(texts):
+        segments.append(
+            TranscriptSegment(id=i, start=t, end=t + 2.0, text=text, words=[TranscriptWord(t, t + 2.0, text)])
+        )
+        t += 2.0 + gap_sec
+    return Transcript(video_id="vidQ", language="ja", segments=segments)
+
+
 def _manifest_with_last_segment_text(text: str) -> RenderManifest:
     segments = [
-        UsedSegment(role="hook", start=0.0, end=2.0, text="冒頭の発言"),
-        UsedSegment(role="answer", start=10.0, end=15.0, text=text),
+        UsedSegment(role="hook", start=0.0, end=2.0, text="冒頭の発言です。"),
+        UsedSegment(role="answer", start=2.3, end=4.3, text=text),
     ]
     return RenderManifest(
         video_id="vidQ", candidate_id="c1", segments=segments,
         hook_text="h", watermark_text="w",
-        total_duration=7.0,
+        total_duration=4.0,
         intermediate_video_path="mid.mp4", final_video_path="final.mp4",
     )
 
 
 def test_utterance_completeness_qa_passes_on_natural_sentence_ending():
-    manifest = _manifest_with_last_segment_text("これで結論です。")
-    check = qa.utterance_completeness_qa(RawClipCandidate(
+    # Re-runs clip_selector.extend_to_natural_ending: the transcript's
+    # referenced end segment (id=1) already ends with terminal
+    # punctuation, so no extension is wanted -- passes.
+    transcript = _transcript_with_gap(0.3, ["冒頭の発言です。", "これで結論です。"])
+    raw = RawClipCandidate(
         hook_type="story", segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=1)],
         hook_text="h", opening_hook_strength=80, title="t", description="d", score=1, reasoning="r", caveats="",
-    ), _transcript(), manifest)
+    )
+    manifest = _manifest_with_last_segment_text("これで結論です。")
+    check = qa.utterance_completeness_qa(raw, transcript, manifest)
     assert check.passed is True
     assert check.critical is True
 
 
 def test_utterance_completeness_qa_fails_on_mid_utterance_ending():
-    manifest = _manifest_with_last_segment_text("それが起きた理由としては、こういうことが考えられるので")
-    check = qa.utterance_completeness_qa(RawClipCandidate(
+    # The referenced end segment (id=1) has no terminal punctuation and a
+    # close-in-time continuation (id=2) exists -- extend_to_natural_ending
+    # would extend past it, so this candidate (still referencing id=1, as
+    # a stale cached result would) fails as incomplete.
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
+    )
+    raw = RawClipCandidate(
         hook_type="story", segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=1)],
         hook_text="h", opening_hook_strength=80, title="t", description="d", score=1, reasoning="r", caveats="",
-    ), _transcript(), manifest)
+    )
+    manifest = _manifest_with_last_segment_text("それが起きた理由としては、こういうことが考えられるので")
+    check = qa.utterance_completeness_qa(raw, transcript, manifest)
     assert check.passed is False
     assert check.critical is True
     assert check.detail  # names the offending trailing text

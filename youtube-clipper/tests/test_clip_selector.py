@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from podcast_clipper import clip_selector, config
+from podcast_clipper import cache, clip_selector, config
 from podcast_clipper.clip_selector import (
     Stage1CandidateOutput,
     Stage1Output,
@@ -161,60 +161,89 @@ def _transcript_with_gap(gap_sec, texts):
     return Transcript(video_id="vidX", language="ja", segments=segments)
 
 
-def test_is_natural_sentence_ending_true_for_terminal_punctuation():
-    assert clip_selector.is_natural_sentence_ending("これで終わりです。") is True
+def test_ends_with_terminal_punctuation_true_for_sentence_final_marker():
+    assert clip_selector._ends_with_terminal_punctuation("これで終わりです。") is True
 
 
-def test_is_natural_sentence_ending_false_for_continuation_suffix():
-    assert clip_selector.is_natural_sentence_ending("それはこうなので") is False
-
-
-def test_is_natural_sentence_ending_true_when_neither_signal_present():
-    assert clip_selector.is_natural_sentence_ending("普通の単語") is True
+def test_ends_with_terminal_punctuation_false_without_a_marker():
+    # No dictionary of Japanese sentence-ending words/particles is
+    # consulted -- lacking a terminal punctuation mark is treated as
+    # "not confidently complete" regardless of what the text actually
+    # says, and the gap-based structural check decides the rest.
+    assert clip_selector._ends_with_terminal_punctuation("それはこうなので") is False
+    assert clip_selector._ends_with_terminal_punctuation("普通の単語") is False
 
 
 def test_extend_to_natural_ending_leaves_natural_endings_unchanged():
-    # A: already ends naturally -- no extension needed.
+    # C: already ends naturally -- no extension needed, same object back.
     transcript = _transcript_with_gap(0.3, ["これで結論です。", "次のトピックです。"])
     raw = _raw_candidate(0, 0)
-    result = clip_selector._extend_to_natural_ending(raw, transcript)
+    result = clip_selector.extend_to_natural_ending(raw, transcript)
     assert result is raw
 
 
-def test_extend_to_natural_ending_returns_none_when_nothing_to_extend_into():
-    # B: mid-utterance, but it's the last transcript segment -- nothing to pull in.
+def test_extend_to_natural_ending_accepts_when_nothing_to_extend_into():
+    # E (variant): no terminal punctuation, but it's the last transcript
+    # segment -- nothing to extend into, so it's accepted as-is (never
+    # returns None; there is no candidate to reject to).
     transcript = _transcript_with_gap(0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので"])
     raw = _raw_candidate(0, 1)
-    result = clip_selector._extend_to_natural_ending(raw, transcript)
-    assert result is None
+    result = clip_selector.extend_to_natural_ending(raw, transcript)
+    assert result.segments[-1].end_segment_id == 1
 
 
-def test_extend_to_natural_ending_returns_none_on_real_pause(monkeypatch):
-    # B (variant): mid-utterance, but the next segment is far enough away
-    # (a real VAD-detected pause) that it isn't a safe continuation.
-    monkeypatch.setattr(config, "END_EXTENSION_MAX_GAP_SEC", 0.8)
+def test_extend_to_natural_ending_accepts_on_real_pause():
+    # E: no terminal punctuation, but the next segment is far enough away
+    # (a real VAD-detected pause) that it's treated as an intentional
+    # stopping point rather than forced across the gap.
     transcript = _transcript_with_gap(
         5.0, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "全く別の話題です。"]
     )
     raw = _raw_candidate(0, 1)
-    result = clip_selector._extend_to_natural_ending(raw, transcript)
-    assert result is None
+    result = clip_selector.extend_to_natural_ending(raw, transcript)
+    assert result.segments[-1].end_segment_id == 1
 
 
 def test_extend_to_natural_ending_extends_into_continuing_segment():
-    # C: next segment is a close-in-time continuation that completes the thought.
+    # D: no terminal punctuation, and the next segment is a close-in-time
+    # continuation -- extends purely on the structural gap signal, with
+    # no dictionary lookup on the text at all.
     transcript = _transcript_with_gap(
         0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
     )
     raw = _raw_candidate(0, 1)
-    result = clip_selector._extend_to_natural_ending(raw, transcript)
-    assert result is not None
+    result = clip_selector.extend_to_natural_ending(raw, transcript)
     assert result.segments[-1].end_segment_id == 2
 
 
+def test_extend_to_natural_ending_extends_even_without_a_known_continuation_word():
+    # Same as above but the trailing text matches no particular
+    # suffix/particle at all -- proves the decision is driven by the gap,
+    # not by matching against a fixed word list.
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "それについてはこう考えられます", "というのが今回の結論です。"]
+    )
+    raw = _raw_candidate(0, 1)
+    result = clip_selector.extend_to_natural_ending(raw, transcript)
+    assert result.segments[-1].end_segment_id == 2
+
+
+def test_extend_to_natural_ending_stops_at_extension_budget(monkeypatch):
+    monkeypatch.setattr(config, "MAX_END_EXTENSION_SEGMENTS", 1)
+    # Three unpunctuated segments in a row with short gaps -- extending
+    # fully would need 2 hops, but the budget only allows 1.
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "それについて一つ目の話ですが", "さらに二つ目の話ですが", "これで結論です。"]
+    )
+    raw = _raw_candidate(0, 1)
+    result = clip_selector.extend_to_natural_ending(raw, transcript)
+    assert result.segments[-1].end_segment_id == 2  # only one hop taken, budget exhausted
+
+
 def test_filter_local_quality_rejects_candidate_when_natural_ending_exceeds_hard_max(monkeypatch):
-    # D: reaching a natural ending would exceed DURATION_HARD_MAX_SEC --
-    # the candidate is rejected rather than cut off mid-utterance to fit.
+    # F: reaching a natural ending would exceed DURATION_HARD_MAX_SEC --
+    # the candidate is rejected rather than cut off mid-utterance to fit
+    # (Stage1 has other candidates to fall back on here).
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 5.0)
     transcript = _transcript_with_gap(
@@ -227,6 +256,7 @@ def test_filter_local_quality_rejects_candidate_when_natural_ending_exceeds_hard
 
 
 def test_filter_local_quality_keeps_candidate_when_extension_stays_within_hard_max(monkeypatch):
+    # A: fresh (non-cached) candidate is extended.
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _transcript_with_gap(
@@ -237,6 +267,49 @@ def test_filter_local_quality_keeps_candidate_when_extension_stays_within_hard_m
     kept = clip_selector._filter_local_quality([raw], transcript)
     assert len(kept) == 1
     assert kept[0].segments[-1].end_segment_id == 2
+
+
+# --- B (most important): a cache hit must go through the same correction -
+
+
+def test_select_candidates_applies_ending_correction_to_cached_candidates():
+    """The exact scenario that slipped through before this fix: a Stage2
+    result cached under the *old* (pre-extension) behavior -- its last
+    segment ends mid-utterance, matching the real clip_c2 incident -- must
+    still come out corrected on a cache hit, without any Claude API call,
+    without discarding/recomputing the cache.
+    """
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
+    )
+    stale_cached_candidate = _raw_candidate(0, 1, opening_hook_strength=90)
+    cache.save_stage2(transcript.video_id, [stale_cached_candidate] * 3)
+
+    result = clip_selector.select_candidates(transcript, "タイトル")
+
+    assert len(result) == 3
+    for c in result:
+        assert c.segments[-1].end_segment_id == 2  # extended past the stale mid-utterance cutoff
+
+
+def test_select_candidates_keeps_cached_candidate_even_if_extension_exceeds_hard_max(monkeypatch):
+    """Unlike _filter_local_quality (which can drop a candidate in favor
+    of a Stage1 alternative), a cached final candidate has no substitute
+    and no additional API call is made -- so it must still be returned
+    (never silently dropped, never cut off mid-utterance) even if the
+    natural ending pushes it past DURATION_HARD_MAX_SEC.
+    """
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 5.0)
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
+    )
+    stale_cached_candidate = _raw_candidate(0, 1, opening_hook_strength=90)
+    cache.save_stage2(transcript.video_id, [stale_cached_candidate] * 3)
+
+    result = clip_selector.select_candidates(transcript, "タイトル")
+
+    assert len(result) == 3
+    assert all(c.segments[-1].end_segment_id == 2 for c in result)
 
 
 # --- select_candidates: no automatic retry (item H) ----------------------
