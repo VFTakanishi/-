@@ -127,6 +127,55 @@ def _raw_candidate_from_output(c: CandidateOutput) -> RawClipCandidate:
     )
 
 
+class StructuredOutputError(RuntimeError):
+    """Raised when a Claude Structured Outputs response has no usable
+    parsed_output (truncated by max_tokens, refused, context window
+    exceeded, or another undocumented reason). Never retried automatically
+    -- the caller (jobs.py) surfaces this as a failed job with a full
+    traceback via its existing error_traceback field.
+    """
+
+
+def _describe_content_block_types(response) -> str:
+    try:
+        return ", ".join(getattr(b, "type", type(b).__name__) for b in response.content)
+    except Exception:
+        return "<unavailable>"
+
+
+def _require_parsed_output(response, *, stage: str):
+    """Structured Outputs' `parsed_output` is Optional -- it's None whenever
+    Claude's response didn't end up schema-conformant (truncated by
+    max_tokens, refused, context window exceeded, ...). Dereferencing it
+    unconditionally crashes with an undiagnosable "'NoneType' object has no
+    attribute 'candidates'". This surfaces the real reason instead, without
+    ever retrying the API call itself -- that's the caller's decision, not
+    this function's.
+    """
+    if response.parsed_output is not None:
+        return response.parsed_output
+
+    stop_reason = getattr(response, "stop_reason", None)
+    output_tokens = getattr(getattr(response, "usage", None), "output_tokens", None)
+    detail = (
+        f"{stage}: Structured Outputs returned no parsed_output "
+        f"(stop_reason={stop_reason!r}, output_tokens={output_tokens!r}, "
+        f"max_tokens={config.STRUCTURED_OUTPUT_MAX_TOKENS}, "
+        f"content_blocks=[{_describe_content_block_types(response)}])"
+    )
+
+    if stop_reason == "max_tokens":
+        raise StructuredOutputError(
+            f"{detail}. Truncated by max_tokens before completing structured output."
+        )
+    if stop_reason == "refusal":
+        stop_details = getattr(response, "stop_details", None)
+        raise StructuredOutputError(f"{detail}. Claude refused. stop_details={stop_details!r}")
+    if stop_reason == "model_context_window_exceeded":
+        raise StructuredOutputError(f"{detail}. Model context window exceeded.")
+    raise StructuredOutputError(f"{detail}. Unexpected: no parsed_output for this stop_reason.")
+
+
 def _usable_segments(transcript: Transcript) -> list[TranscriptSegment]:
     """Segments Claude is allowed to reference at all.
 
@@ -171,12 +220,13 @@ def extract_candidates_for_chunk(
 
     response = _client().messages.parse(
         model=config.ANTHROPIC_MODEL,
-        max_tokens=4096,
+        max_tokens=config.STRUCTURED_OUTPUT_MAX_TOKENS,
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
         output_format=Stage1Output,
     )
-    return [_raw_candidate_from_output(c) for c in response.parsed_output.candidates]
+    parsed = _require_parsed_output(response, stage="Stage1")
+    return [_raw_candidate_from_output(c) for c in parsed.candidates]
 
 
 def run_stage1(
@@ -246,12 +296,13 @@ def rank_and_finalize(
 
     response = _client().messages.parse(
         model=config.ANTHROPIC_MODEL,
-        max_tokens=4096,
+        max_tokens=config.STRUCTURED_OUTPUT_MAX_TOKENS,
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
         output_format=Stage2Output,
     )
-    return [_raw_candidate_from_output(c) for c in response.parsed_output.candidates]
+    parsed = _require_parsed_output(response, stage="Stage2")
+    return [_raw_candidate_from_output(c) for c in parsed.candidates]
 
 
 def _opening_text(raw: RawClipCandidate, transcript: Transcript) -> str:

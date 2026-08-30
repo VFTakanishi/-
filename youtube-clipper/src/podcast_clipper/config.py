@@ -48,6 +48,14 @@ CHUNK_OVERLAP_MINUTES = 1.0
 
 ANTHROPIC_MODEL = os.environ.get("PODCAST_CLIPPER_ANTHROPIC_MODEL", "claude-sonnet-5")
 
+# Ceiling for Stage1/Stage2 Structured Outputs responses. Each candidate
+# carries segments/hook_text/opening_hook_strength/title/description/score/
+# reasoning/caveats, and Stage2 always returns exactly 3 -- 4096 was
+# observed on a real machine to sometimes truncate before completion
+# (stop_reason == "max_tokens"). This is a ceiling, not a fixed cost: a
+# response that finishes naturally does not consume all of it.
+STRUCTURED_OUTPUT_MAX_TOKENS = 8192
+
 # --- Transcription --------------------------------------------------
 WHISPER_MODEL_SIZE = os.environ.get("PODCAST_CLIPPER_WHISPER_MODEL", "large-v3")
 WHISPER_DEVICE = os.environ.get("PODCAST_CLIPPER_WHISPER_DEVICE", "cpu")

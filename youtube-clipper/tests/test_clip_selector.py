@@ -342,3 +342,68 @@ def test_rank_and_finalize_converts_structured_output(monkeypatch):
 def test_forbid_real_anthropic_client_fixture_actually_blocks_construction():
     with pytest.raises(AssertionError):
         clip_selector._client()
+
+
+# --- _require_parsed_output: Structured Outputs' parsed_output is Optional
+# --- and must never be dereferenced unconditionally (real-machine incident:
+# --- "'NoneType' object has no attribute 'candidates'"). These test the
+# --- helper directly against fake response objects -- no real API call.
+
+
+class _FakeUsage:
+    def __init__(self, output_tokens):
+        self.output_tokens = output_tokens
+
+
+class _FakeParseResponse:
+    def __init__(self, *, parsed_output=None, stop_reason="end_turn", content=None, usage=None):
+        self.parsed_output = parsed_output
+        self.stop_reason = stop_reason
+        self.content = content if content is not None else []
+        self.usage = usage
+
+
+def test_require_parsed_output_returns_it_when_present():
+    parsed = Stage1Output(candidates=[])
+    response = _FakeParseResponse(parsed_output=parsed, stop_reason="end_turn")
+    assert clip_selector._require_parsed_output(response, stage="Stage1") is parsed
+
+
+def test_require_parsed_output_raises_on_max_tokens():
+    response = _FakeParseResponse(parsed_output=None, stop_reason="max_tokens", usage=_FakeUsage(8192))
+    with pytest.raises(clip_selector.StructuredOutputError, match="max_tokens"):
+        clip_selector._require_parsed_output(response, stage="Stage1")
+
+
+def test_require_parsed_output_raises_on_refusal():
+    response = _FakeParseResponse(parsed_output=None, stop_reason="refusal")
+    with pytest.raises(clip_selector.StructuredOutputError, match="refus"):
+        clip_selector._require_parsed_output(response, stage="Stage2")
+
+
+def test_require_parsed_output_raises_on_context_window_exceeded():
+    response = _FakeParseResponse(parsed_output=None, stop_reason="model_context_window_exceeded")
+    with pytest.raises(clip_selector.StructuredOutputError, match="context window"):
+        clip_selector._require_parsed_output(response, stage="Stage1")
+
+
+def test_require_parsed_output_raises_on_unexplained_none():
+    """parsed_output is None but stop_reason is a normal-looking end_turn --
+    an undocumented/unexpected case that must still fail loudly rather than
+    silently continuing with a missing result.
+    """
+    response = _FakeParseResponse(parsed_output=None, stop_reason="end_turn")
+    with pytest.raises(clip_selector.StructuredOutputError):
+        clip_selector._require_parsed_output(response, stage="Stage2")
+
+
+def test_require_parsed_output_does_not_crash_on_empty_content():
+    response = _FakeParseResponse(parsed_output=None, stop_reason="max_tokens", content=[])
+    with pytest.raises(clip_selector.StructuredOutputError):
+        clip_selector._require_parsed_output(response, stage="Stage1")
+
+
+def test_require_parsed_output_does_not_crash_on_missing_usage():
+    response = _FakeParseResponse(parsed_output=None, stop_reason="refusal", usage=None)
+    with pytest.raises(clip_selector.StructuredOutputError):
+        clip_selector._require_parsed_output(response, stage="Stage2")
