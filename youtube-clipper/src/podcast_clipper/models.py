@@ -93,6 +93,39 @@ class Transcript:
         raise KeyError(f"no transcript segment with id={segment_id}")
 
 
+# Known weak lead-in phrases that may appear at the very start of a
+# candidate's opening. Used two ways: clip_selector.py's
+# _looks_like_weak_opening (reject a candidate whose opening still looks
+# weak after trimming) and boundary.py's opening-trim (mechanically skip
+# past one of these at the very front of a candidate's first segment,
+# never a mid-sentence occurrence). Defined once here so both stay
+# consistent.
+WEAK_OPENING_PREFIXES = (
+    "今回は", "今日は", "ということで", "えー", "えーと", "えっと", "あの", "まあ", "さて", "このように",
+)
+
+
+def find_opening_trim_point(segment: TranscriptSegment) -> TranscriptWord | None:
+    """If segment's word sequence begins with one of WEAK_OPENING_PREFIXES
+    (matched only at the very start of the segment -- never a
+    mid-sentence occurrence, since matching stops as soon as the
+    accumulated text is no longer a prefix of any known phrase), returns
+    the first word after that phrase so playback can start there instead.
+    Returns None if there's no word-timestamp data at all (never guess a
+    cut point without it) or no known prefix matches.
+    """
+    if not segment.words:
+        return None
+    accumulated = ""
+    for i, word in enumerate(segment.words):
+        accumulated += word.text
+        if accumulated in WEAK_OPENING_PREFIXES:
+            return segment.words[i + 1] if i + 1 < len(segment.words) else None
+        if not any(prefix.startswith(accumulated) for prefix in WEAK_OPENING_PREFIXES):
+            return None
+    return None
+
+
 @dataclass
 class RawUsedSegment:
     """A semantic range Claude selected, referencing transcript segment IDs."""

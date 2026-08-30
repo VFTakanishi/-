@@ -46,7 +46,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import boundary, cache, config, structured_output
+from . import boundary, cache, config, models, structured_output
 from .models import RawClipCandidate, RawUsedSegment, Transcript, TranscriptSegment
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
@@ -91,17 +91,15 @@ class Stage2RankingOutput(BaseModel):
 # Weak "warm-up" openings explicitly called out as unacceptable: a mechanical
 # safety net that backs up Claude's own opening_hook_strength self-rating by
 # catching the most obvious literal cases. This checks the *actual spoken*
-# transcript text of the candidate's first (hook) segment, never the
+# transcript text of the candidate's first (hook) segment (after
+# boundary.py's opening trim -- see _opening_text below), never the
 # on-screen hook_text overlay -- a strong overlay must never excuse a weak
-# spoken opening.
-_WEAK_OPENING_PREFIXES = [
-    "今回は", "今日は", "ということで", "えー", "えーと", "えっと", "あの", "まあ", "さて",
-]
-
-
+# spoken opening. The prefix list itself lives in models.py
+# (WEAK_OPENING_PREFIXES) so it stays identical to the list
+# boundary.py's opening-trim mechanically skips past.
 def _looks_like_weak_opening(text: str) -> bool:
     stripped = text.strip()
-    return any(stripped.startswith(p) for p in _WEAK_OPENING_PREFIXES)
+    return any(stripped.startswith(p) for p in models.WEAK_OPENING_PREFIXES)
 
 
 def _force_first_segment_is_hook(raw: RawClipCandidate) -> None:
@@ -239,7 +237,14 @@ def _candidate_duration(raw: RawClipCandidate, transcript: Transcript) -> float:
 
 
 def _opening_text(raw: RawClipCandidate, transcript: Transcript) -> str:
-    return transcript.segment_by_id(raw.segments[0].start_segment_id).text
+    """The candidate's actual opening text *after* boundary.py's opening
+    trim (see boundary._apply_opening_trim) -- never the raw untrimmed
+    transcript text. Reading the raw text here would make this reject a
+    candidate for a weak lead-in ("このように...") that render/UI have
+    already mechanically trimmed away, defeating the trim entirely.
+    """
+    resolved = boundary.resolve_candidate(raw, transcript, candidate_id="_tmp")
+    return resolved.segments[0].text
 
 
 # The only "confidently complete" text signal -- sentence-final
@@ -255,6 +260,22 @@ def _ends_with_terminal_punctuation(text: str) -> bool:
     return bool(stripped) and stripped.endswith(_SENTENCE_END_MARKERS)
 
 
+# Clear grammatical continuation markers ("〜ので", "〜けど", ...): used
+# ONLY as a strong *negative* signal that a text is obviously still
+# continuing, in combination with the structural (inter-segment gap)
+# check below -- never on its own as the sole judge of completeness. Do
+# not go back to deciding completeness from this list alone.
+_CONFIRMED_CONTINUATION_SUFFIXES = (
+    "ので", "から", "けど", "けれど", "けれども", "ですが", "ますが",
+    "という", "ということで", "し", "て", "で", "たら", "れば",
+)
+
+
+def _ends_with_confirmed_continuation(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and stripped.endswith(_CONFIRMED_CONTINUATION_SUFFIXES)
+
+
 def extend_to_natural_ending(
     raw: RawClipCandidate, transcript: Transcript
 ) -> RawClipCandidate:
@@ -266,9 +287,20 @@ def extend_to_natural_ending(
     splits segments on detected silence, so a short gap is itself a
     continuity signal; a real pause, or no next segment at all, is taken
     as the best available evidence that this *was* an intentional
-    stopping point even without punctuation -- forcing an extension
-    across a real pause would be worse than accepting an
-    unpunctuated-but-paused-after ending.
+    stopping point -- but ONLY when the text isn't also grammatically
+    signalling that it's still continuing. A pause alone is never treated
+    as "the sentence is complete": when the current text ends with a
+    confirmed continuation marker (_ends_with_confirmed_continuation,
+    e.g. "〜ので"), that is much stronger evidence of an unfinished
+    thought than an ambiguous, unpunctuated-but-otherwise-neutral ending,
+    so a longer gap (config.END_EXTENSION_CONTINUATION_MAX_GAP_SEC) is
+    tolerated before giving up on bridging it -- the marker is used only
+    as a negative signal combined with the structural gap check, never as
+    the sole judge on its own. Even so, this loop can still stop while
+    the text is confirmed-still-continuing (gap too large even under the
+    lenient threshold, or budget/next-segment exhausted); callers must
+    check has_confident_natural_ending afterward to detect and reject
+    that case rather than treating "extension stopped" as "now complete".
 
     Always returns a RawClipCandidate -- the input unchanged if it
     already looks complete or can't be safely extended further, never
@@ -296,7 +328,13 @@ def extend_to_natural_ending(
         if next_index >= len(transcript.segments):
             break
         next_segment = transcript.segments[next_index]
-        if next_segment.start - current.end > config.END_EXTENSION_MAX_GAP_SEC:
+        gap = next_segment.start - current.end
+        max_gap = (
+            config.END_EXTENSION_CONTINUATION_MAX_GAP_SEC
+            if _ends_with_confirmed_continuation(current.text)
+            else config.END_EXTENSION_MAX_GAP_SEC
+        )
+        if gap > max_gap:
             break
         end_id = next_segment.id
         extensions += 1
@@ -309,6 +347,25 @@ def extend_to_natural_ending(
     return replace(raw, segments=new_segments)
 
 
+def has_confident_natural_ending(raw: RawClipCandidate, transcript: Transcript) -> bool:
+    """True unless the candidate's current last segment lacks terminal
+    punctuation AND grammatically signals it's still continuing
+    (_ends_with_confirmed_continuation) -- i.e. extend_to_natural_ending
+    ran out of budget, ran off the end of the transcript, or hit a gap
+    too large to bridge while the text was still confidently incomplete.
+    A pause (of any length) is never, by itself, evidence of completeness
+    for such text -- callers (_filter_local_quality, _finalize_candidates,
+    qa.utterance_completeness_qa) must call this *after*
+    extend_to_natural_ending and drop/fail the candidate if it returns
+    False, rather than accepting whatever ending extension happened to
+    stop at.
+    """
+    text = transcript.segment_by_id(raw.segments[-1].end_segment_id).text
+    if _ends_with_terminal_punctuation(text):
+        return True
+    return not _ends_with_confirmed_continuation(text)
+
+
 def _filter_local_quality(
     candidates: list[RawClipCandidate], transcript: Transcript
 ) -> list[RawClipCandidate]:
@@ -318,11 +375,14 @@ def _filter_local_quality(
     chunk only ever sees its own segment_ids, but this stays defensive).
     Candidates that fail any check are dropped silently; no feedback is
     sent back to Claude and no retry happens here. Ending completeness
-    (see extend_to_natural_ending) is applied here too, and the hard
-    duration bounds are re-checked *after* extension -- since Stage1
-    produced many candidates, one whose natural ending pushes it past
-    DURATION_HARD_MAX_SEC is simply dropped in favor of another rather
-    than cut off early to hit the ceiling.
+    (see extend_to_natural_ending) is applied here too: a candidate still
+    confidently mid-utterance after extension (has_confident_natural_ending
+    returns False -- e.g. still ends in "〜ので" with no further segment
+    to bridge to) is dropped rather than accepted just because a pause
+    followed it, and the hard duration bounds are re-checked *after*
+    extension -- since Stage1 produced many candidates, one whose natural
+    ending pushes it past DURATION_HARD_MAX_SEC is simply dropped in favor
+    of another rather than cut off early to hit the ceiling.
     """
     kept = []
     for c in candidates:
@@ -335,6 +395,8 @@ def _filter_local_quality(
 
         _force_first_segment_is_hook(c)
         c = extend_to_natural_ending(c, transcript)
+        if not has_confident_natural_ending(c, transcript):
+            continue
 
         dur = _candidate_duration(c, transcript)
         if not (config.DURATION_HARD_MIN_SEC <= dur <= config.DURATION_HARD_MAX_SEC):
@@ -405,15 +467,19 @@ def rank_candidates(
 def _finalize_candidates(
     candidates: list[RawClipCandidate], transcript: Transcript
 ) -> list[RawClipCandidate]:
-    """Re-applies extend_to_natural_ending AND re-enforces the hard
-    duration bounds on a final candidate list, regardless of where it
-    came from -- a fresh Stage2 selection or a cache hit. The rule is
-    identical for both: a natural ending that pushes a candidate outside
-    [DURATION_HARD_MIN_SEC, DURATION_HARD_MAX_SEC] makes it ineligible. It
+    """Re-applies extend_to_natural_ending, re-checks
+    has_confident_natural_ending, AND re-enforces the hard duration bounds
+    on a final candidate list, regardless of where it came from -- a fresh
+    Stage2 selection or a cache hit. The rule is identical for both: a
+    candidate still confidently mid-utterance after extension (e.g. still
+    ends in "〜ので" with no viable further segment to bridge to -- a
+    pause is never treated as completeness on its own), or one whose
+    natural ending pushes it outside
+    [DURATION_HARD_MIN_SEC, DURATION_HARD_MAX_SEC], makes it ineligible. It
     is never truncated mid-utterance to fit, and a cache hit does not
     relax this just because there's no alternative candidate to
     substitute -- "no substitute available" is a reason to fail loudly,
-    not a reason to accept an out-of-range clip.
+    not a reason to accept an out-of-range or incomplete clip.
 
     select_candidates calls this on both of its return paths, so cached
     and freshly-selected candidates always go through the identical
@@ -433,14 +499,17 @@ def _finalize_candidates(
     finalized = []
     for c in candidates:
         extended = extend_to_natural_ending(c, transcript)
+        if not has_confident_natural_ending(extended, transcript):
+            continue
         dur = _candidate_duration(extended, transcript)
         if config.DURATION_HARD_MIN_SEC <= dur <= config.DURATION_HARD_MAX_SEC:
             finalized.append(extended)
 
     if len(finalized) < config.NUM_CANDIDATES:
         raise RuntimeError(
-            "保存済み候補のうち、自然な発話終端を確保すると尺が目標範囲"
-            f"（{config.DURATION_HARD_MIN_SEC:.0f}〜{config.DURATION_HARD_MAX_SEC:.0f}秒）"
+            "保存済み候補のうち、自然な発話終端を確保できない候補（例: 「〜ので」等の"
+            "継続表現で終わっており、これ以上延長できないもの）、または延長後の尺が"
+            f"目標範囲（{config.DURATION_HARD_MIN_SEC:.0f}〜{config.DURATION_HARD_MAX_SEC:.0f}秒）"
             f"を外れる候補があり、有効な{config.NUM_CANDIDATES}候補を確保できませんでした"
             f"（有効{len(finalized)}件）。再解析が必要です。APIへの自動再要求は行いません。"
         )

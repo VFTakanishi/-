@@ -359,6 +359,28 @@ def test_utterance_completeness_qa_fails_on_mid_utterance_ending():
     assert check.detail  # names the offending trailing text
 
 
+def test_utterance_completeness_qa_fails_on_confirmed_continuation_with_no_viable_extension():
+    # Distinct from the "still extends further" failure above: here the
+    # referenced end segment (id=1) is also the *last* transcript segment
+    # -- extend_to_natural_ending has nothing left to bridge into, so
+    # `still_extends` alone would say "complete". A pause (or the mere
+    # absence of a next segment) must never be treated as completeness
+    # when the text itself confidently signals it's still continuing
+    # ("...ので") -- has_confident_natural_ending is what catches this.
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "整備士に出会うことが大切じゃないかなと思うので"]
+    )
+    raw = RawClipCandidate(
+        hook_type="story", segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=1)],
+        hook_text="h", opening_hook_strength=80, title="t", description="d", score=1, reasoning="r", caveats="",
+    )
+    manifest = _manifest_with_last_segment_text("整備士に出会うことが大切じゃないかなと思うので")
+    check = qa.utterance_completeness_qa(raw, transcript, manifest)
+    assert check.passed is False
+    assert check.critical is True
+    assert check.detail
+
+
 # --- ordering guarantee (plan fix #7): video Content QA must run on the --
 # --- intermediate (pre-text) video, never on the final (post-text) mp4  --
 

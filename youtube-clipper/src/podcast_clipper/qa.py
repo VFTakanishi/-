@@ -384,13 +384,20 @@ def utterance_completeness_qa(
     going through clip_selector.select_candidates (which always applies
     this same correction to both fresh and cached candidates).
 
-    Re-runs clip_selector.extend_to_natural_ending -- the identical
-    structural logic (sentence-final punctuation, inter-segment gap) the
-    primary fix uses -- rather than a separate heuristic, so this backstop
-    can never disagree with the primary fix about what counts as complete.
+    Re-runs clip_selector.extend_to_natural_ending and
+    clip_selector.has_confident_natural_ending -- the identical structural
+    logic (sentence-final punctuation, inter-segment gap, confirmed
+    continuation markers) the primary fix uses -- rather than a separate
+    heuristic, so this backstop can never disagree with the primary fix
+    about what counts as complete. A candidate that's still confidently
+    mid-utterance after extension (e.g. still ends in "〜ので" with no
+    viable further segment) fails here too -- a pause alone is never
+    treated as completeness, matching clip_selector's own rule.
     """
     extended = clip_selector.extend_to_natural_ending(raw_candidate, transcript)
-    complete = extended.segments[-1].end_segment_id == raw_candidate.segments[-1].end_segment_id
+    still_extends = extended.segments[-1].end_segment_id != raw_candidate.segments[-1].end_segment_id
+    confident = clip_selector.has_confident_natural_ending(raw_candidate, transcript)
+    complete = (not still_extends) and confident
     last_text = manifest.segments[-1].text
     return QACheck(
         name="発話完結性チェック",

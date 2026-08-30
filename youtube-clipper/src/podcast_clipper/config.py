@@ -44,6 +44,15 @@ MAX_END_EXTENSION_SEGMENTS = 3
 # on detected silence, so a short gap is itself a continuity signal)
 # rather than a real pause marking a completed thought.
 END_EXTENSION_MAX_GAP_SEC = 0.8
+# A confirmed non-final grammatical ending (ので/から/けど/という/...) is
+# much stronger evidence of continuation than an unpunctuated-but-
+# otherwise-ambiguous ending, so it gets a longer (but still bounded)
+# allowance before an inter-segment gap is trusted as a real pause -- a
+# pause alone must never be enough to call "...と思うので" complete. No
+# real transcript data was available to calibrate this exactly, so it's
+# set conservatively at ~2x the base gap threshold rather than guessed
+# loosely (e.g. not several seconds).
+END_EXTENSION_CONTINUATION_MAX_GAP_SEC = 1.5
 
 # Bump this whenever clip_selector.py's Claude prompt text or Structured
 # Outputs schema changes in a way that makes previously-cached Stage1/Stage2

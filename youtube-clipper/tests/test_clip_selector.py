@@ -240,6 +240,98 @@ def test_extend_to_natural_ending_stops_at_extension_budget(monkeypatch):
     assert result.segments[-1].end_segment_id == 2  # only one hop taken, budget exhausted
 
 
+def test_extend_to_natural_ending_uses_lenient_gap_for_confirmed_continuation(monkeypatch):
+    # C: a confirmed continuation ending ("...ので") must not be accepted
+    # as complete just because a pause exceeds the base 0.8s gap threshold
+    # -- but the new, still-bounded, lenient threshold for *confirmed*
+    # continuation text should bridge it rather than stopping early.
+    monkeypatch.setattr(config, "END_EXTENSION_MAX_GAP_SEC", 0.8)
+    monkeypatch.setattr(config, "END_EXTENSION_CONTINUATION_MAX_GAP_SEC", 1.5)
+    transcript = _transcript_with_gap(
+        1.2, ["冒頭の発言です。", "整備士に出会うことが大切じゃないかなと思うので", "そのあたりも確認する必要があります。"]
+    )
+    raw = _raw_candidate(0, 1)
+    result = clip_selector.extend_to_natural_ending(raw, transcript)
+    assert result.segments[-1].end_segment_id == 2
+
+
+def test_extend_to_natural_ending_ambiguous_text_still_uses_base_gap(monkeypatch):
+    # The lenient threshold applies only to text matching a confirmed
+    # continuation marker -- an ambiguous ending (no punctuation, no
+    # continuation suffix) at the same 1.2s gap must still stop at the
+    # base 0.8s threshold, exactly as before this change.
+    monkeypatch.setattr(config, "END_EXTENSION_MAX_GAP_SEC", 0.8)
+    monkeypatch.setattr(config, "END_EXTENSION_CONTINUATION_MAX_GAP_SEC", 1.5)
+    transcript = _transcript_with_gap(
+        1.2, ["冒頭の発言です。", "それについてはこう考えられます", "というのが今回の結論です。"]
+    )
+    raw = _raw_candidate(0, 1)
+    result = clip_selector.extend_to_natural_ending(raw, transcript)
+    assert result.segments[-1].end_segment_id == 1
+
+
+# --- has_confident_natural_ending: a pause alone must never mean complete -
+
+
+def test_has_confident_natural_ending_true_for_terminal_punctuation():
+    transcript = _transcript_with_gap(0.3, ["これで結論です。", "次のトピックです。"])
+    raw = _raw_candidate(0, 0)
+    assert clip_selector.has_confident_natural_ending(raw, transcript) is True
+
+
+def test_has_confident_natural_ending_false_for_confirmed_continuation_suffix():
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "整備士に出会うことが大切じゃないかなと思うので"]
+    )
+    raw = _raw_candidate(0, 1)
+    assert clip_selector.has_confident_natural_ending(raw, transcript) is False
+
+
+def test_has_confident_natural_ending_true_for_ambiguous_non_continuation_text():
+    # No terminal punctuation, but also not a confirmed continuation
+    # marker -- accepted as a natural stopping point (rule 4).
+    transcript = _transcript_with_gap(0.3, ["冒頭の発言です。", "普通の単語"])
+    raw = _raw_candidate(0, 1)
+    assert clip_selector.has_confident_natural_ending(raw, transcript) is True
+
+
+def test_has_confident_natural_ending_false_when_no_next_segment_to_bridge():
+    # Item M test 3: "...ので" + no next segment at all must never be
+    # treated as complete just because there's nothing left to extend
+    # into -- the candidate must be flagged ineligible, not accepted.
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "整備士に出会うことが大切じゃないかなと思うので"]
+    )
+    raw = _raw_candidate(0, 1)
+    extended = clip_selector.extend_to_natural_ending(raw, transcript)
+    assert clip_selector.has_confident_natural_ending(extended, transcript) is False
+
+
+def test_filter_local_quality_drops_confirmed_continuation_with_no_viable_extension():
+    # The same scenario wired through the actual pre-Stage2 filter.
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "整備士に出会うことが大切じゃないかなと思うので"]
+    )
+    raw = _raw_candidate(0, 1, opening_hook_strength=90)
+    kept = clip_selector._filter_local_quality([raw], transcript)
+    assert kept == []
+
+
+def test_select_candidates_raises_when_cached_candidates_are_confirmed_continuation_with_no_extension(monkeypatch):
+    # Item M test 7: the identical "pause != complete" rule must apply to
+    # the cache-hit path (_finalize_candidates), not just the fresh path.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "整備士に出会うことが大切じゃないかなと思うので"]
+    )
+    stale_cached_candidate = _raw_candidate(0, 1, opening_hook_strength=90)
+    cache.save_stage2(transcript.video_id, [stale_cached_candidate] * 3)
+
+    with pytest.raises(RuntimeError, match="有効な"):
+        clip_selector.select_candidates(transcript, "タイトル")
+
+
 def test_filter_local_quality_rejects_candidate_when_natural_ending_exceeds_hard_max(monkeypatch):
     # F: reaching a natural ending would exceed DURATION_HARD_MAX_SEC --
     # the candidate is rejected rather than cut off mid-utterance to fit
@@ -582,6 +674,77 @@ def test_rank_candidates_does_not_send_full_transcript(monkeypatch):
     clip_selector.rank_candidates(id_map, transcript, "タイトル")
 
     assert "マーカーXYZ123" not in captured["user_content"]
+
+
+# --- opening trim: _opening_text/_looks_like_weak_opening must agree with
+# --- boundary.py's mechanical trim (item M: 8-11) -------------------------
+
+
+def _segment_with_words(i, start, *word_texts):
+    """A TranscriptSegment whose word list is `word_texts`, laid out
+    back-to-back from `start` (0.5s each), with .text set to their exact
+    concatenation -- mirrors how boundary._apply_opening_trim expects word
+    spans to line up with segment.text (see test_boundary.py).
+    """
+    words = []
+    t = start
+    for wt in word_texts:
+        words.append(TranscriptWord(start=t, end=t + 0.5, text=wt))
+        t += 0.5
+    return TranscriptSegment(id=i, start=start, end=t, text="".join(word_texts), words=words)
+
+
+def test_opening_text_returns_post_trim_text():
+    # _opening_text must see what render/UI will actually show (post-trim),
+    # never the raw untrimmed transcript text.
+    transcript = Transcript(
+        video_id="vid1", language="ja",
+        segments=[
+            _segment_with_words(0, 0.0, "このように", "弱点を", "直すと"),
+            _segment_with_words(1, 5.0, "次の弱点が生まれます。"),
+        ],
+    )
+    raw = _raw_candidate(0, 1, opening_hook_strength=90)
+    opening = clip_selector._opening_text(raw, transcript)
+    assert opening.startswith("弱点を")
+    assert "このように" not in opening
+
+
+def test_looks_like_weak_opening_no_longer_rejects_once_trimmed(monkeypatch):
+    # Once boundary.py trims "このように" off the front, _opening_text
+    # sees "弱点を直すと..." -- not a weak-opening prefix -- so the
+    # candidate must survive _filter_local_quality (items J/K: the reject
+    # check and the trim mechanism must agree, never disagree).
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vid1", language="ja",
+        segments=[
+            _segment_with_words(0, 0.0, "このように", "弱点を", "直すと次の弱点が生まれます。"),
+        ],
+    )
+    raw = _raw_candidate(0, 0, opening_hook_strength=90)
+    kept = clip_selector._filter_local_quality([raw], transcript)
+    assert len(kept) == 1
+
+
+def test_looks_like_weak_opening_still_rejects_when_trim_leaves_weak_text(monkeypatch):
+    # If, after trimming one known prefix, the opening still starts with
+    # another weak prefix from models.WEAK_OPENING_PREFIXES, the reject
+    # check must still fire -- trimming only removes the mechanically
+    # known lead-in word(s) at the very front, it does not launder an
+    # opening that is weak all the way through.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vid1", language="ja",
+        segments=[
+            _segment_with_words(0, 0.0, "このように", "今回は", "本題に入ります。"),
+        ],
+    )
+    raw = _raw_candidate(0, 0, opening_hook_strength=90)
+    kept = clip_selector._filter_local_quality([raw], transcript)
+    assert kept == []
 
 
 def test_select_candidates_calls_stage2_at_most_once(monkeypatch):
