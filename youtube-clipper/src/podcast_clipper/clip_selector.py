@@ -272,17 +272,16 @@ def extend_to_natural_ending(
 
     Always returns a RawClipCandidate -- the input unchanged if it
     already looks complete or can't be safely extended further, never
-    None. Callers that have alternative candidates to fall back on (e.g.
-    _filter_local_quality, which has many Stage1 candidates to choose
-    from) should additionally re-check duration bounds afterward and drop
-    the candidate if extension pushed it past DURATION_HARD_MAX_SEC.
-    Callers with no alternative (a cached final candidate, see
-    _finalize_candidates) should accept the result as-is rather than cut
-    it off mid-utterance. No Claude API call is made either way, and this
-    never re-decides *which* segments to use semantically -- only whether
-    to include a couple more of the segments Claude already had
-    available. Used identically by qa.utterance_completeness_qa as a
-    safety net, so the primary fix and the QA backstop can never disagree.
+    None. This never checks duration itself: every caller (both
+    _filter_local_quality and _finalize_candidates) re-checks duration
+    bounds afterward and drops the candidate if extension pushed it past
+    DURATION_HARD_MAX_SEC -- the rule is identical regardless of whether
+    an alternative candidate happens to be available. No Claude API call
+    is made either way, and this never re-decides *which* segments to use
+    semantically -- only whether to include a couple more of the segments
+    Claude already had available. Used identically by
+    qa.utterance_completeness_qa as a safety net, so the primary fix and
+    the QA backstop can never disagree.
     """
     last = raw.segments[-1]
     end_id = last.end_segment_id
@@ -406,22 +405,46 @@ def rank_candidates(
 def _finalize_candidates(
     candidates: list[RawClipCandidate], transcript: Transcript
 ) -> list[RawClipCandidate]:
-    """Re-applies extend_to_natural_ending to a final candidate list
-    regardless of where it came from -- a fresh Stage2 selection or a
-    cache hit. A cache hit must never skip this just because the cached
-    result predates this fix: select_candidates calls this on both of its
-    return paths, so cached and freshly-selected candidates always go
-    through the identical correction before reaching render.
+    """Re-applies extend_to_natural_ending AND re-enforces the hard
+    duration bounds on a final candidate list, regardless of where it
+    came from -- a fresh Stage2 selection or a cache hit. The rule is
+    identical for both: a natural ending that pushes a candidate outside
+    [DURATION_HARD_MIN_SEC, DURATION_HARD_MAX_SEC] makes it ineligible. It
+    is never truncated mid-utterance to fit, and a cache hit does not
+    relax this just because there's no alternative candidate to
+    substitute -- "no substitute available" is a reason to fail loudly,
+    not a reason to accept an out-of-range clip.
 
-    Unlike _filter_local_quality (which has many Stage1 alternatives to
-    fall back on), there is no substitute candidate here and no
-    additional API call is made -- so a natural ending is always
-    preferred even if, in the rare case a cached candidate still needs
-    extension, it ends up slightly past DURATION_HARD_MAX_SEC. Cutting a
-    clip off mid-utterance remains strictly forbidden, and there is no
-    way to ask Claude for a replacement without discarding the cache.
+    select_candidates calls this on both of its return paths, so cached
+    and freshly-selected candidates always go through the identical
+    correction before reaching render. For the fresh path,
+    _filter_local_quality already enforced these same bounds before
+    Stage2 ran, so this check is normally a no-op there; for a cache hit,
+    this is the first time the bounds are enforced against the
+    (possibly-extended) result.
+
+    If fewer than config.NUM_CANDIDATES remain eligible after this,
+    raises immediately -- there is no substitute available without
+    re-running Stage1/Stage2 against the Claude API, which this function
+    must never do. The caller (re-analyzing an already-cached video)
+    needs an explicit signal that a fresh analysis is required, not a
+    silently short candidate list.
     """
-    return [extend_to_natural_ending(c, transcript) for c in candidates]
+    finalized = []
+    for c in candidates:
+        extended = extend_to_natural_ending(c, transcript)
+        dur = _candidate_duration(extended, transcript)
+        if config.DURATION_HARD_MIN_SEC <= dur <= config.DURATION_HARD_MAX_SEC:
+            finalized.append(extended)
+
+    if len(finalized) < config.NUM_CANDIDATES:
+        raise RuntimeError(
+            "保存済み候補のうち、自然な発話終端を確保すると尺が目標範囲"
+            f"（{config.DURATION_HARD_MIN_SEC:.0f}〜{config.DURATION_HARD_MAX_SEC:.0f}秒）"
+            f"を外れる候補があり、有効な{config.NUM_CANDIDATES}候補を確保できませんでした"
+            f"（有効{len(finalized)}件）。再解析が必要です。APIへの自動再要求は行いません。"
+        )
+    return finalized
 
 
 def select_candidates(
@@ -433,7 +456,9 @@ def select_candidates(
     few candidates, or Stage2 doesn't return enough valid ids, this raises
     immediately rather than requesting more from the API. Every return
     path goes through _finalize_candidates, so a cache hit never bypasses
-    the ending-completeness correction.
+    the ending-completeness correction or the hard duration bounds --
+    the same rule applies whether the candidates are freshly selected or
+    loaded from cache.
     """
     if not force_refresh:
         cached = cache.load_stage2(transcript.video_id)

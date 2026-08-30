@@ -272,13 +272,16 @@ def test_filter_local_quality_keeps_candidate_when_extension_stays_within_hard_m
 # --- B (most important): a cache hit must go through the same correction -
 
 
-def test_select_candidates_applies_ending_correction_to_cached_candidates():
+def test_select_candidates_applies_ending_correction_to_cached_candidates(monkeypatch):
     """The exact scenario that slipped through before this fix: a Stage2
     result cached under the *old* (pre-extension) behavior -- its last
     segment ends mid-utterance, matching the real clip_c2 incident -- must
     still come out corrected on a cache hit, without any Claude API call,
-    without discarding/recomputing the cache.
+    without discarding/recomputing the cache. (C: cache candidate, stays
+    within hard bounds after extension -> accepted.)
     """
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _transcript_with_gap(
         0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
     )
@@ -292,13 +295,15 @@ def test_select_candidates_applies_ending_correction_to_cached_candidates():
         assert c.segments[-1].end_segment_id == 2  # extended past the stale mid-utterance cutoff
 
 
-def test_select_candidates_keeps_cached_candidate_even_if_extension_exceeds_hard_max(monkeypatch):
-    """Unlike _filter_local_quality (which can drop a candidate in favor
-    of a Stage1 alternative), a cached final candidate has no substitute
-    and no additional API call is made -- so it must still be returned
-    (never silently dropped, never cut off mid-utterance) even if the
-    natural ending pushes it past DURATION_HARD_MAX_SEC.
+def test_select_candidates_raises_when_all_cached_candidates_exceed_hard_max_after_extension(monkeypatch):
+    """D: a cached candidate is never kept just because there's no
+    substitute -- reaching a natural ending past DURATION_HARD_MAX_SEC
+    makes it ineligible exactly as it would during fresh selection, never
+    truncated mid-utterance to fit. All 3 cached candidates are equally
+    over-length here, so none remain eligible and select_candidates must
+    raise rather than silently return them anyway or call the API again.
     """
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 5.0)
     transcript = _transcript_with_gap(
         0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
@@ -306,10 +311,57 @@ def test_select_candidates_keeps_cached_candidate_even_if_extension_exceeds_hard
     stale_cached_candidate = _raw_candidate(0, 1, opening_hook_strength=90)
     cache.save_stage2(transcript.video_id, [stale_cached_candidate] * 3)
 
-    result = clip_selector.select_candidates(transcript, "タイトル")
+    with pytest.raises(RuntimeError, match="有効な"):
+        clip_selector.select_candidates(transcript, "タイトル")
 
-    assert len(result) == 3
-    assert all(c.segments[-1].end_segment_id == 2 for c in result)
+
+def test_select_candidates_raises_when_only_some_cached_candidates_remain_eligible(monkeypatch):
+    """F: 2 of 3 cached candidates stay within hard bounds after
+    extension, 1 doesn't -- the absolute condition is exactly 3
+    candidates, so select_candidates must not silently return the 2
+    still-valid ones; it must raise instead of shortchanging the UI.
+    """
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 5.0)
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
+    )
+    good = _raw_candidate(0, 0, opening_hook_strength=90)  # ends naturally, short -> stays valid
+    bad = _raw_candidate(0, 1, opening_hook_strength=90)  # extends past segment 2 -> exceeds hard max
+    cache.save_stage2(transcript.video_id, [good, good, bad])
+
+    with pytest.raises(RuntimeError, match="有効な"):
+        clip_selector.select_candidates(transcript, "タイトル")
+
+
+def test_select_candidates_applies_the_same_duration_rule_on_fresh_and_cached_paths(monkeypatch):
+    """Proves fresh and cache share one rule, not two: with identical
+    transcript/bounds, a fresh Stage2 selection and a cache hit both
+    extend to the same natural ending and both stay eligible under the
+    same hard-duration check (fresh via _filter_local_quality before
+    Stage2, cache via _finalize_candidates after).
+    """
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _transcript_with_gap(
+        0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
+    )
+    candidate = _raw_candidate(0, 1, opening_hook_strength=90)
+
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: [candidate] * 4)
+    monkeypatch.setattr(clip_selector, "rank_candidates", lambda id_map, t, title: list(id_map.keys()))
+    fresh_result = clip_selector.select_candidates(transcript, "タイトル")
+
+    cache_transcript = Transcript(
+        video_id=transcript.video_id + "-cache", language="ja", segments=transcript.segments
+    )
+    cache.save_stage2(cache_transcript.video_id, [candidate] * 3)
+    cached_result = clip_selector.select_candidates(cache_transcript, "タイトル")
+
+    assert len(fresh_result) == 3
+    assert len(cached_result) == 3
+    assert all(c.segments[-1].end_segment_id == 2 for c in fresh_result)
+    assert all(c.segments[-1].end_segment_id == 2 for c in cached_result)
 
 
 # --- select_candidates: no automatic retry (item H) ----------------------
@@ -354,8 +406,8 @@ def test_select_candidates_happy_path(monkeypatch):
 
 
 def test_select_candidates_caches_and_skips_recompute(monkeypatch):
-    from podcast_clipper import cache
-
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
     cache.save_stage2("vid1", [_raw_candidate(0, 0)] * 3)
 
