@@ -79,7 +79,7 @@ END_EXTENSION_CONTINUATION_MAX_GAP_SEC = 1.5
 # and treats a mismatch as a cache miss (falls back to a fresh Stage1/Stage2
 # run) rather than trying to deserialize old-shape data. The Whisper
 # transcript cache has no dependency on this and is unaffected.
-CANDIDATE_SCHEMA_VERSION = 6
+CANDIDATE_SCHEMA_VERSION = 7
 
 CHUNK_MINUTES = 10.0
 CHUNK_OVERLAP_MINUTES = 1.0

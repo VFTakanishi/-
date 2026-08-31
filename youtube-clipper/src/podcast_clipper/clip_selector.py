@@ -65,6 +65,16 @@ class Stage1SegmentOutput(BaseModel):
     role: Literal["hook", "context", "answer", "payoff"]
     start_segment_id: int
     end_segment_id: int
+    # Optional: a short substring that exists verbatim, contiguously, at a
+    # real word boundary near the start of the start_segment_id transcript
+    # segment (e.g. "86は" within "これも私の愛車である86はスープラを...").
+    # Lets a candidate start mid-segment at a natural phrase boundary
+    # instead of always using the segment's literal first word. Never
+    # AI-authored replacement text -- boundary.py verifies it against the
+    # real transcript (models.find_anchor_start_word) and falls back to no
+    # trim if it doesn't match exactly. Length-bounded since it's meant to
+    # be a short phrase/clause, not a rewritten sentence.
+    start_anchor_text: str | None = Field(default=None, min_length=1, max_length=60)
 
 
 class Stage1CandidateOutput(BaseModel):
@@ -122,13 +132,25 @@ def _format_segments(segments: list[TranscriptSegment]) -> str:
     return "\n".join(lines)
 
 
-def _deterministic_hook_text(segment_id: int, segments: list[TranscriptSegment]) -> str:
+def _deterministic_hook_text(
+    segment_id: int, start_anchor_text: str | None, segments: list[TranscriptSegment]
+) -> str:
     """hook_text is never AI-authored. It's the real transcript text of
-    whatever plays first (the candidate's first segment), truncated to a
-    safe on-screen length by character count only -- never rewritten,
+    whatever actually plays first -- the candidate's first segment, after
+    the same anchor/lead-in trim boundary.py applies when resolving the
+    real edit points (models.resolve_segment_start_word), so this display
+    text never shows a weak lead-in ("これも私の愛車である...") that the
+    rendered clip itself has already trimmed away -- truncated to a safe
+    on-screen length by character count only, never rewritten,
     embellished, or invented.
     """
-    text = next(s.text for s in segments if s.id == segment_id).strip()
+    segment = next(s for s in segments if s.id == segment_id)
+    trim_word = models.resolve_segment_start_word(segment, start_anchor_text)
+    if trim_word is not None:
+        lead_in_len = sum(len(w.text) for w in segment.words if w.start < trim_word.start)
+        text = (segment.text[lead_in_len:].lstrip() or segment.text).strip()
+    else:
+        text = segment.text.strip()
     if len(text) > config.HOOK_TEXT_MAX_CHARS:
         return text[: config.HOOK_TEXT_MAX_CHARS].rstrip() + "…"
     return text
@@ -143,13 +165,20 @@ def _raw_candidate_from_stage1_output(
     display copy, so there's nothing to carry over for those fields.
     """
     segments = [
-        RawUsedSegment(role=s.role, start_segment_id=s.start_segment_id, end_segment_id=s.end_segment_id)
+        RawUsedSegment(
+            role=s.role,
+            start_segment_id=s.start_segment_id,
+            end_segment_id=s.end_segment_id,
+            start_anchor_text=s.start_anchor_text,
+        )
         for s in c.segments
     ]
     return RawClipCandidate(
         hook_type=c.hook_type,
         segments=segments,
-        hook_text=_deterministic_hook_text(segments[0].start_segment_id, chunk_segments),
+        hook_text=_deterministic_hook_text(
+            segments[0].start_segment_id, segments[0].start_anchor_text, chunk_segments
+        ),
         opening_hook_strength=c.opening_hook_strength,
         title="",
         description="",
@@ -239,14 +268,41 @@ def _candidate_duration(raw: RawClipCandidate, transcript: Transcript) -> float:
 
 
 def _opening_text(raw: RawClipCandidate, transcript: Transcript) -> str:
-    """The candidate's actual opening text *after* boundary.py's opening
-    trim (see boundary._apply_opening_trim) -- never the raw untrimmed
+    """The candidate's actual opening text *after* boundary.py's start
+    trim (see boundary._apply_start_trim) -- never the raw untrimmed
     transcript text. Reading the raw text here would make this reject a
     candidate for a weak lead-in ("このように...") that render/UI have
-    already mechanically trimmed away, defeating the trim entirely.
+    already mechanically trimmed away, defeating the trim entirely. Since
+    segments may be reordered, `segments[0]` here is whichever segment
+    Claude placed first (the actual hook), not necessarily the
+    chronologically-first one.
     """
     resolved = boundary.resolve_candidate(raw, transcript, candidate_id="_tmp")
     return resolved.segments[0].text
+
+
+def _has_overlapping_segments(raw: RawClipCandidate, transcript: Transcript) -> bool:
+    """True if any two of this candidate's segments reference overlapping
+    (or identical) transcript segment_id ranges. Segment order is no
+    longer required to be chronological (a reordered candidate can place
+    a later, stronger utterance first), so this is the safety net against
+    the two failure modes that freedom opens up: the same real speech
+    playing twice in one clip, or extend_to_natural_ending accidentally
+    walking one segment into content another segment of the same
+    candidate already uses. Never itself decides *which* segment is
+    wrong -- callers drop the whole candidate rather than guess which
+    side of the overlap to keep.
+    """
+    ranges = [
+        (transcript.segment_index(rs.start_segment_id), transcript.segment_index(rs.end_segment_id))
+        for rs in raw.segments
+    ]
+    for i in range(len(ranges)):
+        a_start, a_end = ranges[i]
+        for b_start, b_end in ranges[i + 1 :]:
+            if a_start <= b_end and b_start <= a_end:
+                return True
+    return False
 
 
 # The only "confidently complete" text signal -- sentence-final
@@ -304,6 +360,17 @@ def extend_to_natural_ending(
     check has_confident_natural_ending afterward to detect and reject
     that case rather than treating "extension stopped" as "now complete".
 
+    Since a candidate's segments may now be reordered (not necessarily in
+    transcript-chronological order -- see extract_candidates.md), the last
+    *played* segment is not necessarily the last one chronologically:
+    extending it forward could otherwise walk straight into transcript
+    content another one of this same candidate's segments already uses
+    (e.g. an earlier-in-time segment placed *after* it for a reorder).
+    This never happens: extension stops the moment the next transcript
+    segment falls inside any other segment's [start_segment_id,
+    end_segment_id] range, exactly as if it had hit the end of the
+    transcript, rather than reusing/duplicating that content.
+
     Always returns a RawClipCandidate -- the input unchanged if it
     already looks complete or can't be safely extended further, never
     None. This never checks duration itself: every caller (both
@@ -319,6 +386,10 @@ def extend_to_natural_ending(
     """
     last = raw.segments[-1]
     end_id = last.end_segment_id
+    other_index_ranges = [
+        (transcript.segment_index(rs.start_segment_id), transcript.segment_index(rs.end_segment_id))
+        for rs in raw.segments[:-1]
+    ]
     extensions = 0
     while True:
         current = transcript.segment_by_id(end_id)
@@ -328,6 +399,8 @@ def extend_to_natural_ending(
             break
         next_index = transcript.segment_index(end_id) + 1
         if next_index >= len(transcript.segments):
+            break
+        if any(start <= next_index <= end for start, end in other_index_ranges):
             break
         next_segment = transcript.segments[next_index]
         gap = next_segment.start - current.end
@@ -344,7 +417,12 @@ def extend_to_natural_ending(
     if end_id == last.end_segment_id:
         return raw
     new_segments = list(raw.segments[:-1]) + [
-        RawUsedSegment(role=last.role, start_segment_id=last.start_segment_id, end_segment_id=end_id)
+        RawUsedSegment(
+            role=last.role,
+            start_segment_id=last.start_segment_id,
+            end_segment_id=end_id,
+            start_anchor_text=last.start_anchor_text,
+        )
     ]
     return replace(raw, segments=new_segments)
 
@@ -384,7 +462,10 @@ def _filter_local_quality(
     followed it, and the hard duration bounds are re-checked *after*
     extension -- since Stage1 produced many candidates, one whose natural
     ending pushes it past DURATION_HARD_MAX_SEC is simply dropped in favor
-    of another rather than cut off early to hit the ceiling.
+    of another rather than cut off early to hit the ceiling. Also drops
+    any candidate whose segments overlap (_has_overlapping_segments) --
+    segments may now be reordered rather than strictly chronological, so
+    this is the safety net against reused/duplicated transcript content.
     """
     kept = []
     for c in candidates:
@@ -398,6 +479,9 @@ def _filter_local_quality(
         _force_first_segment_is_hook(c)
         c = extend_to_natural_ending(c, transcript)
         if not has_confident_natural_ending(c, transcript):
+            continue
+
+        if _has_overlapping_segments(c, transcript):
             continue
 
         dur = _candidate_duration(c, transcript)
@@ -507,6 +591,8 @@ def finalize_candidates(
     for c in candidates:
         extended = extend_to_natural_ending(c, transcript)
         if not has_confident_natural_ending(extended, transcript):
+            continue
+        if _has_overlapping_segments(extended, transcript):
             continue
         dur = _candidate_duration(extended, transcript)
         if config.DURATION_HARD_MIN_SEC <= dur <= config.DURATION_HARD_MAX_SEC:

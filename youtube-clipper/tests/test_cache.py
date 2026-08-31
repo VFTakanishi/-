@@ -152,7 +152,7 @@ def test_schema_v3_is_miss_and_current_version_is_hit():
     stage1 and stage2, while a cache written under the current schema
     version must hit normally.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 6
+    assert config.CANDIDATE_SCHEMA_VERSION == 7
 
     v3_stage2_payload = {
         "schema_version": 3,
@@ -199,7 +199,7 @@ def test_schema_v4_is_miss_after_hook_scoring_prompt_bump():
     written under version 4 must still be treated as a miss under the
     current (later-bumped) schema version too.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 6
+    assert config.CANDIDATE_SCHEMA_VERSION == 7
 
     v4_stage2_payload = {
         "schema_version": 4,
@@ -242,7 +242,7 @@ def test_schema_v5_is_miss_after_stage1_recall_widening():
     missing viable candidates the wider search would have found). A cache
     written under version 5 must be treated as a miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 6
+    assert config.CANDIDATE_SCHEMA_VERSION == 7
 
     v5_stage1_payload = {
         "schema_version": 5,
@@ -275,6 +275,54 @@ def test_schema_v5_is_miss_after_stage1_recall_widening():
     assert cache.load_stage1_chunk("vidV5", 0) is not None
     cache.save_stage2("vidV5", [raw, raw, raw])
     assert cache.load_stage2("vidV5") is not None
+
+
+def test_schema_v6_is_miss_after_anchor_trim_and_reorder_support():
+    """RawUsedSegment/Stage1SegmentOutput gained an optional
+    start_anchor_text field (lets a candidate start mid-segment at a real
+    word boundary instead of only ever using the segment's literal first
+    word), and segment order within a candidate is no longer required to
+    be transcript-chronological (a stronger later utterance can be placed
+    first as the hook). Both change what a cached candidate *means*
+    without changing the outer JSON shape enough to fail plain
+    deserialization on its own, so CANDIDATE_SCHEMA_VERSION was bumped
+    6->7 to force old (pre-anchor, chronological-only) Stage1/Stage2
+    caches to be recomputed. A cache written under version 6 must be
+    treated as a miss.
+    """
+    assert config.CANDIDATE_SCHEMA_VERSION == 7
+
+    v6_stage1_payload = {
+        "schema_version": 6,
+        "chunks": [{"chunk_index": 0, "candidates": []}],
+    }
+    cache.stage1_path("vidV6").write_text(
+        json.dumps(v6_stage1_payload, ensure_ascii=False), encoding="utf-8"
+    )
+    assert cache.load_stage1_chunk("vidV6", 0) is None
+
+    v6_stage2_payload = {
+        "schema_version": 6,
+        "candidates": [
+            {
+                "hook_type": "story",
+                "segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}],
+                "hook_text": "h", "opening_hook_strength": 85,
+                "title": "t", "description": "d", "score": 85,
+                "reasoning": "r", "caveats": "",
+            }
+        ],
+    }
+    cache.stage2_path("vidV6").write_text(
+        json.dumps(v6_stage2_payload, ensure_ascii=False), encoding="utf-8"
+    )
+    assert cache.load_stage2("vidV6") is None
+
+    raw = _raw_candidate(hook_type="story")
+    cache.save_stage1_chunk("vidV6", 0, [raw])
+    assert cache.load_stage1_chunk("vidV6", 0) is not None
+    cache.save_stage2("vidV6", [raw, raw, raw])
+    assert cache.load_stage2("vidV6") is not None
 
 
 def test_transcript_cache_is_unaffected_by_candidate_schema_versioning():

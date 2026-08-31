@@ -32,6 +32,25 @@ def test_trim_concat_and_verticalize_filter_has_one_trim_pair_per_segment():
     assert "[vcat]split=2" in filt
 
 
+def test_trim_concat_and_verticalize_filter_never_reorders_by_timestamp():
+    # D: a reordered candidate (hook = chronologically-*later* segment,
+    # context = chronologically-earlier segment) must render in exactly
+    # the given list order -- render.py must never re-sort segments by
+    # their start time back into chronological order.
+    segments = [
+        UsedSegment(role="hook", start=10.0, end=13.0, text="later, but plays first"),
+        UsedSegment(role="context", start=1.0, end=3.0, text="earlier, but plays second"),
+    ]
+    filt = render._trim_concat_and_verticalize_filter(segments)
+
+    # v0/a0 (the first trim/concat slot) must correspond to the *first*
+    # list entry (start=10.0), not the chronologically-earliest one.
+    first_trim_clause = filt.split(";")[0]
+    assert "start=10.0:end=13.0" in first_trim_clause
+    assert filt.index("start=10.0:end=13.0") < filt.index("start=1.0:end=3.0")
+    assert "[v0][a0][v1][a1]concat=n=2:v=1:a=1[vcat][acat]" in filt
+
+
 def test_trim_concat_filter_supports_single_and_triple_segment_candidates():
     one = [UsedSegment(role="hook", start=0, end=1, text="a")]
     three = [

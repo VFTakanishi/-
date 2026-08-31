@@ -8,12 +8,24 @@ boundary, with a small safety margin into the surrounding silence) so the
 cut doesn't land mid-syllable. It must never widen or narrow the semantic
 range Claude selected beyond that small, fixed padding.
 
-The one further adjustment this module makes -- skipping a known weak
-lead-in phrase ("このように", "えー", ...) at the very front of a
-candidate's opening (see _apply_opening_trim) -- is the same category of
-change as the padding above: a fixed, narrow, non-semantic normalization
-against a known closed list (models.WEAK_OPENING_PREFIXES), never a
-judgement about which content or topic Claude selected.
+The one further adjustment this module makes -- moving a segment's start
+past a weak lead-in to a real, verified word boundary (see
+_apply_start_trim) -- is the same category of change as the padding
+above: a narrow, mechanical normalization, never a judgement about which
+content or topic Claude selected. Two sources feed it: a fixed closed list
+of known lead-in phrases ("このように", "えー", ...,
+models.WEAK_OPENING_PREFIXES), or -- when Claude supplied one for a given
+segment -- an AI-chosen start_anchor_text, which is only ever trusted
+after models.find_anchor_start_word verifies it's an exact, contiguous,
+word-boundary-aligned substring of that segment's real transcript text.
+Neither ever invents or rewrites words; both only ever move the start
+point later within words Claude (or Whisper) already produced. Segment
+*order* itself (which segment plays first, second, ...) is entirely
+clip_selector.py's/Claude's choice, expressed as the order of
+raw.segments -- this module resolves each segment independently and never
+reorders the list, so a candidate whose segments are not in chronological
+transcript order (a stronger later utterance placed first as the hook) is
+resolved, rendered, and QA'd in that same given order throughout.
 
 This function is deterministic (pure function of the raw candidate + the
 transcript), which qa.py relies on: it recomputes the same resolution to
@@ -69,16 +81,23 @@ def resolve_segment(raw_seg: RawUsedSegment, transcript: Transcript) -> UsedSegm
     return UsedSegment(role=raw_seg.role, start=start_time, end=end_time, text=text)
 
 
-def _apply_opening_trim(
+def _apply_start_trim(
     used: UsedSegment, raw_used: RawUsedSegment, transcript: Transcript
 ) -> UsedSegment:
-    """Mechanically skips a known weak lead-in phrase at the very start of
-    the candidate (see module docstring) -- returns `used` unchanged if
-    there's nothing to trim, no word-timestamp data, or trimming would
-    collapse the segment to empty.
+    """Mechanically moves this segment's start to whichever real word
+    models.resolve_segment_start_word decides: an AI-chosen
+    start_anchor_text (an exact, word-boundary-aligned match within the
+    start_segment_id transcript segment), or -- only when no anchor was
+    given at all -- the fixed WEAK_OPENING_PREFIXES lead-in trim (see
+    module docstring). Applied to every segment in a candidate, not just
+    the first, since a mid-candidate segment reached after a reorder/jump
+    can equally start with a weak lead-in or benefit from an anchor.
+    Returns `used` unchanged if there's nothing to trim, no word-timestamp
+    data, or trimming would collapse the segment to empty -- this never
+    guesses an approximate cut point.
     """
-    first_seg = transcript.segment_by_id(raw_used.start_segment_id)
-    trim_word = models.find_opening_trim_point(first_seg)
+    start_seg = transcript.segment_by_id(raw_used.start_segment_id)
+    trim_word = models.resolve_segment_start_word(start_seg, raw_used.start_anchor_text)
     if trim_word is None:
         return used
 
@@ -87,11 +106,11 @@ def _apply_opening_trim(
     if new_start >= used.end:
         return used
 
-    # used.text begins with first_seg.text verbatim (resolve_segment joins
+    # used.text begins with start_seg.text verbatim (resolve_segment joins
     # segments in order with no leading text before the first one), so the
-    # lead-in phrase's word-length span can be stripped directly off the
-    # front of it.
-    lead_in_len = sum(len(w.text) for w in first_seg.words if w.start < trim_word.start)
+    # lead-in span's word-length can be stripped directly off the front of
+    # it.
+    lead_in_len = sum(len(w.text) for w in start_seg.words if w.start < trim_word.start)
     trimmed_text = used.text[lead_in_len:].lstrip()
     return replace(used, start=new_start, text=trimmed_text or used.text)
 
@@ -100,8 +119,10 @@ def resolve_candidate(
     raw: RawClipCandidate, transcript: Transcript, candidate_id: str
 ) -> ClipCandidate:
     segments = [resolve_segment(rs, transcript) for rs in raw.segments]
-    if segments:
-        segments[0] = _apply_opening_trim(segments[0], raw.segments[0], transcript)
+    segments = [
+        _apply_start_trim(seg, raw_used, transcript)
+        for seg, raw_used in zip(segments, raw.segments)
+    ]
     return ClipCandidate(
         id=candidate_id,
         hook_type=raw.hook_type,

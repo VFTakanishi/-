@@ -331,7 +331,8 @@ def test_stage1_output_max_json_size_is_well_under_max_tokens():
     """Documents and guards the audit finding that motivated disabling
     thinking: the worst-case Stage1Output JSON (config.STAGE1_MAX_
     CANDIDATES_PER_CHUNK candidates, 3 segments each, long enum values,
-    3-digit segment ids) is far smaller than STAGE1_MAX_OUTPUT_TOKENS, so a
+    3-digit segment ids, a max-length start_anchor_text on every segment)
+    is far smaller than STAGE1_MAX_OUTPUT_TOKENS, so a
     stop_reason="max_tokens" truncation is not explained by the final JSON
     itself -- it pointed at something else consuming the token budget
     (adaptive thinking).
@@ -339,8 +340,12 @@ def test_stage1_output_max_json_size_is_well_under_max_tokens():
     Re-audited when STAGE1_MAX_CANDIDATES_PER_CHUNK was raised 3 -> 6 (to
     widen Stage1's search breadth after MIN_OPENING_HOOK_STRENGTH went up
     to 80): worst case grew from ~820 to ~1624 chars (~234 -> ~464
-    estimated tokens), still comfortably under half of
-    STAGE1_MAX_OUTPUT_TOKENS=2048, so the ceiling was left unchanged.
+    estimated tokens). Re-audited again when Stage1SegmentOutput gained the
+    optional start_anchor_text field (max_length=60): worst case grew to
+    ~3118 chars (~891 estimated tokens) with every segment carrying a
+    max-length anchor -- still comfortably under half of
+    STAGE1_MAX_OUTPUT_TOKENS=2048, so the ceiling was left unchanged both
+    times.
     """
     from podcast_clipper import config
     from podcast_clipper.clip_selector import Stage1CandidateOutput, Stage1SegmentOutput
@@ -348,9 +353,18 @@ def test_stage1_output_max_json_size_is_well_under_max_tokens():
     candidate = Stage1CandidateOutput(
         hook_type="surprising_fact",
         segments=[
-            Stage1SegmentOutput(role="hook", start_segment_id=123, end_segment_id=124),
-            Stage1SegmentOutput(role="context", start_segment_id=125, end_segment_id=126),
-            Stage1SegmentOutput(role="answer", start_segment_id=127, end_segment_id=128),
+            Stage1SegmentOutput(
+                role="hook", start_segment_id=123, end_segment_id=124,
+                start_anchor_text="あ" * 60,
+            ),
+            Stage1SegmentOutput(
+                role="context", start_segment_id=125, end_segment_id=126,
+                start_anchor_text="い" * 60,
+            ),
+            Stage1SegmentOutput(
+                role="answer", start_segment_id=127, end_segment_id=128,
+                start_anchor_text="う" * 60,
+            ),
         ],
         opening_hook_strength=95,
         score=92,

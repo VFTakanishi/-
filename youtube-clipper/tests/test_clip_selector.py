@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from podcast_clipper import cache, clip_selector, config
+from podcast_clipper import boundary, cache, clip_selector, config
 from podcast_clipper.clip_selector import (
     Stage1CandidateOutput,
     Stage1Output,
@@ -262,6 +262,50 @@ def test_rank_and_finalize_prompt_states_it_picks_the_final_best_three():
     assert "最終的に採用すべきベスト3" in text
 
 
+# --- prompt content: start_anchor_text trim + segment reordering ----------
+
+
+def test_extract_candidates_prompt_documents_start_anchor_text():
+    text = _extract_candidates_prompt_text()
+    assert "start_anchor_text" in text
+    assert "完全一致" in text
+
+
+def test_extract_candidates_prompt_forbids_mid_word_anchor_starts():
+    text = _extract_candidates_prompt_text()
+    assert "単語の途中" in text
+    assert "word境界に一致する必要がある" in text
+
+
+def test_extract_candidates_prompt_allows_reordering_segments():
+    """The most important change this round: segments no longer need to
+    be in transcript-chronological order."""
+    text = _extract_candidates_prompt_text()
+    assert "時系列順である必要はありません" in text or "時系列順である必要はない" in text
+
+
+def test_extract_candidates_prompt_reorder_forbids_fabrication():
+    text = _extract_candidates_prompt_text()
+    assert "発話を作文しない" in text
+    assert "因果関係を逆転させない" in text
+
+
+def test_extract_candidates_prompt_scores_hook_strength_post_trim_and_reorder():
+    """opening_hook_strength must be scored against what actually plays
+    first after anchor trim / reordering, not the raw untrimmed segment or
+    the pre-reorder chronological first segment (item 16)."""
+    text = _extract_candidates_prompt_text()
+    assert "トリム後のテキスト" in text
+    assert "並び替え後に実際に最初に来るsegment" in text
+
+
+def test_extract_candidates_prompt_includes_real_machine_examples():
+    text = _extract_candidates_prompt_text()
+    assert "これも私の愛車である86はスープラをベースに作られています" in text
+    assert "ZN6-86であったり" in text
+    assert "冷却効率を上げるために重量を増やすというのはアンチパターンになる" in text
+
+
 # --- ending completeness: clips must not end mid-utterance ----------------
 
 
@@ -477,6 +521,139 @@ def test_filter_local_quality_keeps_candidate_when_extension_stays_within_hard_m
     kept = clip_selector._filter_local_quality([raw], transcript)
     assert len(kept) == 1
     assert kept[0].segments[-1].end_segment_id == 2
+
+
+# --- overlap safety net: segments no longer required to be chronological -
+
+
+def _reorder_transcript():
+    # 3 segments, chronological order 0 -> 1 -> 2, each ending without
+    # terminal punctuation (so extension is tempted to keep walking).
+    return Transcript(
+        video_id="vidR",
+        language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=2.0, text="真冬のサーキットで走ります",
+                words=[TranscriptWord(start=0.0, end=2.0, text="真冬のサーキットで走ります")],
+            ),
+            TranscriptSegment(
+                id=1, start=2.3, end=4.0, text="車を冷やしますというのであれば",
+                words=[TranscriptWord(start=2.3, end=4.0, text="車を冷やしますというのであれば")],
+            ),
+            TranscriptSegment(
+                id=2, start=4.3, end=6.0, text="重量を増やすのはアンチパターンになる",
+                words=[TranscriptWord(start=4.3, end=6.0, text="重量を増やすのはアンチパターンになる")],
+            ),
+        ],
+    )
+
+
+def test_has_overlapping_segments_true_for_overlapping_ranges():
+    transcript = _reorder_transcript()
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=1, end_segment_id=2),
+            RawUsedSegment(role="context", start_segment_id=0, end_segment_id=1),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    assert clip_selector._has_overlapping_segments(raw, transcript) is True
+
+
+def test_has_overlapping_segments_false_for_disjoint_reordered_ranges():
+    transcript = _reorder_transcript()
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="context", start_segment_id=0, end_segment_id=1),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    assert clip_selector._has_overlapping_segments(raw, transcript) is False
+
+
+def test_extend_to_natural_ending_does_not_walk_into_another_segments_range():
+    """A reordered candidate (hook = chronologically-later segment 2,
+    context = chronologically-earlier segments 0-1) has no terminal
+    punctuation anywhere, so the last-played segment (context, ending at
+    segment 1) would normally keep extending forward -- but segment 2 is
+    already used by this same candidate's hook. Extension must stop
+    before segment 1 -> 2, exactly as if segment 1 were the end of the
+    transcript, rather than reusing content segment 2 already plays.
+    """
+    transcript = _reorder_transcript()
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="context", start_segment_id=0, end_segment_id=1),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    extended = clip_selector.extend_to_natural_ending(raw, transcript)
+    assert extended.segments[-1].end_segment_id == 1
+    assert clip_selector._has_overlapping_segments(extended, transcript) is False
+
+
+def _overlap_transcript_with_clean_endings():
+    # Every segment ends with terminal punctuation, so extend_to_natural_
+    # ending never kicks in -- isolates the overlap check itself as the
+    # reason a candidate is dropped, independent of ending-completeness.
+    return Transcript(
+        video_id="vidO",
+        language="ja",
+        segments=[
+            TranscriptSegment(
+                id=i, start=i * 2.0, end=i * 2.0 + 1.5, text=f"文{i}です。",
+                words=[TranscriptWord(start=i * 2.0, end=i * 2.0 + 1.5, text=f"文{i}です。")],
+            )
+            for i in range(3)
+        ],
+    )
+
+
+def test_filter_local_quality_drops_candidates_with_overlapping_segments(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _overlap_transcript_with_clean_endings()
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=1),
+            RawUsedSegment(role="context", start_segment_id=1, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    kept = clip_selector._filter_local_quality([raw], transcript)
+    assert kept == []
+
+
+def test_finalize_candidates_drops_overlapping_segments(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _overlap_transcript_with_clean_endings()
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=1),
+            RawUsedSegment(role="context", start_segment_id=1, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    # Padded with valid, non-overlapping candidates so the overlap itself
+    # (not NUM_CANDIDATES underflow) is what's being isolated.
+    good = [_raw_candidate(0, 0) for _ in range(config.NUM_CANDIDATES)]
+    finalized = clip_selector.finalize_candidates([raw] + good, transcript)
+    assert all(not clip_selector._has_overlapping_segments(c, transcript) for c in finalized)
+    assert len(finalized) == config.NUM_CANDIDATES
 
 
 # --- B (most important): a cache hit must go through the same correction -
@@ -804,14 +981,38 @@ def test_stage1_candidate_output_rejects_unknown_fields():
 
 def test_deterministic_hook_text_uses_real_transcript_text():
     segments = [_segment(0, start=0.0, text="これは実際の発言です")]
-    assert clip_selector._deterministic_hook_text(0, segments) == "これは実際の発言です"
+    assert clip_selector._deterministic_hook_text(0, None, segments) == "これは実際の発言です"
 
 
 def test_deterministic_hook_text_truncates_by_character_count_only(monkeypatch):
     monkeypatch.setattr(config, "HOOK_TEXT_MAX_CHARS", 5)
     segments = [_segment(0, start=0.0, text="abcdefghij")]
-    result = clip_selector._deterministic_hook_text(0, segments)
+    result = clip_selector._deterministic_hook_text(0, None, segments)
     assert result == "abcde…"
+
+
+def test_deterministic_hook_text_reflects_anchor_trim():
+    """hook_text (the UI's "冒頭の実音声") must match what boundary.py
+    actually resolves as the opening -- so a weak self-introduction lead-in
+    like "これも私の愛車である" doesn't show in the UI when start_anchor_text
+    has already trimmed it out of the rendered clip's real opening.
+    """
+    segments = [
+        TranscriptSegment(
+            id=0, start=0.0, end=3.0,
+            text="これも私の愛車である86はスープラをベースに作られています",
+            words=[
+                TranscriptWord(start=0.0, end=0.3, text="これも"),
+                TranscriptWord(start=0.3, end=0.6, text="私の"),
+                TranscriptWord(start=0.6, end=0.9, text="愛車である"),
+                TranscriptWord(start=0.9, end=1.2, text="86は"),
+                TranscriptWord(start=1.2, end=3.0, text="スープラをベースに作られています"),
+            ],
+        )
+    ]
+    result = clip_selector._deterministic_hook_text(0, "86は", segments)
+    assert result.startswith("86は")
+    assert "これも私の愛車である" not in result
 
 
 # --- extract_candidates_for_chunk / rank_candidates: real wiring ---------
@@ -840,6 +1041,46 @@ def test_extract_candidates_for_chunk_converts_structured_output(monkeypatch):
     assert result[0].description == ""
     assert result[0].reasoning == ""
     assert result[0].caveats == ""
+
+
+def test_extract_candidates_for_chunk_carries_anchor_through_to_hook_text(monkeypatch):
+    # E: the UI's "冒頭の実音声" (hook_text) must reflect the same anchor
+    # trim boundary.py applies when resolving the real edit points -- both
+    # must show "86は..." and never the raw untrimmed "これも私の愛車である...".
+    kwargs = _valid_candidate_kwargs()
+    kwargs["segments"] = [
+        {"role": "hook", "start_segment_id": 0, "end_segment_id": 0, "start_anchor_text": "86は"}
+    ]
+    output = Stage1Output(candidates=[Stage1CandidateOutput(**kwargs)])
+    monkeypatch.setattr(
+        clip_selector.structured_output, "call",
+        lambda schema_model, **kwargs: output,
+    )
+
+    chunk_segments = [
+        TranscriptSegment(
+            id=0, start=0.0, end=3.0,
+            text="これも私の愛車である86はスープラをベースに作られています",
+            words=[
+                TranscriptWord(start=0.0, end=0.3, text="これも"),
+                TranscriptWord(start=0.3, end=0.6, text="私の"),
+                TranscriptWord(start=0.6, end=0.9, text="愛車である"),
+                TranscriptWord(start=0.9, end=1.2, text="86は"),
+                TranscriptWord(start=1.2, end=3.0, text="スープラをベースに作られています"),
+            ],
+        )
+    ]
+    result = clip_selector.extract_candidates_for_chunk(chunk_segments, "タイトル")
+
+    raw = result[0]
+    assert raw.segments[0].start_anchor_text == "86は"
+    assert raw.hook_text.startswith("86は")
+    assert "これも私の愛車である" not in raw.hook_text
+
+    # UI (hook_text) and render (boundary-resolved opening) must agree.
+    transcript = Transcript(video_id="vidE", language="ja", segments=chunk_segments)
+    resolved = boundary.resolve_candidate(raw, transcript, candidate_id="c1")
+    assert resolved.segments[0].text.startswith(raw.hook_text.rstrip("…"))
 
 
 def test_rank_candidates_returns_ranked_known_ids_only(monkeypatch):

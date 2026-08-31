@@ -126,13 +126,78 @@ def find_opening_trim_point(segment: TranscriptSegment) -> TranscriptWord | None
     return None
 
 
+def find_anchor_start_word(segment: TranscriptSegment, anchor_text: str) -> TranscriptWord | None:
+    """Locates an AI-chosen start_anchor_text (e.g. "86は" within a segment
+    whose full text is "これも私の愛車である86はスープラを...") as an exact,
+    contiguous substring of the segment's word sequence, aligned to a real
+    word boundary, and returns the word it begins on -- so a candidate can
+    start mid-segment at a natural phrase/clause boundary instead of only
+    ever using the segment's own first word (see find_opening_trim_point,
+    which only ever recognizes a small fixed list of lead-in phrases).
+
+    Never fuzzy-matches and never guesses: returns None if anchor_text is
+    falsy, the segment has no word-timestamp data, the exact text doesn't
+    appear in the segment at all, or the match's start falls in the
+    middle of a word (a genuine mid-word start is never allowed, even
+    though a mid-*segment*, phrase-boundary start now is). The caller
+    (boundary.py) must treat None as "don't trim" and fall back to the
+    segment's own start -- never approximate a cut point.
+    """
+    if not segment.words or not anchor_text:
+        return None
+    concatenated = ""
+    word_start_offsets: list[int] = []
+    for word in segment.words:
+        word_start_offsets.append(len(concatenated))
+        concatenated += word.text
+    idx = concatenated.find(anchor_text)
+    if idx == -1:
+        return None
+    try:
+        return segment.words[word_start_offsets.index(idx)]
+    except ValueError:
+        # anchor_text was found, but not starting exactly on a word
+        # boundary -- that would be a mid-word start, which is forbidden.
+        return None
+
+
+def resolve_segment_start_word(
+    segment: TranscriptSegment, start_anchor_text: str | None
+) -> TranscriptWord | None:
+    """Decides which real word a segment's playback should actually start
+    from. If start_anchor_text is set, trusts it exclusively: an exact,
+    word-boundary-aligned match (find_anchor_start_word) is used, and an
+    invalid/not-found anchor falls straight back to "no trim" (None) --
+    never silently substituting the unrelated fixed-prefix heuristic below
+    for a trim Claude explicitly chose not to get. If no anchor was given
+    at all, falls back to the fixed WEAK_OPENING_PREFIXES lead-in trim
+    (find_opening_trim_point) exactly as before, so candidates that don't
+    use anchors keep their old behavior unchanged.
+    """
+    if start_anchor_text:
+        return find_anchor_start_word(segment, start_anchor_text)
+    return find_opening_trim_point(segment)
+
+
 @dataclass
 class RawUsedSegment:
-    """A semantic range Claude selected, referencing transcript segment IDs."""
+    """A semantic range Claude selected, referencing transcript segment IDs.
+
+    start_anchor_text is optional: when set, it's a short substring Claude
+    asserts exists verbatim, contiguously, at a real word boundary near
+    the start of the start_segment_id transcript segment (e.g. "86は"
+    within "これも私の愛車である86はスープラを..."), letting playback begin
+    mid-segment at a natural phrase boundary instead of always using the
+    segment's literal first word. It is never AI-authored replacement
+    text -- boundary.py verifies it against the real transcript
+    (models.find_anchor_start_word) and falls back to "no trim" (the
+    segment's own start) if it doesn't match exactly.
+    """
 
     role: SegmentRole
     start_segment_id: int
     end_segment_id: int  # inclusive
+    start_anchor_text: str | None = None
 
 
 @dataclass
