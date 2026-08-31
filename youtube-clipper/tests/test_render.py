@@ -93,6 +93,43 @@ def test_watermark_spec_is_prominent_and_always_on(monkeypatch, tmp_path):
     assert "(w-text_w)/2" == watermark.x_expr  # horizontally centered
     assert "h-text_h" in watermark.y_expr  # bottom safe area
 
+    # Pins the stronger CTA styling values, and that render.py reads them
+    # from config rather than hardcoding them (see config.WATERMARK_*).
+    assert watermark.fontsize == config.WATERMARK_FONT_SIZE == 80
+    assert watermark.box_color == config.WATERMARK_BOX_COLOR == "black@0.82"
+    assert watermark.box_borderw == config.WATERMARK_BOX_BORDERW == 26
+    assert watermark.y_expr == f"h-text_h-{config.WATERMARK_BOTTOM_MARGIN}"
+    assert config.WATERMARK_BOTTOM_MARGIN == 210
+
+
+def test_watermark_spec_follows_config_overrides(monkeypatch, tmp_path):
+    """render.py must read the watermark styling from config at call time
+    (not bake in the defaults), so operators can retune it without editing
+    render.py -- see config.py's WATERMARK_* constants.
+    """
+    monkeypatch.setattr(config, "WATERMARK_FONT_SIZE", 99)
+    monkeypatch.setattr(config, "WATERMARK_BOX_COLOR", "black@0.5")
+    monkeypatch.setattr(config, "WATERMARK_BOX_BORDERW", 5)
+    monkeypatch.setattr(config, "WATERMARK_BOTTOM_MARGIN", 1)
+
+    captured = {}
+
+    def fake_chain(input_label, output_label, specs, tmp_dir):
+        captured["specs"] = specs
+        return f"[{input_label}]null[{output_label}]", []
+
+    monkeypatch.setattr(render.text_overlay, "chain_drawtext_filters", fake_chain)
+    monkeypatch.setattr(render, "_run_ffmpeg", lambda cmd: None)
+
+    candidate = _candidate([UsedSegment(role="hook", start=0.0, end=2.0, text="a")])
+    render.apply_text_overlays(Path("intermediate.mp4"), candidate, tmp_path, tmp_path)
+
+    watermark = captured["specs"][0]
+    assert watermark.fontsize == 99
+    assert watermark.box_color == "black@0.5"
+    assert watermark.box_borderw == 5
+    assert watermark.y_expr == "h-text_h-1"
+
 
 @requires_ffmpeg
 def test_render_candidate_end_to_end_produces_valid_files(monkeypatch, tmp_path):

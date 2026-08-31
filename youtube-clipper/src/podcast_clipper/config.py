@@ -31,8 +31,14 @@ DEFAULT_SEGMENTS_PER_CANDIDATE = 2
 # Below this, a candidate's *spoken* opening (the real transcript text of
 # its first/hook segment) is treated as too weak and triggers the same
 # feedback+retry pass as an out-of-range duration (see
-# clip_selector.select_candidates).
-MIN_OPENING_HOOK_STRENGTH = 60
+# clip_selector.select_candidates). Real-machine validation showed 60 let
+# through openings that are explanatory/abstract rather than an actual
+# scroll-stopping hook (see prompts/extract_candidates.md's 70-79 band), so
+# this is raised to 80: only openings the prompt would score as "clearly
+# makes you want to keep watching" or stronger pass. If fewer than
+# NUM_CANDIDATES clear this bar, that's a real quality shortfall -- do not
+# lower this threshold to force 3 candidates.
+MIN_OPENING_HOOK_STRENGTH = 80
 
 # Ending completeness: if a candidate's last segment looks cut off
 # mid-utterance, clip_selector extends into following transcript segments
@@ -60,7 +66,7 @@ END_EXTENSION_CONTINUATION_MAX_GAP_SEC = 1.5
 # and treats a mismatch as a cache miss (falls back to a fresh Stage1/Stage2
 # run) rather than trying to deserialize old-shape data. The Whisper
 # transcript cache has no dependency on this and is unaffected.
-CANDIDATE_SCHEMA_VERSION = 4
+CANDIDATE_SCHEMA_VERSION = 5
 
 CHUNK_MINUTES = 10.0
 CHUNK_OVERLAP_MINUTES = 1.0
@@ -111,6 +117,16 @@ BACKGROUND_BLUR_SIGMA = 20
 # The only in-video text is this always-on watermark -- no hook-text
 # overlay, no end-of-clip CTA subtitle.
 WATERMARK_TEXT = os.environ.get("PODCAST_CLIPPER_WATERMARK_TEXT", "VF高西で検索！")
+
+# Watermark/CTA styling. Real-machine validation found the original values
+# (fontsize=56, box_color=black@0.55, box_borderw=18, bottom margin=140) too
+# subtle to read as a call-to-action, so these were raised for stronger
+# on-screen presence while staying clear of the Shorts UI (like/comment
+# buttons) at the bottom of the frame.
+WATERMARK_FONT_SIZE = 80
+WATERMARK_BOX_COLOR = "black@0.82"
+WATERMARK_BOX_BORDERW = 26
+WATERMARK_BOTTOM_MARGIN = 210
 
 RELATED_VIDEO_INSTRUCTIONS = (
     "YouTubeへアップロード後、YouTube Studioでこのショートの「関連動画」に"

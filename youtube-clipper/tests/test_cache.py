@@ -144,15 +144,15 @@ def test_stage2_with_stale_schema_version_is_treated_as_cache_miss():
     assert cache.load_stage2("vidB") is None
 
 
-def test_schema_v3_is_miss_and_v4_is_hit():
+def test_schema_v3_is_miss_and_current_version_is_hit():
     """The tool_use/messages.parse() -> minimal-schema Structured Outputs
     migration bumped CANDIDATE_SCHEMA_VERSION from 3 to 4 (Stage1's cache
     file shape itself changed: per-chunk dict instead of a chunk list). A
     cache written under version 3 must be treated as a miss on both
-    stage1 and stage2, while a cache written under the current version 4
-    must hit normally.
+    stage1 and stage2, while a cache written under the current schema
+    version must hit normally.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 4
+    assert config.CANDIDATE_SCHEMA_VERSION == 5
 
     v3_stage2_payload = {
         "schema_version": 3,
@@ -188,6 +188,47 @@ def test_schema_v3_is_miss_and_v4_is_hit():
 
     cache.save_stage1_chunk("vidH", 0, [raw])
     assert cache.load_stage1_chunk("vidH", 0) is not None
+
+
+def test_schema_v4_is_miss_after_hook_scoring_prompt_bump():
+    """The Stage1/Stage2 hook-scoring rubric was strengthened (stricter
+    opening_hook_strength bands, MIN_OPENING_HOOK_STRENGTH raised 60->80,
+    Stage2 independently re-evaluates the hook) without changing the
+    candidate JSON shape, so CANDIDATE_SCHEMA_VERSION was bumped 4->5 purely
+    to invalidate scores computed under the old, looser rubric. A cache
+    written under version 4 must be treated as a miss.
+    """
+    assert config.CANDIDATE_SCHEMA_VERSION == 5
+
+    v4_stage2_payload = {
+        "schema_version": 4,
+        "candidates": [
+            {
+                "hook_type": "story",
+                "segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}],
+                "hook_text": "h", "opening_hook_strength": 78,
+                "title": "t", "description": "d", "score": 80,
+                "reasoning": "r", "caveats": "",
+            }
+        ],
+    }
+    cache.stage2_path("vidV4").write_text(
+        json.dumps(v4_stage2_payload, ensure_ascii=False), encoding="utf-8"
+    )
+    assert cache.load_stage2("vidV4") is None
+
+    v4_stage1_payload = {
+        "schema_version": 4,
+        "chunks": [{"chunk_index": 0, "candidates": []}],
+    }
+    cache.stage1_path("vidV4b").write_text(
+        json.dumps(v4_stage1_payload, ensure_ascii=False), encoding="utf-8"
+    )
+    assert cache.load_stage1_chunk("vidV4b", 0) is None
+
+    raw = _raw_candidate(hook_type="story")
+    cache.save_stage2("vidV4", [raw, raw, raw])
+    assert cache.load_stage2("vidV4") is not None
 
 
 def test_transcript_cache_is_unaffected_by_candidate_schema_versioning():

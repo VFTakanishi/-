@@ -107,12 +107,12 @@ def apply_text_overlays(
         text_overlay.TextOverlaySpec(
             text=config.WATERMARK_TEXT,
             x_expr="(w-text_w)/2",
-            y_expr="h-text_h-140",
-            fontsize=56,
+            y_expr=f"h-text_h-{config.WATERMARK_BOTTOM_MARGIN}",
+            fontsize=config.WATERMARK_FONT_SIZE,
             fontcolor="white",
             box=True,
-            box_color="black@0.55",
-            box_borderw=18,
+            box_color=config.WATERMARK_BOX_COLOR,
+            box_borderw=config.WATERMARK_BOX_BORDERW,
         ),
     ]
 

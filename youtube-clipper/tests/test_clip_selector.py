@@ -112,6 +112,41 @@ def test_filter_local_quality_drops_weak_opening_hook_strength(monkeypatch):
     assert kept == []
 
 
+def test_min_opening_hook_strength_default_is_80():
+    """Real-machine validation showed the old default of 60 let through
+    explanatory/abstract openings that read as a weak Shorts hook (see
+    prompts/extract_candidates.md's 70-79 band). Raised to 80 so only
+    openings scored as "clearly makes you want to keep watching" or
+    stronger clear the local filter.
+    """
+    assert config.MIN_OPENING_HOOK_STRENGTH == 80
+
+
+def test_filter_local_quality_drops_opening_hook_strength_of_79(monkeypatch):
+    """79 sits in the prompt's 70-79 ("explanatory/abstract, weak hook")
+    band and must be rejected under the default threshold."""
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    candidates = [_raw_candidate(0, 2, opening_hook_strength=79)]
+
+    kept = clip_selector._filter_local_quality(candidates, transcript)
+    assert kept == []
+
+
+def test_filter_local_quality_passes_opening_hook_strength_of_80(monkeypatch):
+    """80 is the minimum score the prompt calls "clearly makes you want to
+    keep watching" and must clear the local filter when other conditions
+    (duration, natural opening text) are satisfied."""
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    candidates = [_raw_candidate(0, 2, opening_hook_strength=80)]
+
+    kept = clip_selector._filter_local_quality(candidates, transcript)
+    assert len(kept) == 1
+
+
 def test_filter_local_quality_drops_literal_weak_opening_text(monkeypatch):
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
@@ -142,6 +177,43 @@ def test_filter_local_quality_forces_first_segment_role_to_hook(monkeypatch):
     kept = clip_selector._filter_local_quality(candidates, transcript)
     assert len(kept) == 1
     assert kept[0].segments[0].role == "hook"
+
+
+# --- prompt content: strengthened hook-scoring rubric ---------------------
+
+
+def _extract_candidates_prompt_text():
+    return (clip_selector._PROMPTS_DIR / "extract_candidates.md").read_text(encoding="utf-8")
+
+
+def _rank_and_finalize_prompt_text():
+    return (clip_selector._PROMPTS_DIR / "rank_and_finalize.md").read_text(encoding="utf-8")
+
+
+def test_extract_candidates_prompt_has_90_80_70_scoring_bands():
+    text = _extract_candidates_prompt_text()
+    assert "90" in text and "100" in text
+    assert "80" in text and "89" in text
+    assert "70" in text and "79" in text
+
+
+def test_extract_candidates_prompt_does_not_rate_abstract_explanation_as_strong_hook():
+    """Pins that the real-machine-observed weak opening ("弱点を直すとか改善す
+    ると次の弱点というのが生まれてくるので...") is explicitly called out as an
+    example that must NOT be scored as a strong hook, so this specific
+    real-world failure can't silently regress if the prompt is edited
+    again later.
+    """
+    text = _extract_candidates_prompt_text()
+    assert "弱点を直すとか改善すると" in text
+    assert "だと思っています" in text or "と思っています" in text
+
+
+def test_rank_and_finalize_prompt_independently_evaluates_stage1_hook_score():
+    """Stage2 must not blindly trust Stage1's opening_hook_strength -- it
+    has to re-evaluate the actual first utterance itself."""
+    text = _rank_and_finalize_prompt_text()
+    assert "鵜呑みにしないでください" in text or "鵜呑み" in text
 
 
 # --- ending completeness: clips must not end mid-utterance ----------------
