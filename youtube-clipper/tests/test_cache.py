@@ -152,7 +152,7 @@ def test_schema_v3_is_miss_and_current_version_is_hit():
     stage1 and stage2, while a cache written under the current schema
     version must hit normally.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 7
+    assert config.CANDIDATE_SCHEMA_VERSION == 8
 
     v3_stage2_payload = {
         "schema_version": 3,
@@ -199,7 +199,7 @@ def test_schema_v4_is_miss_after_hook_scoring_prompt_bump():
     written under version 4 must still be treated as a miss under the
     current (later-bumped) schema version too.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 7
+    assert config.CANDIDATE_SCHEMA_VERSION == 8
 
     v4_stage2_payload = {
         "schema_version": 4,
@@ -242,7 +242,7 @@ def test_schema_v5_is_miss_after_stage1_recall_widening():
     missing viable candidates the wider search would have found). A cache
     written under version 5 must be treated as a miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 7
+    assert config.CANDIDATE_SCHEMA_VERSION == 8
 
     v5_stage1_payload = {
         "schema_version": 5,
@@ -290,7 +290,7 @@ def test_schema_v6_is_miss_after_anchor_trim_and_reorder_support():
     caches to be recomputed. A cache written under version 6 must be
     treated as a miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 7
+    assert config.CANDIDATE_SCHEMA_VERSION == 8
 
     v6_stage1_payload = {
         "schema_version": 6,
@@ -323,6 +323,55 @@ def test_schema_v6_is_miss_after_anchor_trim_and_reorder_support():
     assert cache.load_stage1_chunk("vidV6", 0) is not None
     cache.save_stage2("vidV6", [raw, raw, raw])
     assert cache.load_stage2("vidV6") is not None
+
+
+def test_schema_v7_is_miss_after_junction_safety_support():
+    """Real-machine feedback showed a candidate could pass every existing
+    check (each segment fine on its own, hook fine, final ending fine)
+    yet still cut together into an unnatural mid-clip junction (e.g.
+    "車を冷やしますっていうのであれば" hard-cut into an unrelated "連続周回
+    をする場合は"), or open on a dangling reference ("これのクラッチ交換の
+    際に..."). Junction validation (_validate_candidate_junctions,
+    _extend_internal_junctions, the limited hook/payoff exact-repeat
+    overlap allowance) closes this without changing the Stage1 output
+    shape, so CANDIDATE_SCHEMA_VERSION was bumped 7->8 purely to force
+    caches built under the old, junction-unaware rubric to be
+    recomputed. A cache written under version 7 must be treated as a
+    miss.
+    """
+    assert config.CANDIDATE_SCHEMA_VERSION == 8
+
+    v7_stage1_payload = {
+        "schema_version": 7,
+        "chunks": [{"chunk_index": 0, "candidates": []}],
+    }
+    cache.stage1_path("vidV7").write_text(
+        json.dumps(v7_stage1_payload, ensure_ascii=False), encoding="utf-8"
+    )
+    assert cache.load_stage1_chunk("vidV7", 0) is None
+
+    v7_stage2_payload = {
+        "schema_version": 7,
+        "candidates": [
+            {
+                "hook_type": "story",
+                "segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}],
+                "hook_text": "h", "opening_hook_strength": 85,
+                "title": "t", "description": "d", "score": 85,
+                "reasoning": "r", "caveats": "",
+            }
+        ],
+    }
+    cache.stage2_path("vidV7").write_text(
+        json.dumps(v7_stage2_payload, ensure_ascii=False), encoding="utf-8"
+    )
+    assert cache.load_stage2("vidV7") is None
+
+    raw = _raw_candidate(hook_type="story")
+    cache.save_stage1_chunk("vidV7", 0, [raw])
+    assert cache.load_stage1_chunk("vidV7", 0) is not None
+    cache.save_stage2("vidV7", [raw, raw, raw])
+    assert cache.load_stage2("vidV7") is not None
 
 
 def test_transcript_cache_is_unaffected_by_candidate_schema_versioning():

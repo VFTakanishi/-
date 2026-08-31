@@ -104,6 +104,19 @@ WEAK_OPENING_PREFIXES = (
     "今回は", "今日は", "ということで", "えー", "えーと", "えっと", "あの", "まあ", "さて", "このように",
 )
 
+# Deictic/anaphoric openings: unlike WEAK_OPENING_PREFIXES (filler that can
+# simply be skipped past), these words carry a referent the viewer needs
+# ("これ"/"それ" point at *something*) -- skipping past them doesn't fix a
+# candidate whose opening depends on them, since the thing they refer to
+# may not even be in the clip. Used only to *detect* (never mechanically
+# trim) a context-dependent opening; clip_selector.py rejects a candidate
+# whose resolved opening still starts with one of these after any
+# start_anchor_text trim, rather than guessing a substitute.
+CONTEXT_DEPENDENT_OPENING_PREFIXES = (
+    "これの", "これ", "それ", "この", "その", "こういう", "こういった",
+    "なので", "だから", "それで", "ということで", "その場合",
+)
+
 
 def find_opening_trim_point(segment: TranscriptSegment) -> TranscriptWord | None:
     """If segment's word sequence begins with one of WEAK_OPENING_PREFIXES

@@ -381,6 +381,74 @@ def test_utterance_completeness_qa_fails_on_confirmed_continuation_with_no_viabl
     assert check.detail
 
 
+# --- junction_safety_qa: backstop reusing clip_selector.is_candidate_junction_safe
+
+
+def test_junction_safety_qa_fails_on_unsafe_non_chronological_junction():
+    # Reproduces the real-machine bad cut: unfinished "...のであれば"
+    # hard-cut into an unrelated, distant segment. Segment id=1 (the real
+    # chronological continuation) sits *between* the two used segments so
+    # the jump from id=0 straight to id=2 is a genuine non-chronological
+    # jump, not merely the next transcript segment in sequence.
+    transcript = Transcript(
+        video_id="vidJ",
+        language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=2.0, text="車を冷やしますっていうのであれば",
+                words=[TranscriptWord(start=0.0, end=2.0, text="車を冷やしますっていうのであれば")],
+            ),
+            TranscriptSegment(
+                id=1, start=2.3, end=4.0, text="冷却効率を上げるために重量を増やすというのはアンチパターンになるかなと思います",
+                words=[TranscriptWord(start=2.3, end=4.0, text="冷却効率を上げるために重量を増やすというのはアンチパターンになるかなと思います")],
+            ),
+            TranscriptSegment(
+                id=2, start=20.0, end=22.0, text="連続周回をする場合は違う話になります",
+                words=[TranscriptWord(start=20.0, end=22.0, text="連続周回をする場合は違う話になります")],
+            ),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=2, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=80, title="t", description="d", score=1, reasoning="r", caveats="",
+    )
+    check = qa.junction_safety_qa(raw, transcript)
+    assert check.passed is False
+    assert check.critical is True
+
+
+def test_junction_safety_qa_passes_on_safe_candidate():
+    transcript = Transcript(
+        video_id="vidJ2",
+        language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=2.0, text="結論はこうです。",
+                words=[TranscriptWord(start=0.0, end=2.0, text="結論はこうです。")],
+            ),
+            TranscriptSegment(
+                id=1, start=20.0, end=22.0, text="具体的な例を挙げます。",
+                words=[TranscriptWord(start=20.0, end=22.0, text="具体的な例を挙げます。")],
+            ),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=1, end_segment_id=1),
+        ],
+        hook_text="h", opening_hook_strength=80, title="t", description="d", score=1, reasoning="r", caveats="",
+    )
+    check = qa.junction_safety_qa(raw, transcript)
+    assert check.passed is True
+    assert check.critical is True
+
+
 # --- ordering guarantee (plan fix #7): video Content QA must run on the --
 # --- intermediate (pre-text) video, never on the final (post-text) mp4  --
 
@@ -423,3 +491,5 @@ def test_run_full_qa_runs_video_content_qa_on_intermediate_only(monkeypatch):
     assert "final.mp4" not in seen_video_content_qa_paths
     # The utterance-completeness safety net must be wired into run_full_qa.
     assert "発話完結性チェック" in [c.name for c in report.checks]
+    # ...and so must the junction-safety backstop.
+    assert "カット接続の自然さチェック" in [c.name for c in report.checks]

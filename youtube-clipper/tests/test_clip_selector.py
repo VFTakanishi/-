@@ -262,6 +262,38 @@ def test_rank_and_finalize_prompt_states_it_picks_the_final_best_three():
     assert "最終的に採用すべきベスト3" in text
 
 
+# --- prompt content: junction safety (cut-point naturalness) --------------
+
+
+def test_extract_candidates_prompt_documents_junction_safety():
+    text = _extract_candidates_prompt_text()
+    assert "カット接続の自然さ" in text
+    assert "すべての隣接ペア" in text
+
+
+def test_extract_candidates_prompt_includes_bad_junction_example():
+    text = _extract_candidates_prompt_text()
+    assert "車を冷やしますっていうのであれば" in text
+    assert "連続周回をする場合は" in text
+
+
+def test_extract_candidates_prompt_requires_extending_before_non_chronological_jump():
+    text = _extract_candidates_prompt_text()
+    assert "いきなり別のsegmentへ飛ばないこと" in text
+
+
+def test_extract_candidates_prompt_documents_limited_exact_repeat():
+    text = _extract_candidates_prompt_text()
+    assert "最大2回まで" in text
+    assert "3回以上は禁止" in text
+
+
+def test_rank_and_finalize_prompt_documents_junction_safety():
+    text = _rank_and_finalize_prompt_text()
+    assert "カット接続の自然さ" in text
+    assert "連続周回をする場合は" in text
+
+
 # --- prompt content: start_anchor_text trim + segment reordering ----------
 
 
@@ -654,6 +686,321 @@ def test_finalize_candidates_drops_overlapping_segments(monkeypatch):
     finalized = clip_selector.finalize_candidates([raw] + good, transcript)
     assert all(not clip_selector._has_overlapping_segments(c, transcript) for c in finalized)
     assert len(finalized) == config.NUM_CANDIDATES
+
+
+# --- junction safety net: cut points between segments must read naturally
+# (real-machine feedback: "車を冷やしますっていうのであれば" hard-cut into an
+# unrelated "連続周回をする場合は" -- every check up to this point (per-
+# segment, hook, final ending) passed, but the A->B cut itself was broken
+# Japanese) ------------------------------------------------------------
+
+
+def _junction_transcript():
+    # Reconstructs the real-machine candidate 3 scenario: a chronological
+    # run (0: context intro, 1: unfinished "...のであれば", 2: the real
+    # conclusion that follows it) plus an unrelated, distant segment (3)
+    # that must never be spliced onto segment 1's unfinished ending.
+    return Transcript(
+        video_id="vidJ",
+        language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=2.0, text="真冬のサーキットで2、3周しかアタックをしません",
+                words=[TranscriptWord(start=0.0, end=2.0, text="真冬のサーキットで2、3周しかアタックをしません")],
+            ),
+            TranscriptSegment(
+                id=1, start=2.3, end=4.0, text="車を冷やしますっていうのであれば",
+                words=[TranscriptWord(start=2.3, end=4.0, text="車を冷やしますっていうのであれば")],
+            ),
+            TranscriptSegment(
+                id=2, start=4.3, end=6.0,
+                text="冷却効率を上げるために重量を増やすというのはアンチパターンになるかなと思います",
+                words=[
+                    TranscriptWord(start=4.3, end=4.9, text="冷却効率を"),
+                    TranscriptWord(start=4.9, end=5.3, text="上げるために"),
+                    TranscriptWord(start=5.3, end=6.0, text="重量を増やすというのはアンチパターンになるかなと思います"),
+                ],
+            ),
+            TranscriptSegment(
+                id=3, start=20.0, end=22.0, text="連続周回をする場合は違う話になります",
+                words=[TranscriptWord(start=20.0, end=22.0, text="連続周回をする場合は違う話になります")],
+            ),
+        ],
+    )
+
+
+def _junction_candidate(second_start_id, second_end_id, second_role="context"):
+    return RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=1),
+            RawUsedSegment(role=second_role, start_segment_id=second_start_id, end_segment_id=second_end_id),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+
+
+def test_validate_candidate_junctions_A_rejects_bad_non_chronological_junction():
+    # A: unfinished "...のであれば" hard-cut into an unrelated condition.
+    transcript = _junction_transcript()
+    bad = _junction_candidate(3, 3)
+    assert clip_selector._validate_candidate_junctions(bad, transcript) is False
+
+
+def test_validate_candidate_junctions_B_allows_chronological_continuation():
+    # B: same unfinished ending, but the next segment is literally the
+    # real transcript continuation (segment 2 follows segment 1).
+    transcript = _junction_transcript()
+    good = _junction_candidate(2, 2)
+    assert clip_selector._validate_candidate_junctions(good, transcript) is True
+
+
+def test_validate_candidate_junctions_C_allows_complete_then_independent_jump():
+    # C: a non-chronological jump is fine when the first segment is
+    # complete and the second reads independently.
+    transcript = _junction_transcript()
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="context", start_segment_id=0, end_segment_id=0),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    assert clip_selector._validate_candidate_junctions(raw, transcript) is True
+
+
+def test_validate_candidate_junctions_D_rejects_context_dependent_hook():
+    # D: candidate 2 regression -- "これのクラッチ交換の際に..." never
+    # establishes what "これ" refers to within this candidate.
+    transcript = Transcript(
+        video_id="vidD",
+        language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=3.0,
+                text="これのクラッチ交換の際にメタルクラッチを入れるとミッションが壊れやすくなるっていうのはよく言われてます",
+                words=[TranscriptWord(
+                    start=0.0, end=3.0,
+                    text="これのクラッチ交換の際にメタルクラッチを入れるとミッションが壊れやすくなるっていうのはよく言われてます",
+                )],
+            ),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="surprising_fact",
+        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    assert clip_selector._validate_candidate_junctions(raw, transcript) is False
+
+
+def test_validate_candidate_junctions_E_allows_anchor_trimmed_independent_opening():
+    # E: the same underlying segment, but start_anchor_text drops "これの"
+    # and starts at the car models actually named -- independent, allowed.
+    transcript = Transcript(
+        video_id="vidE",
+        language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=5.0,
+                text="よくある話が私も乗っているZN6-86であったりあとはBRZあとGR86メタルクラッチを入れるとミッションが壊れやすくなるっていうのはよく言われてます",
+                words=[
+                    TranscriptWord(start=0.0, end=0.4, text="よくある話が"),
+                    TranscriptWord(start=0.4, end=0.8, text="私も乗っている"),
+                    TranscriptWord(start=0.8, end=1.2, text="ZN6-86であったり"),
+                    TranscriptWord(
+                        start=1.2, end=5.0,
+                        text="あとはBRZあとGR86メタルクラッチを入れるとミッションが壊れやすくなるっていうのはよく言われてます",
+                    ),
+                ],
+            ),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="surprising_fact",
+        segments=[
+            RawUsedSegment(
+                role="hook", start_segment_id=0, end_segment_id=0,
+                start_anchor_text="ZN6-86であったり",
+            )
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    assert clip_selector._validate_candidate_junctions(raw, transcript) is True
+
+
+def test_validate_candidate_junctions_F_candidate1_anchor_regression():
+    # F: candidate 1 regression -- "これも私の愛車である86は..." trimmed via
+    # start_anchor_text="86は" resolves to an independent opening.
+    transcript = Transcript(
+        video_id="vidF",
+        language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=3.0,
+                text="これも私の愛車である86はスープラをベースに作られています",
+                words=[
+                    TranscriptWord(start=0.0, end=0.3, text="これも"),
+                    TranscriptWord(start=0.3, end=0.6, text="私の"),
+                    TranscriptWord(start=0.6, end=0.9, text="愛車である"),
+                    TranscriptWord(start=0.9, end=1.2, text="86は"),
+                    TranscriptWord(start=1.2, end=3.0, text="スープラをベースに作られています"),
+                ],
+            ),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0, start_anchor_text="86は")
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    assert clip_selector._validate_candidate_junctions(raw, transcript) is True
+    resolved = boundary.resolve_candidate(raw, transcript, candidate_id="c1")
+    assert resolved.segments[0].text.startswith("86は")
+
+
+def test_confirmed_continuation_catches_kedomo_ending():
+    # G: root cause of the real-machine ending bug -- the suffix list
+    # didn't previously recognize "けれないんですけども"-style casual
+    # continuations (only "けど"/"けれども", not "けども").
+    assert clip_selector._ends_with_confirmed_continuation("〜良いかもしれないんですけども") is True
+    assert clip_selector._segment_ending_is_confident("〜良いかもしれないんですけども") is False
+
+
+def test_has_confident_natural_ending_rejects_kedomo_final_segment():
+    # G: a candidate whose last segment ends in "...けども" must fail the
+    # final-ending check, same as any other unfinished ending.
+    transcript = _junction_transcript()
+    raw = _raw_candidate(3, 3)  # segment 3 is a placeholder; override text
+    transcript.segments[3].text = "〜良いかもしれないんですけども"
+    assert clip_selector.has_confident_natural_ending(raw, transcript) is False
+
+
+def test_overlap_H_allows_hook_payoff_exact_repeat_with_context_between():
+    transcript = _junction_transcript()
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="context", start_segment_id=0, end_segment_id=1),
+            RawUsedSegment(role="payoff", start_segment_id=2, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    assert clip_selector._has_overlapping_segments(raw, transcript) is False
+
+
+def test_overlap_I_rejects_partial_overlap_even_with_hook_payoff_roles():
+    transcript = _junction_transcript()
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=1, end_segment_id=2),
+            RawUsedSegment(role="context", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="payoff", start_segment_id=2, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    assert clip_selector._has_overlapping_segments(raw, transcript) is True
+
+
+def test_overlap_J_rejects_same_segment_reused_three_times():
+    transcript = _junction_transcript()
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="answer", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="payoff", start_segment_id=2, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    assert clip_selector._has_overlapping_segments(raw, transcript) is True
+
+
+def test_overlap_rejects_adjacent_hook_repeat():
+    transcript = _junction_transcript()
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="payoff", start_segment_id=2, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    assert clip_selector._has_overlapping_segments(raw, transcript) is True
+
+
+def test_overlap_rejects_repeat_with_wrong_second_role():
+    transcript = _junction_transcript()
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="context", start_segment_id=0, end_segment_id=1),
+            RawUsedSegment(role="context", start_segment_id=2, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    assert clip_selector._has_overlapping_segments(raw, transcript) is True
+
+
+def test_is_candidate_junction_safe_combines_both_checks():
+    transcript = _junction_transcript()
+    bad_junction = _junction_candidate(3, 3)
+    assert clip_selector.is_candidate_junction_safe(bad_junction, transcript) is False
+
+    good = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="context", start_segment_id=0, end_segment_id=1),
+            RawUsedSegment(role="payoff", start_segment_id=2, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    assert clip_selector.is_candidate_junction_safe(good, transcript) is True
+
+
+def test_filter_local_quality_extends_internal_junction_before_rejecting(monkeypatch):
+    # Internal (non-last) segment ending unfinished, followed by a
+    # non-chronological jump: _extend_internal_junctions must try
+    # extending it to the real transcript continuation first. Extending
+    # segment 0-1's unfinished "...のであれば" ending reaches segment 2
+    # (the real conclusion) *before* it would hit segment 3 (blocked,
+    # since the candidate's other segment already uses it) -- turning an
+    # unsafe (1 -> 3) jump into a safe, chronological (2 -> 3) one, rather
+    # than rejecting the candidate outright.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _junction_transcript()
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=1),
+            RawUsedSegment(role="payoff", start_segment_id=3, end_segment_id=3),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    kept = clip_selector._filter_local_quality([raw], transcript)
+    assert len(kept) == 1
+    assert kept[0].segments[0].end_segment_id == 2
+    assert kept[0].segments[-1].start_segment_id == 3
 
 
 # --- B (most important): a cache hit must go through the same correction -

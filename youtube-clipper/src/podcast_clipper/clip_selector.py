@@ -114,6 +114,17 @@ def _looks_like_weak_opening(text: str) -> bool:
     return any(stripped.startswith(p) for p in models.WEAK_OPENING_PREFIXES)
 
 
+# A candidate's spoken opening (or a non-chronological jump's destination
+# -- see _validate_candidate_junctions) must be understandable on its own,
+# with no prior context. Unlike _looks_like_weak_opening's filler prefixes
+# (skippable), a deictic/anaphoric opening ("これの...", "その場合...") has
+# a referent the clip may never actually establish, so this is only ever
+# used to detect and reject -- never to pick a substitute trim point.
+def _looks_context_dependent_opening(text: str) -> bool:
+    stripped = text.strip()
+    return any(stripped.startswith(p) for p in models.CONTEXT_DEPENDENT_OPENING_PREFIXES)
+
+
 def _force_first_segment_is_hook(raw: RawClipCandidate) -> None:
     """The first segment of a candidate must be tagged role=hook (this is a
     labeling/consistency requirement, not a semantic judgement -- whatever
@@ -281,27 +292,69 @@ def _opening_text(raw: RawClipCandidate, transcript: Transcript) -> str:
     return resolved.segments[0].text
 
 
+def _is_allowed_exact_repeat_pair(
+    raw: RawClipCandidate, i: int, j: int, exact_group_size: int
+) -> bool:
+    """A narrow exception to the overlap ban: the *same* source range used
+    to punch the hook, then repeated verbatim later as the clip's
+    conclusion (answer/payoff) -- e.g. stating the conclusion up front,
+    walking through the supporting example, then landing on the exact
+    same conclusion again as the payoff. Allowed only when ALL hold:
+    - this exact range is used exactly twice in the whole candidate
+      (exact_group_size == 2 -- a 3rd use, or a use alongside a merely
+      *overlapping*-but-not-identical range, is never allowed here)
+    - the first use (i) is the candidate's opening hook (index 0, role
+      "hook")
+    - the second use (j) is role "answer" or "payoff" (never a second
+      "hook" or "context")
+    - they are not adjacent (j > i + 1) -- there must be at least one
+      other segment (context) between them; immediately repeating the
+      hook right after itself is never allowed
+    Every other overlap -- partial, 3+ reuse, wrong roles, adjacent -- is
+    rejected by the caller.
+    """
+    if exact_group_size != 2:
+        return False
+    if i != 0 or raw.segments[i].role != "hook":
+        return False
+    if raw.segments[j].role not in ("answer", "payoff"):
+        return False
+    return j > i + 1
+
+
 def _has_overlapping_segments(raw: RawClipCandidate, transcript: Transcript) -> bool:
     """True if any two of this candidate's segments reference overlapping
-    (or identical) transcript segment_id ranges. Segment order is no
+    transcript segment_id ranges, UNLESS the pair is the narrow allowed
+    exact-repeat pattern (_is_allowed_exact_repeat_pair -- an identical
+    range reused verbatim as hook-then-payoff). Segment order is no
     longer required to be chronological (a reordered candidate can place
     a later, stronger utterance first), so this is the safety net against
-    the two failure modes that freedom opens up: the same real speech
-    playing twice in one clip, or extend_to_natural_ending accidentally
-    walking one segment into content another segment of the same
-    candidate already uses. Never itself decides *which* segment is
-    wrong -- callers drop the whole candidate rather than guess which
-    side of the overlap to keep.
+    the failure modes that freedom opens up: the same real speech playing
+    twice in one clip in an unintended way, or extend_to_natural_ending
+    accidentally walking one segment into content another segment of the
+    same candidate already uses. Never itself decides *which* segment is
+    wrong on a disallowed overlap -- callers drop the whole candidate
+    rather than guess which side to keep.
     """
     ranges = [
         (transcript.segment_index(rs.start_segment_id), transcript.segment_index(rs.end_segment_id))
         for rs in raw.segments
     ]
+    exact_group_sizes: dict[tuple[int, int], int] = {}
+    for r in ranges:
+        exact_group_sizes[r] = exact_group_sizes.get(r, 0) + 1
+
     for i in range(len(ranges)):
-        a_start, a_end = ranges[i]
-        for b_start, b_end in ranges[i + 1 :]:
-            if a_start <= b_end and b_start <= a_end:
-                return True
+        for j in range(i + 1, len(ranges)):
+            a_start, a_end = ranges[i]
+            b_start, b_end = ranges[j]
+            if not (a_start <= b_end and b_start <= a_end):
+                continue
+            if ranges[i] == ranges[j] and _is_allowed_exact_repeat_pair(
+                raw, i, j, exact_group_sizes[ranges[i]]
+            ):
+                continue
+            return True
     return False
 
 
@@ -324,7 +377,7 @@ def _ends_with_terminal_punctuation(text: str) -> bool:
 # check below -- never on its own as the sole judge of completeness. Do
 # not go back to deciding completeness from this list alone.
 _CONFIRMED_CONTINUATION_SUFFIXES = (
-    "ので", "から", "けど", "けれど", "けれども", "ですが", "ますが",
+    "ので", "から", "けど", "けども", "けれど", "けれども", "ですが", "ますが",
     "という", "ということで", "し", "て", "で", "たら", "れば",
 )
 
@@ -334,11 +387,14 @@ def _ends_with_confirmed_continuation(text: str) -> bool:
     return bool(stripped) and stripped.endswith(_CONFIRMED_CONTINUATION_SUFFIXES)
 
 
-def extend_to_natural_ending(
-    raw: RawClipCandidate, transcript: Transcript
-) -> RawClipCandidate:
-    """If the candidate's last segment doesn't confidently end at a
-    complete sentence, pulls in following transcript segments (up to
+def _extend_raw_segment_to_natural_ending(
+    seg: RawUsedSegment, transcript: Transcript, blocked_index_ranges: list[tuple[int, int]]
+) -> RawUsedSegment:
+    """Core extension loop, shared by extend_to_natural_ending (applied to
+    a candidate's last-*played* segment) and _extend_internal_junctions
+    (applied to an earlier segment whose next junction is a
+    non-chronological jump): if seg doesn't confidently end at a complete
+    sentence, pulls in following transcript segments (up to
     config.MAX_END_EXTENSION_SEGMENTS) as long as each is a plausible
     continuation of the same utterance: the gap to the next segment is at
     most config.END_EXTENSION_MAX_GAP_SEC. faster-whisper's VAD only
@@ -357,39 +413,27 @@ def extend_to_natural_ending(
     the sole judge on its own. Even so, this loop can still stop while
     the text is confirmed-still-continuing (gap too large even under the
     lenient threshold, or budget/next-segment exhausted); callers must
-    check has_confident_natural_ending afterward to detect and reject
-    that case rather than treating "extension stopped" as "now complete".
+    re-check completeness afterward (has_confident_natural_ending for the
+    last segment, _segment_ending_is_confident for an internal one) rather
+    than treating "extension stopped" as "now complete".
 
-    Since a candidate's segments may now be reordered (not necessarily in
-    transcript-chronological order -- see extract_candidates.md), the last
-    *played* segment is not necessarily the last one chronologically:
-    extending it forward could otherwise walk straight into transcript
-    content another one of this same candidate's segments already uses
-    (e.g. an earlier-in-time segment placed *after* it for a reorder).
-    This never happens: extension stops the moment the next transcript
-    segment falls inside any other segment's [start_segment_id,
-    end_segment_id] range, exactly as if it had hit the end of the
-    transcript, rather than reusing/duplicating that content.
+    Never walks into transcript content another segment of the same
+    candidate already uses -- segments may be reordered (not necessarily
+    transcript-chronological -- see extract_candidates.md), so blindly
+    extending forward could otherwise reuse/duplicate a range another
+    segment already covers. blocked_index_ranges (every *other* segment's
+    [start_index, end_index], supplied by the caller) stops extension the
+    moment the next transcript segment would fall inside one of them,
+    exactly as if it had hit the end of the transcript.
 
-    Always returns a RawClipCandidate -- the input unchanged if it
-    already looks complete or can't be safely extended further, never
-    None. This never checks duration itself: every caller (both
-    _filter_local_quality and finalize_candidates) re-checks duration
-    bounds afterward and drops the candidate if extension pushed it past
-    DURATION_HARD_MAX_SEC -- the rule is identical regardless of whether
-    an alternative candidate happens to be available. No Claude API call
-    is made either way, and this never re-decides *which* segments to use
-    semantically -- only whether to include a couple more of the segments
-    Claude already had available. Used identically by
-    qa.utterance_completeness_qa as a safety net, so the primary fix and
-    the QA backstop can never disagree.
+    Returns seg unchanged if it already looks complete or can't be safely
+    extended further, never None. Never checks duration itself -- callers
+    re-check duration bounds afterward. No Claude API call is made either
+    way, and this never re-decides *which* segments to use semantically --
+    only whether to include a couple more of the segments Claude already
+    had available.
     """
-    last = raw.segments[-1]
-    end_id = last.end_segment_id
-    other_index_ranges = [
-        (transcript.segment_index(rs.start_segment_id), transcript.segment_index(rs.end_segment_id))
-        for rs in raw.segments[:-1]
-    ]
+    end_id = seg.end_segment_id
     extensions = 0
     while True:
         current = transcript.segment_by_id(end_id)
@@ -400,7 +444,7 @@ def extend_to_natural_ending(
         next_index = transcript.segment_index(end_id) + 1
         if next_index >= len(transcript.segments):
             break
-        if any(start <= next_index <= end for start, end in other_index_ranges):
+        if any(start <= next_index <= end for start, end in blocked_index_ranges):
             break
         next_segment = transcript.segments[next_index]
         gap = next_segment.start - current.end
@@ -414,17 +458,103 @@ def extend_to_natural_ending(
         end_id = next_segment.id
         extensions += 1
 
-    if end_id == last.end_segment_id:
-        return raw
-    new_segments = list(raw.segments[:-1]) + [
-        RawUsedSegment(
-            role=last.role,
-            start_segment_id=last.start_segment_id,
-            end_segment_id=end_id,
-            start_anchor_text=last.start_anchor_text,
-        )
+    if end_id == seg.end_segment_id:
+        return seg
+    return replace(seg, end_segment_id=end_id)
+
+
+def extend_to_natural_ending(
+    raw: RawClipCandidate, transcript: Transcript
+) -> RawClipCandidate:
+    """Applies _extend_raw_segment_to_natural_ending to the candidate's
+    last-*played* segment (raw.segments[-1]), blocked from walking into
+    any of this candidate's *other* segments' ranges. Always returns a
+    RawClipCandidate -- the input unchanged if nothing was extended.
+    Every caller (both _filter_local_quality and finalize_candidates)
+    re-checks duration bounds afterward and drops the candidate if
+    extension pushed it past DURATION_HARD_MAX_SEC -- the rule is
+    identical regardless of whether an alternative candidate happens to
+    be available. Used identically by qa.utterance_completeness_qa as a
+    safety net, so the primary fix and the QA backstop can never disagree.
+    """
+    last = raw.segments[-1]
+    other_index_ranges = [
+        (transcript.segment_index(rs.start_segment_id), transcript.segment_index(rs.end_segment_id))
+        for rs in raw.segments[:-1]
     ]
+    extended = _extend_raw_segment_to_natural_ending(last, transcript, other_index_ranges)
+    if extended is last:
+        return raw
+    new_segments = list(raw.segments[:-1]) + [extended]
     return replace(raw, segments=new_segments)
+
+
+def _is_chronological_continuation(
+    prev_end_segment_id: int, next_start_segment_id: int, transcript: Transcript
+) -> bool:
+    """True if next_start_segment_id is literally the transcript segment
+    immediately following prev_end_segment_id -- i.e. these two chosen
+    segments were adjacent in the original recording with no jump, so
+    playing prev's end straight into next's start is just the source
+    audio's own natural continuation, never an edited-in transition
+    (see extract_candidates.md's "候補内の並び替え").
+    """
+    return transcript.segment_index(next_start_segment_id) == transcript.segment_index(prev_end_segment_id) + 1
+
+
+def _extend_internal_junctions(raw: RawClipCandidate, transcript: Transcript) -> RawClipCandidate:
+    """For every segment except the last-played one, if the *next*
+    segment in this candidate is a non-chronological jump (see
+    _is_chronological_continuation) and this segment's current ending
+    isn't confidently complete, tries extending it forward through the
+    original transcript to a natural ending first -- exactly like
+    extend_to_natural_ending does for the last segment -- rather than
+    immediately treating the candidate as an unsafe cut. A chronological-
+    continuation junction is left untouched regardless of ending shape:
+    that's just the source's own natural flow playing on, not a cut, so
+    it needs no completeness check here (see _validate_candidate_
+    junctions, which only applies that check to non-chronological jumps).
+
+    Never mutates a segment into another segment's range -- each
+    extension attempt is blocked by every *other* segment's
+    [start_index, end_index] in this same candidate, same as
+    extend_to_natural_ending. Returns raw unchanged if nothing needed
+    extending.
+    """
+    segments = list(raw.segments)
+    changed = False
+    for i in range(len(segments) - 1):
+        prev, nxt = segments[i], segments[i + 1]
+        if _is_chronological_continuation(prev.end_segment_id, nxt.start_segment_id, transcript):
+            continue
+        current_text = transcript.segment_by_id(prev.end_segment_id).text
+        if _segment_ending_is_confident(current_text):
+            continue
+        blocked = [
+            (transcript.segment_index(rs.start_segment_id), transcript.segment_index(rs.end_segment_id))
+            for j, rs in enumerate(segments)
+            if j != i
+        ]
+        extended = _extend_raw_segment_to_natural_ending(prev, transcript, blocked)
+        if extended is not prev:
+            segments[i] = extended
+            changed = True
+    if not changed:
+        return raw
+    return replace(raw, segments=segments)
+
+
+def _segment_ending_is_confident(text: str) -> bool:
+    """True unless text lacks terminal punctuation AND grammatically
+    signals it's still continuing (_ends_with_confirmed_continuation) --
+    the shared judgement behind has_confident_natural_ending (the
+    candidate's very last segment) and _validate_candidate_junctions (any
+    internal segment ending a non-chronological jump). A pause (of any
+    length) is never, by itself, evidence of completeness for such text.
+    """
+    if _ends_with_terminal_punctuation(text):
+        return True
+    return not _ends_with_confirmed_continuation(text)
 
 
 def has_confident_natural_ending(raw: RawClipCandidate, transcript: Transcript) -> bool:
@@ -441,9 +571,71 @@ def has_confident_natural_ending(raw: RawClipCandidate, transcript: Transcript) 
     stop at.
     """
     text = transcript.segment_by_id(raw.segments[-1].end_segment_id).text
-    if _ends_with_terminal_punctuation(text):
-        return True
-    return not _ends_with_confirmed_continuation(text)
+    return _segment_ending_is_confident(text)
+
+
+def _validate_candidate_junctions(raw: RawClipCandidate, transcript: Transcript) -> bool:
+    """True only if the candidate reads naturally end-to-end: the hook's
+    opening is understandable with no prior context, and every adjacent
+    A->B segment pair forms a safe cut junction. This is a real-machine-
+    observed failure mode _has_overlapping_segments/has_confident_natural_
+    ending don't catch on their own: a candidate whose *individual*
+    segments and *final* ending all look fine can still cut together into
+    nonsense mid-clip, e.g. segment A ending "車を冷やしますっていうので
+    あれば" (grammatically demanding a following clause) hard-cut into an
+    unrelated segment B starting "連続周回をする場合は" (a different
+    condition entirely) -- both segments pass every other check, but the
+    A->B cut itself is broken Japanese.
+
+    Per junction (segments[i] -> segments[i+1]):
+    - Chronological continuation (_is_chronological_continuation: B is
+      literally the next transcript segment after A) is always safe
+      regardless of A's ending shape -- it's the source recording's own
+      unedited flow, not a cut clip_selector introduced. (Note:
+      _extend_internal_junctions already tries to turn a would-be-unsafe
+      non-chronological jump into a safe chronological one first, by
+      extending A to a natural ending within the original transcript --
+      this function runs *after* that and judges the result.)
+    - A non-chronological jump (a genuine edit) requires BOTH: A's
+      ending is confidently complete (_segment_ending_is_confident --
+      never cut away from an utterance still grammatically demanding a
+      continuation into unrelated content), AND B's opening doesn't
+      depend on missing prior context (_looks_context_dependent_opening
+      on B's resolved text -- "これの..."/"その場合..." with no
+      antecedent left in the clip).
+
+    The hook (segments[0]) is additionally never allowed to open on a
+    context-dependent reference, chronological-continuation or not: it's
+    the very first thing played, so there is no "prior segment" for it to
+    depend on either way.
+    """
+    resolved = boundary.resolve_candidate(raw, transcript, candidate_id="_tmp")
+    if _looks_context_dependent_opening(resolved.segments[0].text):
+        return False
+
+    for i in range(len(raw.segments) - 1):
+        prev_raw, next_raw = raw.segments[i], raw.segments[i + 1]
+        chronological = _is_chronological_continuation(
+            prev_raw.end_segment_id, next_raw.start_segment_id, transcript
+        )
+        if chronological:
+            continue
+        prev_text = transcript.segment_by_id(prev_raw.end_segment_id).text
+        if not _segment_ending_is_confident(prev_text):
+            return False
+        if _looks_context_dependent_opening(resolved.segments[i + 1].text):
+            return False
+    return True
+
+
+def is_candidate_junction_safe(raw: RawClipCandidate, transcript: Transcript) -> bool:
+    """Public wrapper combining _validate_candidate_junctions and
+    _has_overlapping_segments for callers outside this module (qa.py's
+    junction_safety_qa) that need the identical judgment
+    _filter_local_quality/finalize_candidates already apply, without
+    reaching into this module's private helpers directly.
+    """
+    return _validate_candidate_junctions(raw, transcript) and not _has_overlapping_segments(raw, transcript)
 
 
 def _filter_local_quality(
@@ -463,9 +655,15 @@ def _filter_local_quality(
     extension -- since Stage1 produced many candidates, one whose natural
     ending pushes it past DURATION_HARD_MAX_SEC is simply dropped in favor
     of another rather than cut off early to hit the ceiling. Also drops
-    any candidate whose segments overlap (_has_overlapping_segments) --
+    any candidate whose segments overlap (_has_overlapping_segments,
+    beyond its narrow allowed hook/payoff exact-repeat exception) --
     segments may now be reordered rather than strictly chronological, so
-    this is the safety net against reused/duplicated transcript content.
+    this is the safety net against reused/duplicated transcript content --
+    and any candidate with an unsafe internal cut junction
+    (_validate_candidate_junctions), after first trying to fix an
+    unfinished internal segment by extending it within the original
+    transcript (_extend_internal_junctions), exactly like
+    extend_to_natural_ending does for the final segment.
     """
     kept = []
     for c in candidates:
@@ -477,6 +675,7 @@ def _filter_local_quality(
             continue
 
         _force_first_segment_is_hook(c)
+        c = _extend_internal_junctions(c, transcript)
         c = extend_to_natural_ending(c, transcript)
         if not has_confident_natural_ending(c, transcript):
             continue
@@ -491,6 +690,8 @@ def _filter_local_quality(
         if c.opening_hook_strength < config.MIN_OPENING_HOOK_STRENGTH:
             continue
         if _looks_like_weak_opening(_opening_text(c, transcript)):
+            continue
+        if not _validate_candidate_junctions(c, transcript):
             continue
 
         kept.append(c)
@@ -565,7 +766,10 @@ def finalize_candidates(
     is never truncated mid-utterance to fit, and a cache hit does not
     relax this just because there's no alternative candidate to
     substitute -- "no substitute available" is a reason to fail loudly,
-    not a reason to accept an out-of-range or incomplete clip.
+    not a reason to accept an out-of-range or incomplete clip. Also
+    re-applies _extend_internal_junctions/_has_overlapping_segments/
+    _validate_candidate_junctions, the identical junction-safety rules
+    _filter_local_quality uses, so a cache hit can never bypass them.
 
     select_candidates and refresh_candidates_only both call this on every
     return path -- and, critically, *before* cache.save_stage2 rather than
@@ -589,10 +793,13 @@ def finalize_candidates(
     """
     finalized = []
     for c in candidates:
-        extended = extend_to_natural_ending(c, transcript)
+        extended = _extend_internal_junctions(c, transcript)
+        extended = extend_to_natural_ending(extended, transcript)
         if not has_confident_natural_ending(extended, transcript):
             continue
         if _has_overlapping_segments(extended, transcript):
+            continue
+        if not _validate_candidate_junctions(extended, transcript):
             continue
         dur = _candidate_duration(extended, transcript)
         if config.DURATION_HARD_MIN_SEC <= dur <= config.DURATION_HARD_MAX_SEC:

@@ -374,6 +374,37 @@ def speech_start_alignment_qa(
     )
 
 
+def junction_safety_qa(
+    raw_candidate: RawClipCandidate, transcript: Transcript
+) -> QACheck:
+    """Verifies the clip's segment-to-segment cuts read naturally and its
+    hook opens independently of any missing context. Like
+    utterance_completeness_qa, this is a real judgment call (not a
+    self-consistency check) -- it exists as a safety net against a stale
+    cached Stage2 result (from before junction validation existed)
+    slipping through a cache hit, which skips clip_selector's own
+    filtering entirely.
+
+    Re-runs clip_selector.is_candidate_junction_safe -- the identical
+    judgment (per-junction chronological-continuation/completeness rules,
+    context-dependent-opening detection, the limited hook/payoff
+    exact-repeat allowance) the primary fix uses, rather than a separate
+    heuristic, so this backstop can never disagree with it about what
+    counts as a safe cut.
+    """
+    safe = clip_selector.is_candidate_junction_safe(raw_candidate, transcript)
+    return QACheck(
+        name="カット接続の自然さチェック",
+        passed=safe,
+        critical=True,
+        detail=(
+            ""
+            if safe
+            else "segment間のカット接続、または冒頭の発話が不自然/文脈依存の可能性があります"
+        ),
+    )
+
+
 def utterance_completeness_qa(
     raw_candidate: RawClipCandidate, transcript: Transcript, manifest: RenderManifest
 ) -> QACheck:
@@ -460,6 +491,7 @@ def run_full_qa(
     checks += audio_presence_qa(final_path)
     checks.append(speech_start_alignment_qa(raw_candidate, transcript, manifest))
     checks.append(utterance_completeness_qa(raw_candidate, transcript, manifest))
+    checks.append(junction_safety_qa(raw_candidate, transcript))
     checks.append(boundary_integrity_qa(raw_candidate, transcript, manifest))
 
     thumbnails = extract_thumbnails(
