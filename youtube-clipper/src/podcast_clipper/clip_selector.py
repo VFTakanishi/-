@@ -628,7 +628,19 @@ def evaluate_candidate_junctions(raw: RawClipCandidate, transcript: Transcript) 
       if not), AND B's opening doesn't depend on missing prior context
       (_looks_context_dependent_opening on B's resolved text --
       "これの..."/"その場合..." with no antecedent left in the clip:
-      reason="jump_next_context_dependent" if it does).
+      reason="jump_next_context_dependent" if it does) -- UNLESS B is an
+      exact repeat of the hook itself (same start/end/anchor as
+      segments[0]; see _is_exact_hook_repeat), in which case the
+      "A confidently complete" half is waived: the viewer is being cut
+      back to real, already-clearly-heard content (the hook), not to
+      something unrelated, so an abruptly-trailing A does not make that
+      cut unsafe the way it would for genuinely different content. B's
+      own opening is the hook's, whose independence was already checked
+      above, so no further check is needed for that half either. This is
+      the narrow counterpart to _has_overlapping_segments' existing
+      limited hook/payoff exact-repeat allowance -- both exist to support
+      the same deliberate "state the conclusion, give the example, land
+      on the exact same conclusion again" structure.
 
     The hook (segments[0]) is additionally never allowed to open on a
     context-dependent reference, chronological-continuation or not
@@ -646,6 +658,8 @@ def evaluate_candidate_junctions(raw: RawClipCandidate, transcript: Transcript) 
         )
         if chronological:
             continue
+        if i > 0 and _is_exact_hook_repeat(raw, next_raw):
+            continue
         prev_text = transcript.segment_by_id(prev_raw.end_segment_id).text
         if not _segment_ending_is_confident(prev_text):
             return JunctionEvaluation(safe=False, reason="jump_prev_incomplete", junction_index=i)
@@ -654,6 +668,22 @@ def evaluate_candidate_junctions(raw: RawClipCandidate, transcript: Transcript) 
                 safe=False, reason="jump_next_context_dependent", junction_index=i
             )
     return JunctionEvaluation(safe=True)
+
+
+def _is_exact_hook_repeat(raw: RawClipCandidate, seg: RawUsedSegment) -> bool:
+    """True if seg references the exact same source range as this
+    candidate's hook (segments[0]) -- same start/end segment_id and same
+    start_anchor_text. Used only to recognize the specific, already-
+    limited-and-allowed hook/payoff exact-repeat pattern (see
+    _has_overlapping_segments and evaluate_candidate_junctions), never as
+    a general similarity check.
+    """
+    hook = raw.segments[0]
+    return (
+        seg.start_segment_id == hook.start_segment_id
+        and seg.end_segment_id == hook.end_segment_id
+        and seg.start_anchor_text == hook.start_anchor_text
+    )
 
 
 def _validate_candidate_junctions(raw: RawClipCandidate, transcript: Transcript) -> bool:
@@ -687,6 +717,18 @@ LocalRejectReason = Literal[
     "accepted",
 ]
 
+# Deterministic, API-0 repair strategies repair_local_candidate/
+# generate_local_repair_variants can try before giving up on a rejected
+# candidate -- see their docstrings for what each one does and which
+# reject reason it targets.
+RepairMethod = Literal[
+    "opening_trim",
+    "prepend_previous_and_trim",
+    "drop_context_segment",
+    "drop_non_context_segment",
+    "hook_repeat_payoff",
+]
+
 
 @dataclass
 class LocalCandidateEvaluation:
@@ -714,6 +756,21 @@ class LocalCandidateEvaluation:
     junction_reason: JunctionRejectReason | None = None
     internal_extension_applied: bool = False
     final_extension_applied: bool = False
+    # Set only by evaluate_local_candidate_with_repair when a repair
+    # variant was the one actually accepted: repair_method names which
+    # strategy worked, original_reason preserves what the *unrepaired*
+    # candidate was rejected for, so a diagnostic report can show both
+    # ("was: context_dependent_opening, repaired via opening_trim").
+    # evaluate_local_candidate itself never sets these.
+    repair_method: RepairMethod | None = None
+    original_reason: LocalRejectReason | None = None
+    # Every repair method evaluate_local_candidate_with_repair tried for
+    # this candidate, in order, whether or not any of them succeeded --
+    # so a diagnostic report can show "repair was attempted via X but
+    # still rejected" as well as "repair via X succeeded". Empty when no
+    # repair was applicable to this candidate's reject reason, or when
+    # the candidate was accepted outright (no repair needed).
+    attempted_repair_methods: tuple[RepairMethod, ...] = ()
 
 
 def evaluate_local_candidate(
@@ -814,10 +871,215 @@ def evaluate_local_candidate(
     )
 
 
+# --- deterministic, API-0 repair (real-machine incident: 4/4 Stage1
+# candidates rejected -- rather than lowering any threshold, try a small,
+# fixed set of structural repairs built only from real transcript text/
+# word timestamps/existing segments, then re-run the *exact same*
+# evaluate_local_candidate on the result) ----------------------------------
+
+
+def _try_opening_trim_repair(
+    candidate: RawClipCandidate, transcript: Transcript
+) -> RawClipCandidate | None:
+    """Targets context_dependent_opening: if the hook's own transcript
+    segment begins with one or more known-removable phrases
+    (models.find_sequential_removable_prefix_word -- weak filler and/or a
+    self-narrative aside, chained), sets start_anchor_text to the real
+    remaining text from that point on, so boundary.py starts playback
+    there. Returns None if there's nothing to trim (no word timestamps,
+    no matching prefix, or trimming would consume the whole segment) --
+    never guesses a substitute anchor.
+    """
+    hook = candidate.segments[0]
+    hook_seg = transcript.segment_by_id(hook.start_segment_id)
+    trim_word = models.find_sequential_removable_prefix_word(hook_seg)
+    if trim_word is None:
+        return None
+    anchor_text = "".join(w.text for w in hook_seg.words if w.start >= trim_word.start)
+    if not anchor_text:
+        return None
+    new_hook = replace(hook, start_anchor_text=anchor_text)
+    return replace(candidate, segments=[new_hook] + candidate.segments[1:])
+
+
+def _try_prepend_previous_segment_repair(
+    candidate: RawClipCandidate, transcript: Transcript
+) -> RawClipCandidate | None:
+    """Targets context_dependent_opening in the case _try_opening_trim_
+    repair can't fix: the hook's own segment never names the thing it
+    refers to (e.g. "これのクラッチ交換の際に..." -- trimming "これの" alone
+    still never says which car), because the real antecedent is spoken in
+    the *previous* transcript segment (e.g. "...ZN6-86であったり..."). Pulls
+    in exactly that one immediately-preceding chronological segment as
+    part of the hook's range (never a distant search, never more than
+    one), then tries the same sequential removable-prefix trim on it (the
+    prepended segment may itself start with its own filler, e.g. "よくある
+    話が"). Returns None if there's no previous segment, or if it's
+    already used by another segment of this same candidate (would create
+    an overlap) -- never fabricates or guesses text.
+    """
+    hook = candidate.segments[0]
+    try:
+        hook_idx = transcript.segment_index(hook.start_segment_id)
+    except KeyError:
+        return None
+    if hook_idx == 0:
+        return None
+    prev_seg = transcript.segments[hook_idx - 1]
+    other_ranges = [
+        (transcript.segment_index(rs.start_segment_id), transcript.segment_index(rs.end_segment_id))
+        for rs in candidate.segments[1:]
+    ]
+    if any(start <= hook_idx - 1 <= end for start, end in other_ranges):
+        return None
+
+    new_hook = RawUsedSegment(
+        role="hook", start_segment_id=prev_seg.id, end_segment_id=hook.end_segment_id,
+    )
+    trim_word = models.find_sequential_removable_prefix_word(prev_seg)
+    if trim_word is not None:
+        anchor_text = "".join(w.text for w in prev_seg.words if w.start >= trim_word.start)
+        if anchor_text:
+            new_hook = replace(new_hook, start_anchor_text=anchor_text)
+    return replace(candidate, segments=[new_hook] + candidate.segments[1:])
+
+
+def _try_drop_optional_segment_repairs(candidate: RawClipCandidate) -> list[tuple[RepairMethod, RawClipCandidate]]:
+    """Targets duration_too_long: for a multi-segment candidate, drops one
+    non-hook segment at a time (the hook is never dropped) and lets the
+    full evaluator judge whether the shorter, still-structurally-valid
+    result is acceptable -- never cuts any segment's own content, only
+    removes whole segments Claude already chose. context-role segments
+    are tried first (drop_context_segment) since the user's own
+    preference is to keep hook+payoff over hook+context when only one can
+    fit; non-context segments (answer/payoff) are tried after
+    (drop_non_context_segment). Never touches a single-segment candidate
+    (there's nothing optional to drop).
+    """
+    if len(candidate.segments) < 2:
+        return []
+    variants: list[tuple[RepairMethod, RawClipCandidate]] = []
+    droppable = sorted(
+        range(1, len(candidate.segments)),
+        key=lambda i: 0 if candidate.segments[i].role == "context" else 1,
+    )
+    for i in droppable:
+        method: RepairMethod = (
+            "drop_context_segment" if candidate.segments[i].role == "context" else "drop_non_context_segment"
+        )
+        new_segments = [s for j, s in enumerate(candidate.segments) if j != i]
+        variants.append((method, replace(candidate, segments=new_segments)))
+    return variants
+
+
+def _try_hook_repeat_payoff_repair(
+    candidate: RawClipCandidate, transcript: Transcript
+) -> RawClipCandidate | None:
+    """Targets incomplete_final_ending: if the hook's own real ending is
+    already confidently complete (_segment_ending_is_confident on its
+    resolved end-segment text), appends an *exact* repeat of the hook
+    (identical start/end/anchor) as a new final segment with role
+    "payoff" -- landing on the same real conclusion again, e.g. state the
+    conclusion, walk through the example, restate the exact same
+    conclusion -- rather than leaving the clip hanging on a mid-utterance
+    ending. Relies entirely on the existing limited hook/payoff
+    exact-repeat exception in _has_overlapping_segments and the full
+    evaluate_local_candidate to decide whether this is actually safe
+    (duration, junction, overlap shape) -- this function only ever builds
+    the candidate; it never pre-judges acceptance. Never applied to a
+    single-segment candidate (nothing to repeat *after*), and never
+    applied when the candidate is already at the 3-segment ceiling
+    (RawClipCandidate allows at most 3 -- appending a 4th would raise).
+    """
+    if not (2 <= len(candidate.segments) < 3):
+        return None
+    hook = candidate.segments[0]
+    hook_end_text = transcript.segment_by_id(hook.end_segment_id).text
+    if not _segment_ending_is_confident(hook_end_text):
+        return None
+    payoff = replace(hook, role="payoff")
+    return replace(candidate, segments=list(candidate.segments) + [payoff])
+
+
+# Repair-only bound: caps how many variants a single rejected candidate
+# can generate, so a pathological multi-segment candidate can never
+# balloon into an unbounded local re-evaluation loop.
+_MAX_LOCAL_REPAIR_VARIANTS = 8
+
+
+def generate_local_repair_variants(
+    candidate: RawClipCandidate, transcript: Transcript, reason: LocalRejectReason
+) -> list[tuple[RepairMethod, RawClipCandidate]]:
+    """Returns a small, bounded list of (method, repaired candidate)
+    variants worth re-evaluating, scoped to the specific reason the
+    original candidate was rejected for -- a reason with no known repair
+    (e.g. hook_strength_below_80, weak_opening_prefix, overlap,
+    unsafe_junction on a non-hook junction) yields an empty list, leaving
+    the original rejection as the final answer. Every variant is built
+    only from real transcript text/word timestamps/existing segments (see
+    each _try_*_repair's docstring) -- nothing here ever authors new
+    speech, reorders words within a sentence, or guesses a timestamp.
+    """
+    variants: list[tuple[RepairMethod, RawClipCandidate]] = []
+
+    if reason == "context_dependent_opening":
+        trimmed = _try_opening_trim_repair(candidate, transcript)
+        if trimmed is not None:
+            variants.append(("opening_trim", trimmed))
+        prepended = _try_prepend_previous_segment_repair(candidate, transcript)
+        if prepended is not None:
+            variants.append(("prepend_previous_and_trim", prepended))
+
+    elif reason == "duration_too_long":
+        variants.extend(_try_drop_optional_segment_repairs(candidate))
+
+    elif reason == "incomplete_final_ending":
+        repeated = _try_hook_repeat_payoff_repair(candidate, transcript)
+        if repeated is not None:
+            variants.append(("hook_repeat_payoff", repeated))
+
+    return variants[:_MAX_LOCAL_REPAIR_VARIANTS]
+
+
+def evaluate_local_candidate_with_repair(
+    candidate: RawClipCandidate, transcript: Transcript
+) -> LocalCandidateEvaluation:
+    """Repair-before-reject: evaluates `candidate` exactly as evaluate_
+    local_candidate would; if and only if that's a rejection, generates a
+    bounded set of deterministic repair variants (generate_local_repair_
+    variants) and evaluates *each one* through that identical
+    evaluate_local_candidate -- never a separate, more lenient judgment.
+    The first variant that comes back accepted wins (tagged with
+    repair_method/original_reason so the caller can tell it was
+    repaired); if none of them are accepted, returns the *original*
+    (unrepaired) rejection unchanged. Production (_filter_local_quality)
+    and diagnostics (diagnose_local_filter) both go through this single
+    function via _evaluate_all_local_candidates, so they can never
+    disagree about what got repaired.
+    """
+    original = evaluate_local_candidate(candidate, transcript)
+    if original.accepted:
+        return original
+
+    repair_variants = generate_local_repair_variants(candidate, transcript, original.reason)
+    attempted = tuple(method for method, _ in repair_variants)
+
+    for method, variant in repair_variants:
+        repaired = evaluate_local_candidate(variant, transcript)
+        if repaired.accepted:
+            repaired.repair_method = method
+            repaired.original_reason = original.reason
+            repaired.attempted_repair_methods = attempted
+            return repaired
+
+    original.attempted_repair_methods = attempted
+    return original
+
+
 def _evaluate_all_local_candidates(
     candidates: list[RawClipCandidate], transcript: Transcript
 ) -> list[LocalCandidateEvaluation]:
-    return [evaluate_local_candidate(c, transcript) for c in candidates]
+    return [evaluate_local_candidate_with_repair(c, transcript) for c in candidates]
 
 
 def _filter_local_quality(
@@ -864,11 +1126,15 @@ def _format_diagnostic_summary(evaluations: list[LocalCandidateEvaluation]) -> s
     if not evaluations:
         return ""
     accepted = sum(1 for e in evaluations if e.accepted)
+    repaired = sum(1 for e in evaluations if e.accepted and e.repair_method is not None)
     counts: dict[str, int] = {}
     for e in evaluations:
         counts[e.reason] = counts.get(e.reason, 0) + 1
 
-    lines = ["", "【診断】", f"Stage1候補: {len(evaluations)}件", f"通過: {accepted}件", "", "不合格内訳:"]
+    lines = ["", "【診断】", f"Stage1候補: {len(evaluations)}件", f"通過: {accepted}件"]
+    if repaired:
+        lines.append(f"（うちローカル自動修復: {repaired}件）")
+    lines += ["", "不合格内訳:"]
     for reason, label in _LOCAL_REJECT_REASON_LABELS.items():
         n = counts.get(reason, 0)
         if n:
@@ -877,11 +1143,28 @@ def _format_diagnostic_summary(evaluations: list[LocalCandidateEvaluation]) -> s
     lines.append("")
     for i, e in enumerate(evaluations, start=1):
         opening = e.opening_text[:30] + ("…" if len(e.opening_text) > 30 else "")
-        detail = (
-            f"候補{i}: 冒頭「{opening}」 "
-            f"hook={e.candidate.opening_hook_strength} duration={e.duration_sec:.1f}秒 "
-            f"reject={e.reason}"
-        )
+        if e.accepted and e.repair_method is not None:
+            # Repaired and accepted: show what it originally failed for
+            # and which repair fixed it (item 11's requested format).
+            detail = (
+                f"候補{i}: 冒頭「{opening}」 original_reject={e.original_reason} "
+                f"repair={e.repair_method} → accepted"
+            )
+        elif e.attempted_repair_methods:
+            # Repair was tried but none of the variants were accepted --
+            # the original rejection stands.
+            methods = "/".join(e.attempted_repair_methods)
+            detail = (
+                f"候補{i}: 冒頭「{opening}」 "
+                f"hook={e.candidate.opening_hook_strength} duration={e.duration_sec:.1f}秒 "
+                f"reject={e.reason} repair_tried={methods} → reject"
+            )
+        else:
+            detail = (
+                f"候補{i}: 冒頭「{opening}」 "
+                f"hook={e.candidate.opening_hook_strength} duration={e.duration_sec:.1f}秒 "
+                f"reject={e.reason}"
+            )
         if e.junction_reason:
             detail += f" junction={e.junction_reason}"
         lines.append(detail)

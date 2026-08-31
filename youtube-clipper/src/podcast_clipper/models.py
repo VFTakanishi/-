@@ -139,6 +139,66 @@ def find_opening_trim_point(segment: TranscriptSegment) -> TranscriptWord | None
     return None
 
 
+# Self-narrative asides ("私も乗っている...") and generic preamble phrases
+# ("よくある話が...") -- unlike WEAK_OPENING_PREFIXES (pure filler with no
+# informational content), these carry a little more, but the point that
+# follows never depends on them, so -- unlike CONTEXT_DEPENDENT_OPENING_
+# PREFIXES -- skipping past them is safe. Repair-only (clip_selector.py's
+# repair_local_candidate): never applied by boundary.py's automatic
+# per-render trim, since deciding "this aside is safe to drop" is closer
+# to a semantic judgement than the closed, purely-mechanical
+# WEAK_OPENING_PREFIXES list.
+SELF_REFERENCE_OPENING_PREFIXES = (
+    "これも私の愛車である", "私も乗っている", "私の場合は", "私の車では", "私が思うに", "よくある話が",
+)
+
+# Combined catalog find_sequential_removable_prefix_word chains through --
+# repair-only, kept separate from WEAK_OPENING_PREFIXES (which stays the
+# list boundary.py's automatic trim uses) so widening this list can never
+# silently change what render.py/UI trim on every single candidate.
+_REPAIR_REMOVABLE_OPENING_PREFIXES = WEAK_OPENING_PREFIXES + SELF_REFERENCE_OPENING_PREFIXES
+
+# Repair-only bound: prevents find_sequential_removable_prefix_word from
+# ever looping unboundedly over a pathological word sequence.
+_MAX_SEQUENTIAL_REMOVABLE_PREFIX_TRIMS = 5
+
+
+def find_sequential_removable_prefix_word(segment: TranscriptSegment) -> TranscriptWord | None:
+    """Like find_opening_trim_point, but chains multiple known-removable
+    phrases (WEAK_OPENING_PREFIXES then SELF_REFERENCE_OPENING_PREFIXES,
+    combined) from the very front of the segment, one after another --
+    e.g. "よくある話が" then "私も乗っている" then landing on "ZN6-86で
+    あったり..." -- up to _MAX_SEQUENTIAL_REMOVABLE_PREFIX_TRIMS trims, so a
+    stack of several weak/self-referential lead-ins can be cleared in one
+    pass instead of only ever recognizing the first one.
+
+    Repair-only (see SELF_REFERENCE_OPENING_PREFIXES) -- never used by
+    boundary.py's automatic per-render trim. Returns None if there's no
+    word-timestamp data, no known prefix matches at all, or trimming would
+    consume the entire segment (nothing left to start from).
+    """
+    if not segment.words:
+        return None
+    words = segment.words
+    idx = 0
+    for _ in range(_MAX_SEQUENTIAL_REMOVABLE_PREFIX_TRIMS):
+        accumulated = ""
+        matched_at: int | None = None
+        for i in range(idx, len(words)):
+            accumulated += words[i].text
+            if accumulated in _REPAIR_REMOVABLE_OPENING_PREFIXES:
+                matched_at = i + 1
+                break
+            if not any(p.startswith(accumulated) for p in _REPAIR_REMOVABLE_OPENING_PREFIXES):
+                break
+        if matched_at is None:
+            break
+        idx = matched_at
+        if idx >= len(words):
+            return None  # trimmed the entire segment away -- nothing left
+    return words[idx] if idx > 0 else None
+
+
 def find_anchor_start_word(segment: TranscriptSegment, anchor_text: str) -> TranscriptWord | None:
     """Locates an AI-chosen start_anchor_text (e.g. "86は" within a segment
     whose full text is "これも私の愛車である86はスープラを...") as an exact,

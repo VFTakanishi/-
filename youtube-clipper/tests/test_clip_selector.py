@@ -1271,6 +1271,519 @@ def test_candidate_schema_version_still_8():
     assert config.CANDIDATE_SCHEMA_VERSION == 8
 
 
+# --- repair-before-reject: real-machine incident (4/4 Stage1 candidates
+# rejected under schema v8) -- deterministic, API-0 repair tried before a
+# candidate is finally rejected, always re-judged by the identical
+# evaluate_local_candidate no separate lenient path -------------------
+
+
+def test_repair_A_candidate1_auto_opening_trim(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="repairA", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=3.0,
+                text="これも私の愛車である86はハイグリップタイヤでサーキットを走ります。",
+                words=[
+                    TranscriptWord(start=0.0, end=0.3, text="これも"),
+                    TranscriptWord(start=0.3, end=0.6, text="私の"),
+                    TranscriptWord(start=0.6, end=0.9, text="愛車である"),
+                    TranscriptWord(start=0.9, end=1.2, text="86は"),
+                    TranscriptWord(start=1.2, end=3.0, text="ハイグリップタイヤでサーキットを走ります。"),
+                ],
+            ),
+        ],
+    )
+    # Stage1 did not set start_anchor_text this time (the real-machine
+    # failure mode) -- repair must discover the trim locally.
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
+        hook_text="h", opening_hook_strength=85, title="", description="",
+        score=85, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is True
+    assert result.repair_method == "opening_trim"
+    assert result.original_reason == "context_dependent_opening"
+    resolved = boundary.resolve_candidate(result.candidate, transcript, candidate_id="c1")
+    assert resolved.segments[0].text.startswith("86は")
+
+
+def test_repair_B_no_word_timestamps_keeps_rejection(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="repairB", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=3.0,
+                text="これも私の愛車である86はハイグリップタイヤでサーキットを走ります。",
+                words=[],  # no word timestamps at all
+            ),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
+        hook_text="h", opening_hook_strength=85, title="", description="",
+        score=85, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is False
+    assert result.reason == "context_dependent_opening"
+    assert result.repair_method is None
+
+
+def test_repair_C_sequential_prefix_trim_to_ZN6_86():
+    # C: "よくある話が" alone is not itself a mechanical reject trigger
+    # (it's in neither WEAK_OPENING_PREFIXES nor CONTEXT_DEPENDENT_
+    # OPENING_PREFIXES), so this candidate is accepted outright without
+    # needing repair -- this test instead pins _try_opening_trim_repair's
+    # sequential chaining directly: "よくある話が" then "私も乗っている"
+    # both get cleared in one pass, landing on "ZN6-86であったり...".
+    transcript = Transcript(
+        video_id="repairC", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=5.0,
+                text="よくある話が私も乗っているZN6-86であったりあとはBRZあとGR86です。",
+                words=[
+                    TranscriptWord(start=0.0, end=0.4, text="よくある話が"),
+                    TranscriptWord(start=0.4, end=0.8, text="私も乗っている"),
+                    TranscriptWord(start=0.8, end=4.5, text="ZN6-86であったりあとはBRZあとGR86"),
+                    TranscriptWord(start=4.5, end=5.0, text="です。"),
+                ],
+            ),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="surprising_fact",
+        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
+        hook_text="h", opening_hook_strength=83, title="", description="",
+        score=83, reasoning="", caveats="",
+    )
+
+    trimmed = clip_selector._try_opening_trim_repair(candidate, transcript)
+    assert trimmed is not None
+    resolved = boundary.resolve_candidate(trimmed, transcript, candidate_id="c1")
+    assert resolved.segments[0].text.startswith("ZN6-86であったり")
+    assert "よくある話が" not in resolved.segments[0].text
+    assert "私も乗っている" not in resolved.segments[0].text
+
+
+def _candidate2_transcript():
+    return Transcript(
+        video_id="repairD", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=5.0,
+                text="よくある話が私も乗っているZN6-86であったりあとはBRZあとGR86です。",
+                words=[
+                    TranscriptWord(start=0.0, end=0.4, text="よくある話が"),
+                    TranscriptWord(start=0.4, end=0.8, text="私も乗っている"),
+                    TranscriptWord(start=0.8, end=4.5, text="ZN6-86であったりあとはBRZあとGR86"),
+                    TranscriptWord(start=4.5, end=5.0, text="です。"),
+                ],
+            ),
+            TranscriptSegment(
+                id=1, start=5.3, end=8.0,
+                text="これのクラッチ交換の際にメタルクラッチを入れるとミッションが壊れやすくなるっていうのはよく言われてます。",
+                words=[TranscriptWord(
+                    start=5.3, end=8.0,
+                    text="これのクラッチ交換の際にメタルクラッチを入れるとミッションが壊れやすくなるっていうのはよく言われてます。",
+                )],
+            ),
+        ],
+    )
+
+
+def test_repair_D_candidate2_prepend_previous_segment(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _candidate2_transcript()
+    candidate = RawClipCandidate(
+        hook_type="surprising_fact",
+        segments=[RawUsedSegment(role="hook", start_segment_id=1, end_segment_id=1)],
+        hook_text="h", opening_hook_strength=83, title="", description="",
+        score=83, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is True
+    assert result.repair_method == "prepend_previous_and_trim"
+    assert result.original_reason == "context_dependent_opening"
+    resolved = boundary.resolve_candidate(result.candidate, transcript, candidate_id="c1")
+    assert resolved.segments[0].text.startswith("ZN6-86であったり")
+
+
+def test_repair_E_prepend_previous_still_context_dependent_keeps_rejection(monkeypatch):
+    # E: the previous segment doesn't actually resolve the dangling
+    # reference (still starts with a context-dependent word after trim) --
+    # repair must not paper over a genuinely unresolved opening.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="repairE", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=3.0, text="それについては後で話します。",
+                words=[TranscriptWord(start=0.0, end=3.0, text="それについては後で話します。")],
+            ),
+            TranscriptSegment(
+                id=1, start=3.3, end=6.0,
+                text="これのクラッチ交換の際にメタルクラッチを入れるとミッションが壊れやすくなるっていうのはよく言われてます。",
+                words=[TranscriptWord(
+                    start=3.3, end=6.0,
+                    text="これのクラッチ交換の際にメタルクラッチを入れるとミッションが壊れやすくなるっていうのはよく言われてます。",
+                )],
+            ),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="surprising_fact",
+        segments=[RawUsedSegment(role="hook", start_segment_id=1, end_segment_id=1)],
+        hook_text="h", opening_hook_strength=83, title="", description="",
+        score=83, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is False
+    assert result.reason == "context_dependent_opening"
+    assert result.repair_method is None
+    assert "prepend_previous_and_trim" in result.attempted_repair_methods
+
+
+def _candidate3_transcript():
+    return Transcript(
+        video_id="repairF", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=25.0,
+                text="冷却不足という弱点はなくなるんですけども今度は違う問題が出てきます。",
+                words=[TranscriptWord(start=0.0, end=25.0, text="x")],
+            ),
+            TranscriptSegment(
+                id=1, start=25.3, end=45.0,
+                text="真冬のサーキットで2、3周しかアタックをしません。それが理由です。",
+                words=[TranscriptWord(start=25.3, end=45.0, text="x")],
+            ),
+            TranscriptSegment(
+                id=2, start=45.3, end=55.8,
+                text="冷却効率を上げるために重量を増やすというのはアンチパターンになると思います。",
+                words=[TranscriptWord(start=45.3, end=55.8, text="x")],
+            ),
+        ],
+    )
+
+
+def _candidate3_raw():
+    return RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=1, end_segment_id=1),
+            RawUsedSegment(role="answer", start_segment_id=2, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=80, title="", description="",
+        score=80, reasoning="", caveats="",
+    )
+
+
+def test_repair_F_candidate3_drops_context_segment_under_50s(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
+    transcript = _candidate3_transcript()
+    candidate = _candidate3_raw()
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is True
+    assert result.repair_method == "drop_context_segment"
+    assert result.original_reason == "duration_too_long"
+    assert 20.0 <= result.duration_sec <= 50.0
+    assert [s.role for s in result.candidate.segments] == ["hook", "answer"]
+
+
+def test_repair_G_drop_segment_still_unsafe_keeps_rejection(monkeypatch):
+    # G: dropping either non-hook segment leaves the unfinished hook
+    # jumping to something non-chronological (segment id=1 is a filler,
+    # never referenced by the candidate itself, sitting between hook and
+    # both context/answer -- so neither drop variant can become
+    # "chronologically adjacent" the way test F's clean drop can). The gap
+    # from the hook to id=1 (5.0s) is deliberately larger than both
+    # END_EXTENSION_MAX_GAP_SEC and END_EXTENSION_CONTINUATION_MAX_GAP_SEC,
+    # so _extend_internal_junctions never bridges the hook into id=1 --
+    # otherwise the hook would absorb id=1 and become index-adjacent to
+    # id=2, which would make that junction chronological (and therefore
+    # safe) for the wrong reason.
+    # Dropping must not be accepted just because duration now fits.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
+    transcript = Transcript(
+        video_id="repairG", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=25.0, text="車を冷やしますっていうのであれば",
+                words=[TranscriptWord(start=0.0, end=25.0, text="x")],
+            ),
+            TranscriptSegment(
+                id=1, start=30.0, end=32.7, text="無関係な話題です。",
+                words=[TranscriptWord(start=30.0, end=32.7, text="x")],
+            ),
+            TranscriptSegment(
+                id=2, start=45.3, end=48.0, text="別の話題の説明です。",
+                words=[TranscriptWord(start=45.3, end=48.0, text="x")],
+            ),
+            TranscriptSegment(
+                id=3, start=100.3, end=125.3, text="連続周回をする場合は違う話になります",
+                words=[TranscriptWord(start=100.3, end=125.3, text="x")],
+            ),
+        ],
+    )
+    # Total duration is 25.0 + 2.7 + 25.0 = 52.7s -> duration_too_long.
+    # Dropping "context" (id=2) leaves hook(0-25)+answer(25.0) = 50.0s, which
+    # fits, but the hook ends in a confirmed continuation suffix ("...れば")
+    # so it is not "confidently complete", and jumping straight to id=3 is a
+    # non-chronological jump -- unsafe. Dropping "answer" (id=3) leaves
+    # hook(0-25)+context(2.7)=27.7s, which also fits, but is the same
+    # non-chronological jump from the same not-confidently-complete hook.
+    # Neither variant may be accepted just because duration now fits.
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="answer", start_segment_id=3, end_segment_id=3),
+        ],
+        hook_text="h", opening_hook_strength=80, title="", description="",
+        score=80, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is False
+    assert "drop_context_segment" in result.attempted_repair_methods
+    assert "drop_non_context_segment" in result.attempted_repair_methods
+
+
+def test_repair_H_never_hard_cuts_mid_sentence_at_50s(monkeypatch):
+    # H: drop-segment repair only ever removes *whole* segments -- it must
+    # never truncate a segment's own start/end to force it under 50s.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
+    transcript = _candidate3_transcript()
+    candidate = _candidate3_raw()
+
+    variants = clip_selector.generate_local_repair_variants(candidate, transcript, "duration_too_long")
+    for _, variant in variants:
+        for orig_seg, new_seg in zip(candidate.segments, variant.segments):
+            if new_seg.start_segment_id == orig_seg.start_segment_id:
+                # A kept segment's own range must be byte-identical to
+                # what Stage1 chose -- never partially trimmed.
+                assert new_seg.end_segment_id == orig_seg.end_segment_id
+        # Every segment in the variant must be one of the original
+        # segments verbatim -- never a new, narrower range.
+        original_ranges = {(s.start_segment_id, s.end_segment_id) for s in candidate.segments}
+        for s in variant.segments:
+            assert (s.start_segment_id, s.end_segment_id) in original_ranges
+
+
+def _candidate4_transcript():
+    return Transcript(
+        video_id="repairI", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=5.0,
+                text="冷却効率を上げるために重量を増やすというのはアンチパターンになると思います。",
+                words=[TranscriptWord(start=0.0, end=5.0, text="x")],
+            ),
+            TranscriptSegment(
+                id=1, start=5.3, end=25.0,
+                text="真冬のサーキットで2、3周しかアタックをしませんという話なんですけども",
+                words=[TranscriptWord(start=5.3, end=25.0, text="x")],
+            ),
+        ],
+    )
+
+
+def _candidate4_raw():
+    return RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=1, end_segment_id=1),
+        ],
+        hook_text="h", opening_hook_strength=83, title="", description="",
+        score=83, reasoning="", caveats="",
+    )
+
+
+def test_repair_I_candidate4_hook_repeat_payoff(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
+    transcript = _candidate4_transcript()
+    candidate = _candidate4_raw()
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is True
+    assert result.repair_method == "hook_repeat_payoff"
+    assert result.original_reason == "incomplete_final_ending"
+    assert [s.role for s in result.candidate.segments] == ["hook", "context", "payoff"]
+    assert result.candidate.segments[-1].start_segment_id == result.candidate.segments[0].start_segment_id
+
+
+def test_repair_J_hook_repeat_payoff_over_50s_keeps_rejection(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 30.0)  # tight ceiling
+    transcript = _candidate4_transcript()
+    candidate = _candidate4_raw()
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is False
+    assert "hook_repeat_payoff" in result.attempted_repair_methods
+
+
+def test_repair_K_hook_repeat_payoff_respects_exact_repeat_limit(monkeypatch):
+    # K: the underlying overlap rule (max 2 uses of the same source range,
+    # hook then answer/payoff) must still hold for a repair-generated
+    # repeat -- a candidate that already contains a hook/payoff exact
+    # repeat must not get a *third* use appended.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _candidate4_transcript()
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=1, end_segment_id=1),
+            RawUsedSegment(role="payoff", start_segment_id=0, end_segment_id=0),
+        ],
+        hook_text="h", opening_hook_strength=83, title="", description="",
+        score=83, reasoning="", caveats="",
+    )
+    # context's own ending is still unfinished ("...けども") -- would
+    # normally prompt another hook_repeat_payoff attempt.
+    variants = clip_selector.generate_local_repair_variants(candidate, transcript, "incomplete_final_ending")
+    for _, variant in variants:
+        ev = clip_selector.evaluate_local_candidate(variant, transcript)
+        assert not (ev.accepted and clip_selector._has_overlapping_segments(ev.candidate, transcript) is False and
+                    sum(1 for s in ev.candidate.segments if s.start_segment_id == 0) > 2), (
+            "must never allow the hook's source range to be used 3+ times"
+        )
+
+
+def test_repair_L_always_routes_through_evaluate_local_candidate(monkeypatch):
+    # L: every repair variant must be judged by the exact same evaluator
+    # production uses -- verified by cross-checking generate_local_repair_
+    # variants' outputs against a direct evaluate_local_candidate call.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="repairL", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=3.0,
+                text="これも私の愛車である86はスープラをベースに作られています。",
+                words=[
+                    TranscriptWord(start=0.0, end=0.3, text="これも"),
+                    TranscriptWord(start=0.3, end=0.6, text="私の"),
+                    TranscriptWord(start=0.6, end=0.9, text="愛車である"),
+                    TranscriptWord(start=0.9, end=1.2, text="86は"),
+                    TranscriptWord(start=1.2, end=3.0, text="スープラをベースに作られています。"),
+                ],
+            ),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
+        hook_text="h", opening_hook_strength=85, title="", description="",
+        score=85, reasoning="", caveats="",
+    )
+    with_repair = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    _, only_variant = clip_selector.generate_local_repair_variants(candidate, transcript, "context_dependent_opening")[0]
+    direct = clip_selector.evaluate_local_candidate(only_variant, transcript)
+    assert with_repair.accepted == direct.accepted
+    assert with_repair.candidate.segments == direct.candidate.segments
+
+
+def test_repair_M_variant_count_is_bounded():
+    assert clip_selector._MAX_LOCAL_REPAIR_VARIANTS <= 8
+
+
+def test_repair_N_diagnostic_summary_shows_repair_method(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="repairN", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=3.0,
+                text="これも私の愛車である86はスープラをベースに作られています。",
+                words=[
+                    TranscriptWord(start=0.0, end=0.3, text="これも"),
+                    TranscriptWord(start=0.3, end=0.6, text="私の"),
+                    TranscriptWord(start=0.6, end=0.9, text="愛車である"),
+                    TranscriptWord(start=0.9, end=1.2, text="86は"),
+                    TranscriptWord(start=1.2, end=3.0, text="スープラをベースに作られています。"),
+                ],
+            ),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
+        hook_text="h", opening_hook_strength=85, title="", description="",
+        score=85, reasoning="", caveats="",
+    )
+    evaluations = clip_selector._evaluate_all_local_candidates([candidate], transcript)
+    summary = clip_selector._format_diagnostic_summary(evaluations)
+    assert "opening_trim" in summary
+    assert "original_reject=context_dependent_opening" in summary
+    assert "→ accepted" in summary
+
+
+def test_repair_Q_zero_api_calls_via_repair(monkeypatch):
+    # Q: repair generation/evaluation is pure local computation -- relies
+    # on this module's autouse _forbid_real_anthropic_client fixture, plus
+    # an explicit guard that structured_output.call is never reached.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+
+    def _forbidden(*a, **k):
+        raise AssertionError("repair must never call the Anthropic API")
+
+    monkeypatch.setattr(clip_selector.structured_output, "call", _forbidden)
+
+    transcript = Transcript(
+        video_id="repairQ", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=3.0,
+                text="これも私の愛車である86はスープラをベースに作られています。",
+                words=[
+                    TranscriptWord(start=0.0, end=0.3, text="これも"),
+                    TranscriptWord(start=0.3, end=0.6, text="私の"),
+                    TranscriptWord(start=0.6, end=0.9, text="愛車である"),
+                    TranscriptWord(start=0.9, end=1.2, text="86は"),
+                    TranscriptWord(start=1.2, end=3.0, text="スープラをベースに作られています。"),
+                ],
+            ),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
+        hook_text="h", opening_hook_strength=85, title="", description="",
+        score=85, reasoning="", caveats="",
+    )
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is True
+
+
 # --- B (most important): a cache hit must go through the same correction -
 
 
