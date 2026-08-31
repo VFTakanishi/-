@@ -40,7 +40,7 @@ calls to produce.
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -574,10 +574,35 @@ def has_confident_natural_ending(raw: RawClipCandidate, transcript: Transcript) 
     return _segment_ending_is_confident(text)
 
 
-def _validate_candidate_junctions(raw: RawClipCandidate, transcript: Transcript) -> bool:
-    """True only if the candidate reads naturally end-to-end: the hook's
-    opening is understandable with no prior context, and every adjacent
-    A->B segment pair forms a safe cut junction. This is a real-machine-
+JunctionRejectReason = Literal[
+    "hook_context_dependent",
+    "jump_prev_incomplete",
+    "jump_next_context_dependent",
+]
+
+
+@dataclass
+class JunctionEvaluation:
+    """Diagnostic-friendly result of evaluate_candidate_junctions: `safe`
+    is the production-relevant verdict (see _validate_candidate_junctions,
+    is_candidate_junction_safe); `reason`/`junction_index` exist purely so
+    a diagnostic report (evaluate_local_candidate, diagnose_local_filter)
+    can say *which* rule failed and *where*, without clip_selector.py and
+    its own diagnostics ever implementing the judgment twice.
+    """
+
+    safe: bool
+    reason: JunctionRejectReason | None = None
+    # Index i of the failing segments[i] -> segments[i+1] junction; None
+    # for a hook_context_dependent failure (that's about segments[0]
+    # itself, not a junction between two segments).
+    junction_index: int | None = None
+
+
+def evaluate_candidate_junctions(raw: RawClipCandidate, transcript: Transcript) -> JunctionEvaluation:
+    """The candidate reads naturally end-to-end only if the hook's opening
+    is understandable with no prior context, and every adjacent A->B
+    segment pair forms a safe cut junction. This is a real-machine-
     observed failure mode _has_overlapping_segments/has_confident_natural_
     ending don't catch on their own: a candidate whose *individual*
     segments and *final* ending all look fine can still cut together into
@@ -599,19 +624,20 @@ def _validate_candidate_junctions(raw: RawClipCandidate, transcript: Transcript)
     - A non-chronological jump (a genuine edit) requires BOTH: A's
       ending is confidently complete (_segment_ending_is_confident --
       never cut away from an utterance still grammatically demanding a
-      continuation into unrelated content), AND B's opening doesn't
-      depend on missing prior context (_looks_context_dependent_opening
-      on B's resolved text -- "これの..."/"その場合..." with no
-      antecedent left in the clip).
+      continuation into unrelated content: reason="jump_prev_incomplete"
+      if not), AND B's opening doesn't depend on missing prior context
+      (_looks_context_dependent_opening on B's resolved text --
+      "これの..."/"その場合..." with no antecedent left in the clip:
+      reason="jump_next_context_dependent" if it does).
 
     The hook (segments[0]) is additionally never allowed to open on a
-    context-dependent reference, chronological-continuation or not: it's
-    the very first thing played, so there is no "prior segment" for it to
-    depend on either way.
+    context-dependent reference, chronological-continuation or not
+    (reason="hook_context_dependent"): it's the very first thing played,
+    so there is no "prior segment" for it to depend on either way.
     """
     resolved = boundary.resolve_candidate(raw, transcript, candidate_id="_tmp")
     if _looks_context_dependent_opening(resolved.segments[0].text):
-        return False
+        return JunctionEvaluation(safe=False, reason="hook_context_dependent")
 
     for i in range(len(raw.segments) - 1):
         prev_raw, next_raw = raw.segments[i], raw.segments[i + 1]
@@ -622,10 +648,20 @@ def _validate_candidate_junctions(raw: RawClipCandidate, transcript: Transcript)
             continue
         prev_text = transcript.segment_by_id(prev_raw.end_segment_id).text
         if not _segment_ending_is_confident(prev_text):
-            return False
+            return JunctionEvaluation(safe=False, reason="jump_prev_incomplete", junction_index=i)
         if _looks_context_dependent_opening(resolved.segments[i + 1].text):
-            return False
-    return True
+            return JunctionEvaluation(
+                safe=False, reason="jump_next_context_dependent", junction_index=i
+            )
+    return JunctionEvaluation(safe=True)
+
+
+def _validate_candidate_junctions(raw: RawClipCandidate, transcript: Transcript) -> bool:
+    """Thin boolean wrapper around evaluate_candidate_junctions for
+    production call sites (_filter_local_quality, finalize_candidates)
+    that only ever needed the pass/fail verdict.
+    """
+    return evaluate_candidate_junctions(raw, transcript).safe
 
 
 def is_candidate_junction_safe(raw: RawClipCandidate, transcript: Transcript) -> bool:
@@ -638,64 +674,244 @@ def is_candidate_junction_safe(raw: RawClipCandidate, transcript: Transcript) ->
     return _validate_candidate_junctions(raw, transcript) and not _has_overlapping_segments(raw, transcript)
 
 
+LocalRejectReason = Literal[
+    "invalid_segment_reference",
+    "incomplete_final_ending",
+    "overlap",
+    "duration_too_short",
+    "duration_too_long",
+    "hook_strength_below_80",
+    "weak_opening_prefix",
+    "context_dependent_opening",
+    "unsafe_junction",
+    "accepted",
+]
+
+
+@dataclass
+class LocalCandidateEvaluation:
+    """Diagnostic-friendly result of evaluate_local_candidate. `accepted`/
+    `reason` is the exact verdict _filter_local_quality's production
+    accept/reject decision is derived from -- evaluate_local_candidate is
+    the single implementation both share, so a diagnostic report (see
+    diagnose_local_filter) can never disagree with what actually ran.
+    `candidate` is the (possibly internally- and finally-extended)
+    RawClipCandidate as evaluated up to the point of accept/reject; for an
+    "accepted" evaluation this is exactly what _filter_local_quality would
+    keep. `opening_text`/`duration_sec` are best-effort and stay at their
+    defaults ("" / 0.0) only for reason == "invalid_segment_reference",
+    where the candidate's segment_ids can't even be resolved.
+    `junction_reason` is only set when reason is "context_dependent_
+    opening" or "unsafe_junction" (see evaluate_candidate_junctions). The
+    two extension flags are pure debug context, not used for the verdict.
+    """
+
+    accepted: bool
+    reason: LocalRejectReason
+    candidate: RawClipCandidate
+    opening_text: str = ""
+    duration_sec: float = 0.0
+    junction_reason: JunctionRejectReason | None = None
+    internal_extension_applied: bool = False
+    final_extension_applied: bool = False
+
+
+def evaluate_local_candidate(
+    candidate: RawClipCandidate, transcript: Transcript
+) -> LocalCandidateEvaluation:
+    """The single implementation of the local (pre-Stage2) quality gate.
+    _filter_local_quality (production accept/reject) and
+    diagnose_local_filter (diagnostic report, zero API calls) both call
+    this exactly once per candidate rather than re-implementing the
+    checks, so production behavior and diagnostics can never disagree.
+
+    Checks run in this exact order (first failure wins), mirroring what
+    used to be _filter_local_quality's inline logic:
+    1. referential integrity -- every segment_id must exist in transcript
+       (a Stage1 chunk only ever sees its own segment_ids, but this stays
+       defensive) -> "invalid_segment_reference"
+    2. _force_first_segment_is_hook (label fix, never a rejection)
+    3. _extend_internal_junctions, then extend_to_natural_ending -- tries
+       to turn an unfinished ending (internal or final) into a complete
+       one via the original transcript before judging anything below
+    4. has_confident_natural_ending on the (possibly extended) last
+       segment -> "incomplete_final_ending"
+    5. _has_overlapping_segments (beyond the allowed hook/payoff
+       exact-repeat exception) -> "overlap"
+    6. hard duration bounds, re-checked *after* extension ->
+       "duration_too_short" / "duration_too_long"
+    7. opening_hook_strength vs config.MIN_OPENING_HOOK_STRENGTH ->
+       "hook_strength_below_80" (named for the current default; see
+       config.py for the live threshold)
+    8. _looks_like_weak_opening on the resolved opening
+       (models.WEAK_OPENING_PREFIXES) -> "weak_opening_prefix"
+    9. evaluate_candidate_junctions -- the hook itself opening on a
+       dangling reference maps to "context_dependent_opening"
+       (junction_reason="hook_context_dependent"); an unsafe A->B cut
+       elsewhere maps to "unsafe_junction" (junction_reason=
+       "jump_prev_incomplete" or "jump_next_context_dependent")
+    Anything surviving all of the above is "accepted".
+    """
+    try:
+        for s in candidate.segments:
+            transcript.segment_by_id(s.start_segment_id)
+            transcript.segment_by_id(s.end_segment_id)
+    except KeyError:
+        return LocalCandidateEvaluation(
+            accepted=False, reason="invalid_segment_reference", candidate=candidate
+        )
+
+    _force_first_segment_is_hook(candidate)
+    extended = _extend_internal_junctions(candidate, transcript)
+    internal_extension_applied = extended is not candidate
+    c = extend_to_natural_ending(extended, transcript)
+    final_extension_applied = c is not extended
+
+    opening_text = _opening_text(c, transcript)
+    duration_sec = _candidate_duration(c, transcript)
+
+    def _rejected(
+        reason: LocalRejectReason, junction_reason: JunctionRejectReason | None = None
+    ) -> LocalCandidateEvaluation:
+        return LocalCandidateEvaluation(
+            accepted=False, reason=reason, candidate=c,
+            opening_text=opening_text, duration_sec=duration_sec,
+            junction_reason=junction_reason,
+            internal_extension_applied=internal_extension_applied,
+            final_extension_applied=final_extension_applied,
+        )
+
+    if not has_confident_natural_ending(c, transcript):
+        return _rejected("incomplete_final_ending")
+
+    if _has_overlapping_segments(c, transcript):
+        return _rejected("overlap")
+
+    if duration_sec < config.DURATION_HARD_MIN_SEC:
+        return _rejected("duration_too_short")
+    if duration_sec > config.DURATION_HARD_MAX_SEC:
+        return _rejected("duration_too_long")
+
+    if c.opening_hook_strength < config.MIN_OPENING_HOOK_STRENGTH:
+        return _rejected("hook_strength_below_80")
+    if _looks_like_weak_opening(opening_text):
+        return _rejected("weak_opening_prefix")
+
+    junction = evaluate_candidate_junctions(c, transcript)
+    if not junction.safe:
+        reason: LocalRejectReason = (
+            "context_dependent_opening"
+            if junction.reason == "hook_context_dependent"
+            else "unsafe_junction"
+        )
+        return _rejected(reason, junction_reason=junction.reason)
+
+    return LocalCandidateEvaluation(
+        accepted=True, reason="accepted", candidate=c,
+        opening_text=opening_text, duration_sec=duration_sec,
+        internal_extension_applied=internal_extension_applied,
+        final_extension_applied=final_extension_applied,
+    )
+
+
+def _evaluate_all_local_candidates(
+    candidates: list[RawClipCandidate], transcript: Transcript
+) -> list[LocalCandidateEvaluation]:
+    return [evaluate_local_candidate(c, transcript) for c in candidates]
+
+
 def _filter_local_quality(
     candidates: list[RawClipCandidate], transcript: Transcript
 ) -> list[RawClipCandidate]:
     """Mechanical quality gate that runs before Stage2, so weak candidates
-    never cost a second API call: duration range, spoken opening strength,
-    and referential integrity (segment_ids must actually exist -- a Stage1
-    chunk only ever sees its own segment_ids, but this stays defensive).
+    never cost a second API call. Thin wrapper over
+    evaluate_local_candidate (see its docstring for the exact check order
+    and reason codes) -- kept as a separate, stable entry point since a
+    large existing test suite (and refresh_candidates_only/
+    refresh_stage1_and_candidates/select_candidates below) calls it
+    directly for just the accepted list, not the full diagnostic detail.
     Candidates that fail any check are dropped silently; no feedback is
-    sent back to Claude and no retry happens here. Ending completeness
-    (see extend_to_natural_ending) is applied here too: a candidate still
-    confidently mid-utterance after extension (has_confident_natural_ending
-    returns False -- e.g. still ends in "〜ので" with no further segment
-    to bridge to) is dropped rather than accepted just because a pause
-    followed it, and the hard duration bounds are re-checked *after*
-    extension -- since Stage1 produced many candidates, one whose natural
-    ending pushes it past DURATION_HARD_MAX_SEC is simply dropped in favor
-    of another rather than cut off early to hit the ceiling. Also drops
-    any candidate whose segments overlap (_has_overlapping_segments,
-    beyond its narrow allowed hook/payoff exact-repeat exception) --
-    segments may now be reordered rather than strictly chronological, so
-    this is the safety net against reused/duplicated transcript content --
-    and any candidate with an unsafe internal cut junction
-    (_validate_candidate_junctions), after first trying to fix an
-    unfinished internal segment by extending it within the original
-    transcript (_extend_internal_junctions), exactly like
-    extend_to_natural_ending does for the final segment.
+    sent back to Claude and no retry happens here.
     """
-    kept = []
-    for c in candidates:
-        try:
-            for s in c.segments:
-                transcript.segment_by_id(s.start_segment_id)
-                transcript.segment_by_id(s.end_segment_id)
-        except KeyError:
-            continue
+    return [e.candidate for e in _evaluate_all_local_candidates(candidates, transcript) if e.accepted]
 
-        _force_first_segment_is_hook(c)
-        c = _extend_internal_junctions(c, transcript)
-        c = extend_to_natural_ending(c, transcript)
-        if not has_confident_natural_ending(c, transcript):
-            continue
 
-        if _has_overlapping_segments(c, transcript):
-            continue
+_LOCAL_REJECT_REASON_LABELS: dict[str, str] = {
+    "invalid_segment_reference": "存在しないsegment参照",
+    "incomplete_final_ending": "終端未完結",
+    "overlap": "segment重複",
+    "duration_too_short": "尺不足(20秒未満)",
+    "duration_too_long": "尺超過(50秒超)",
+    "hook_strength_below_80": "hook強度不足",
+    "weak_opening_prefix": "弱い導入句",
+    "context_dependent_opening": "文脈依存の冒頭",
+    "unsafe_junction": "カット接続不自然",
+}
 
-        dur = _candidate_duration(c, transcript)
-        if not (config.DURATION_HARD_MIN_SEC <= dur <= config.DURATION_HARD_MAX_SEC):
-            continue
 
-        if c.opening_hook_strength < config.MIN_OPENING_HOOK_STRENGTH:
-            continue
-        if _looks_like_weak_opening(_opening_text(c, transcript)):
-            continue
-        if not _validate_candidate_junctions(c, transcript):
-            continue
+def _format_diagnostic_summary(evaluations: list[LocalCandidateEvaluation]) -> str:
+    """Renders a compact, scannable breakdown of why each Stage1 candidate
+    was accepted/rejected by the local filter, meant to be appended to
+    the RuntimeError raised when too few candidates survive it
+    (select_candidates / refresh_candidates_only /
+    refresh_stage1_and_candidates). That message becomes job.error
+    (jobs.py), which the existing frontend already renders as multi-line
+    text (static/style.css's `.status` is `white-space: pre-wrap`), so
+    this reaches the user's screen with no other UI changes needed. Never
+    dumps the full transcript -- only each candidate's already-truncated
+    resolved opening text.
+    """
+    if not evaluations:
+        return ""
+    accepted = sum(1 for e in evaluations if e.accepted)
+    counts: dict[str, int] = {}
+    for e in evaluations:
+        counts[e.reason] = counts.get(e.reason, 0) + 1
 
-        kept.append(c)
-    return kept
+    lines = ["", "【診断】", f"Stage1候補: {len(evaluations)}件", f"通過: {accepted}件", "", "不合格内訳:"]
+    for reason, label in _LOCAL_REJECT_REASON_LABELS.items():
+        n = counts.get(reason, 0)
+        if n:
+            lines.append(f"- {label}: {n}件")
+
+    lines.append("")
+    for i, e in enumerate(evaluations, start=1):
+        opening = e.opening_text[:30] + ("…" if len(e.opening_text) > 30 else "")
+        detail = (
+            f"候補{i}: 冒頭「{opening}」 "
+            f"hook={e.candidate.opening_hook_strength} duration={e.duration_sec:.1f}秒 "
+            f"reject={e.reason}"
+        )
+        if e.junction_reason:
+            detail += f" junction={e.junction_reason}"
+        lines.append(detail)
+
+    return "\n".join(lines)
+
+
+def diagnose_local_filter(transcript: Transcript) -> list[LocalCandidateEvaluation]:
+    """API 0: reuses only the already-cached Stage1 chunk results for this
+    transcript (_load_stage1_from_cache_only -- never run_stage1 with
+    force_refresh=True, never the Stage1 or Stage2 Anthropic API) and
+    returns the per-candidate evaluate_local_candidate verdict for every
+    one of them. Lets "why did the local filter leave too few
+    candidates" be re-answered against an already-populated cache (e.g.
+    after pulling a prompt/threshold change) at zero additional API cost.
+
+    Raises RuntimeError (no evaluations computed) if the Stage1 chunk
+    cache is missing or incomplete for this transcript -- this never
+    silently falls back to a fresh, API-calling analysis; the caller must
+    run a real analysis (or refresh_stage1_and_candidates) first to
+    populate the cache.
+    """
+    stage1_candidates = _load_stage1_from_cache_only(transcript)
+    if stage1_candidates is None:
+        raise RuntimeError(
+            "診断用のStage1候補キャッシュが見つからないか不完全です。"
+            "先に解析（またはStage1からの再解析）を一度実行してキャッシュを作成してから、"
+            "この診断を実行してください。（この診断自体はAPIを呼び出しません）"
+        )
+    return _evaluate_all_local_candidates(stage1_candidates, transcript)
 
 
 def _stage2_summary(candidate_id: str, raw: RawClipCandidate, transcript: Transcript) -> dict:
@@ -842,11 +1058,13 @@ def select_candidates(
             return finalized
 
     stage1_candidates = run_stage1(transcript, video_title, force_refresh=force_refresh)
-    filtered = _filter_local_quality(stage1_candidates, transcript)
+    evaluations = _evaluate_all_local_candidates(stage1_candidates, transcript)
+    filtered = [e.candidate for e in evaluations if e.accepted]
     if len(filtered) < config.NUM_CANDIDATES:
         raise RuntimeError(
             f"ローカル品質フィルタを通過した候補が{len(filtered)}件しかありません"
             f"（{config.NUM_CANDIDATES}件必要）。APIへの自動再要求は行いません。"
+            + _format_diagnostic_summary(evaluations)
         )
 
     return _rank_finalize_and_cache(filtered, transcript, video_title)
@@ -929,11 +1147,13 @@ def refresh_candidates_only(
             "完全な再解析（Stage1からのやり直し）が必要です。"
         )
 
-    filtered = _filter_local_quality(stage1_candidates, transcript)
+    evaluations = _evaluate_all_local_candidates(stage1_candidates, transcript)
+    filtered = [e.candidate for e in evaluations if e.accepted]
     if len(filtered) < config.NUM_CANDIDATES:
         raise RuntimeError(
             f"保存済みStage1候補のうちローカル品質フィルタを通過したのは{len(filtered)}件です"
             f"（{config.NUM_CANDIDATES}件必要）。完全な再解析が必要です。"
+            + _format_diagnostic_summary(evaluations)
         )
 
     return _rank_finalize_and_cache(filtered, transcript, video_title)
@@ -961,12 +1181,14 @@ def refresh_stage1_and_candidates(
     + at most one Stage2 call.
     """
     stage1_candidates = run_stage1(transcript, video_title, force_refresh=True)
-    filtered = _filter_local_quality(stage1_candidates, transcript)
+    evaluations = _evaluate_all_local_candidates(stage1_candidates, transcript)
+    filtered = [e.candidate for e in evaluations if e.accepted]
     if len(filtered) < config.NUM_CANDIDATES:
         raise RuntimeError(
             f"Stage1を再解析しましたが、現在の品質基準を満たす候補が{len(filtered)}件しか"
             f"ありませんでした（{config.NUM_CANDIDATES}件必要）。"
             "Stage2ランキングは実行していません。"
+            + _format_diagnostic_summary(evaluations)
         )
 
     return _rank_finalize_and_cache(filtered, transcript, video_title)

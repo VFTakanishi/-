@@ -1003,6 +1003,274 @@ def test_filter_local_quality_extends_internal_junction_before_rejecting(monkeyp
     assert kept[0].segments[-1].start_segment_id == 3
 
 
+# --- diagnostic evaluator: evaluate_local_candidate / diagnose_local_filter
+# (real-machine incident: "Stage1を再解析しましたが...候補が0件しかありません
+# でした" with no visibility into *why* -- this makes the reason visible,
+# API 0, without changing which candidates pass or fail) ------------------
+
+
+def test_evaluate_local_candidate_A_hook_strength_below_80(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    raw = _raw_candidate(0, 2, opening_hook_strength=79)
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.accepted is False
+    assert result.reason == "hook_strength_below_80"
+
+
+def test_evaluate_local_candidate_B_duration_too_short(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
+    transcript = _long_transcript(minutes=1)
+    raw = _raw_candidate(0, 0, opening_hook_strength=90)  # single ~2s segment
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.accepted is False
+    assert result.reason == "duration_too_short"
+
+
+def test_evaluate_local_candidate_C_duration_too_long(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
+    transcript = _long_transcript(minutes=5)  # plenty of segments (20s apart)
+    raw = _raw_candidate(0, 5, opening_hook_strength=90)  # spans >100s, far more than 50s
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.accepted is False
+    assert result.reason == "duration_too_long"
+
+
+def test_evaluate_local_candidate_D_kedomo_ending_is_incomplete(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    # Last (and only) transcript segment -- nothing left to extend into.
+    transcript = _transcript_with_gap(0.3, ["冒頭の発言です。", "〜良いかもしれないんですけども"])
+    raw = _raw_candidate(0, 1, opening_hook_strength=90)
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.accepted is False
+    assert result.reason == "incomplete_final_ending"
+
+
+def _unfixable_bad_junction_transcript():
+    # Unlike _junction_transcript (where the gap to the real continuation
+    # is small enough that _extend_internal_junctions can bridge it, per
+    # test_filter_local_quality_extends_internal_junction_before_
+    # rejecting), here the gap to segment 1 (the next transcript segment,
+    # NOT used by the candidate below) is deliberately too large
+    # (END_EXTENSION_CONTINUATION_MAX_GAP_SEC default 1.5s) for extension
+    # to bridge at all -- so the unfinished "...のであれば" ending truly
+    # cannot be fixed. Segment 2 (a distant, unrelated segment) sits at
+    # transcript index 2, so jumping straight to it from segment 0 is a
+    # genuine non-chronological jump (index 2 != index 0 + 1), unlike a
+    # 2-segment transcript where the next segment is always "adjacent" by
+    # list position regardless of its actual time gap.
+    return Transcript(
+        video_id="vidUnfixable",
+        language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=2.0, text="車を冷やしますっていうのであれば",
+                words=[TranscriptWord(start=0.0, end=2.0, text="車を冷やしますっていうのであれば")],
+            ),
+            TranscriptSegment(
+                id=1, start=20.0, end=22.0, text="別の話題の説明です。",
+                words=[TranscriptWord(start=20.0, end=22.0, text="別の話題の説明です。")],
+            ),
+            TranscriptSegment(
+                id=2, start=40.0, end=42.0, text="連続周回をする場合は違う話になります",
+                words=[TranscriptWord(start=40.0, end=42.0, text="連続周回をする場合は違う話になります")],
+            ),
+        ],
+    )
+
+
+def test_evaluate_local_candidate_E_bad_junction_reports_jump_prev_incomplete(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _unfixable_bad_junction_transcript()
+    bad = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=2, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate(bad, transcript)
+    assert result.accepted is False
+    assert result.reason == "unsafe_junction"
+    assert result.junction_reason == "jump_prev_incomplete"
+
+
+def test_evaluate_local_candidate_F_context_dependent_hook(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidF2",
+        language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=3.0,
+                text="これのクラッチ交換の際にメタルクラッチを入れるとミッションが壊れやすくなるっていうのはよく言われてます",
+                words=[TranscriptWord(
+                    start=0.0, end=3.0,
+                    text="これのクラッチ交換の際にメタルクラッチを入れるとミッションが壊れやすくなるっていうのはよく言われてます",
+                )],
+            ),
+        ],
+    )
+    raw = _raw_candidate(0, 0, opening_hook_strength=90)
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.accepted is False
+    assert result.reason == "context_dependent_opening"
+    assert result.junction_reason == "hook_context_dependent"
+
+
+def test_evaluate_local_candidate_G_candidate1_anchor_not_rejected_as_weak_or_context_dependent(monkeypatch):
+    # G: start_anchor_text="86は" must not itself cause a
+    # weak_opening_prefix or context_dependent_opening rejection -- the
+    # candidate should be fully accepted.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidG",
+        language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=3.0,
+                text="これも私の愛車である86はスープラをベースに作られています。",
+                words=[
+                    TranscriptWord(start=0.0, end=0.3, text="これも"),
+                    TranscriptWord(start=0.3, end=0.6, text="私の"),
+                    TranscriptWord(start=0.6, end=0.9, text="愛車である"),
+                    TranscriptWord(start=0.9, end=1.2, text="86は"),
+                    TranscriptWord(start=1.2, end=3.0, text="スープラをベースに作られています。"),
+                ],
+            ),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0, start_anchor_text="86は")
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.reason == "accepted"
+    assert result.accepted is True
+
+
+def test_evaluate_local_candidate_H_accepted_candidate(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    raw = _raw_candidate(0, 2, opening_hook_strength=90)
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.accepted is True
+    assert result.reason == "accepted"
+
+
+def test_evaluate_local_candidate_I_matches_filter_local_quality_exactly(monkeypatch):
+    # I: production accept/reject (_filter_local_quality) and the
+    # diagnostic evaluator must never disagree -- they share one
+    # implementation (evaluate_local_candidate).
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _unfixable_bad_junction_transcript()
+    candidates = [
+        RawClipCandidate(
+            hook_type="strong_take",
+            segments=[
+                RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+                RawUsedSegment(role="context", start_segment_id=2, end_segment_id=2),
+            ],
+            hook_text="h", opening_hook_strength=90, title="", description="",
+            score=90, reasoning="", caveats="",
+        ),  # unsafe_junction
+        RawClipCandidate(
+            hook_type="strong_take",
+            segments=[RawUsedSegment(role="hook", start_segment_id=1, end_segment_id=1)],
+            hook_text="h", opening_hook_strength=79, title="", description="",
+            score=79, reasoning="", caveats="",
+        ),  # hook_strength_below_80
+        RawClipCandidate(
+            hook_type="strong_take",
+            segments=[RawUsedSegment(role="hook", start_segment_id=1, end_segment_id=1)],
+            hook_text="h", opening_hook_strength=90, title="", description="",
+            score=90, reasoning="", caveats="",
+        ),  # accepted
+    ]
+
+    filtered = clip_selector._filter_local_quality(candidates, transcript)
+    evaluations = clip_selector._evaluate_all_local_candidates(candidates, transcript)
+    accepted_via_evaluations = [e.candidate for e in evaluations if e.accepted]
+
+    assert len(filtered) == len(accepted_via_evaluations) == 1
+    assert filtered[0].segments == accepted_via_evaluations[0].segments
+
+
+def test_refresh_stage1_and_candidates_J_error_includes_diagnostic_summary(monkeypatch):
+    # J: the exact real-machine failure path -- diagnostic counts and
+    # per-candidate detail must be embedded in the RuntimeError text
+    # (which becomes job.error, already rendered to the user).
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    candidates = [_raw_candidate(0, 0, opening_hook_strength=50)]
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: candidates)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        clip_selector.refresh_stage1_and_candidates(transcript, "タイトル")
+
+    message = str(exc_info.value)
+    assert "【診断】" in message
+    assert "Stage1候補: 1件" in message
+    assert "hook強度不足" in message
+
+
+def test_diagnose_local_filter_K_makes_zero_api_calls(monkeypatch):
+    # K: relies on this module's autouse _forbid_real_anthropic_client
+    # fixture (poisons anthropic.Anthropic()) plus an explicit guard on
+    # run_stage1/extract_candidates_for_chunk -- diagnose_local_filter
+    # must never reach either.
+    transcript = _long_transcript(minutes=1)
+    cache.save_stage1_chunk(transcript.video_id, 0, [_raw_candidate(0, 0, opening_hook_strength=90)])
+
+    def _forbidden(*a, **k):
+        raise AssertionError("diagnose_local_filter must never call the Stage1 API")
+
+    monkeypatch.setattr(clip_selector, "run_stage1", _forbidden)
+    monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", _forbidden)
+
+    evaluations = clip_selector.diagnose_local_filter(transcript)
+    assert len(evaluations) >= 1
+
+
+def test_diagnose_local_filter_L_raises_clearly_without_cache():
+    transcript = _long_transcript(minutes=1)
+    transcript.video_id = "vid-never-cached-for-diagnosis"
+
+    with pytest.raises(RuntimeError, match="Stage1候補キャッシュ"):
+        clip_selector.diagnose_local_filter(transcript)
+
+
+def test_candidate_schema_version_still_8():
+    # L: this round adds diagnostics only -- no Stage1 output shape
+    # change, so the schema version must stay exactly where the previous
+    # round (junction safety) left it.
+    assert config.CANDIDATE_SCHEMA_VERSION == 8
+
+
 # --- B (most important): a cache hit must go through the same correction -
 
 
