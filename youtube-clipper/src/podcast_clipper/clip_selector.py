@@ -79,7 +79,9 @@ class Stage1CandidateOutput(BaseModel):
 class Stage1Output(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    candidates: list[Stage1CandidateOutput] = Field(min_length=0, max_length=3)
+    candidates: list[Stage1CandidateOutput] = Field(
+        min_length=0, max_length=config.STAGE1_MAX_CANDIDATES_PER_CHUNK
+    )
 
 
 class Stage2RankingOutput(BaseModel):

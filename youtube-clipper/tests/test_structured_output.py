@@ -329,11 +329,18 @@ def test_thinking_is_disabled_for_sonnet_5():
 
 def test_stage1_output_max_json_size_is_well_under_max_tokens():
     """Documents and guards the audit finding that motivated disabling
-    thinking: the worst-case Stage1Output JSON (3 candidates, 3 segments
-    each, long enum values, 3-digit segment ids) is far smaller than
-    STAGE1_MAX_OUTPUT_TOKENS, so a stop_reason="max_tokens" truncation is
-    not explained by the final JSON itself -- it pointed at something else
-    consuming the token budget (adaptive thinking).
+    thinking: the worst-case Stage1Output JSON (config.STAGE1_MAX_
+    CANDIDATES_PER_CHUNK candidates, 3 segments each, long enum values,
+    3-digit segment ids) is far smaller than STAGE1_MAX_OUTPUT_TOKENS, so a
+    stop_reason="max_tokens" truncation is not explained by the final JSON
+    itself -- it pointed at something else consuming the token budget
+    (adaptive thinking).
+
+    Re-audited when STAGE1_MAX_CANDIDATES_PER_CHUNK was raised 3 -> 6 (to
+    widen Stage1's search breadth after MIN_OPENING_HOOK_STRENGTH went up
+    to 80): worst case grew from ~820 to ~1624 chars (~234 -> ~464
+    estimated tokens), still comfortably under half of
+    STAGE1_MAX_OUTPUT_TOKENS=2048, so the ceiling was left unchanged.
     """
     from podcast_clipper import config
     from podcast_clipper.clip_selector import Stage1CandidateOutput, Stage1SegmentOutput
@@ -348,7 +355,9 @@ def test_stage1_output_max_json_size_is_well_under_max_tokens():
         opening_hook_strength=95,
         score=92,
     )
-    worst_case = Stage1Output(candidates=[candidate, candidate, candidate])
+    worst_case = Stage1Output(
+        candidates=[candidate] * config.STAGE1_MAX_CANDIDATES_PER_CHUNK
+    )
     text = worst_case.model_dump_json()
 
     char_count = len(text)

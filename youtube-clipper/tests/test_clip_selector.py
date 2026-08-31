@@ -216,6 +216,52 @@ def test_rank_and_finalize_prompt_independently_evaluates_stage1_hook_score():
     assert "鵜呑みにしないでください" in text or "鵜呑み" in text
 
 
+# --- prompt content: Stage1 widened to recall-oriented search (max 6) -----
+
+
+def test_extract_candidates_prompt_allows_up_to_six_candidates():
+    text = _extract_candidates_prompt_text()
+    assert "最大6件" in text
+    assert "最大3件" not in text
+
+
+def test_extract_candidates_prompt_requires_scanning_whole_chunk():
+    """Stage1 must not stop after finding candidates early in the chunk --
+    it has to read to the end before finalizing its candidate list, so a
+    stronger later utterance isn't missed."""
+    text = _extract_candidates_prompt_text()
+    assert "冒頭から末尾まで全体を読んで" in text
+
+
+def test_extract_candidates_prompt_forbids_using_up_slots_on_the_first_half():
+    text = _extract_candidates_prompt_text()
+    assert "前半で見つかった強そうな発話だけで候補枠を使い切り" in text
+    assert "後半" in text
+
+
+def test_extract_candidates_prompt_forbids_padding_weak_candidates_to_fill_six():
+    text = _extract_candidates_prompt_text()
+    assert "件数を埋める必要はありません" in text
+
+
+def test_extract_candidates_prompt_forbids_near_duplicate_candidates():
+    text = _extract_candidates_prompt_text()
+    assert "複数枠に並べないでください" in text
+
+
+def test_extract_candidates_prompt_states_stage1_is_recall_not_final_selection():
+    """Documents the Stage1/Stage2 role split: Stage1 casts a wide net,
+    Stage2 (seeing the pooled candidates from every chunk) picks the final
+    best-3."""
+    text = _extract_candidates_prompt_text()
+    assert "最終ベスト3を決める係ではありません" in text or "最終的に使う3本を選び切る係ではありません" in text
+
+
+def test_rank_and_finalize_prompt_states_it_picks_the_final_best_three():
+    text = _rank_and_finalize_prompt_text()
+    assert "最終的に採用すべきベスト3" in text
+
+
 # --- ending completeness: clips must not end mid-utterance ----------------
 
 
@@ -686,13 +732,20 @@ def _valid_candidate_kwargs():
     }
 
 
-def test_stage1_output_accepts_zero_to_three_candidates():
+def test_stage1_output_accepts_zero_to_six_candidates():
+    """Stage1's per-chunk cap was widened 3 -> config.STAGE1_MAX_CANDIDATES_
+    PER_CHUNK (6): Stage1's job is recall (cast a wide net of candidates
+    that could plausibly clear MIN_OPENING_HOOK_STRENGTH), not picking the
+    final best-3 -- that narrowing still happens via the local quality
+    filter + Stage2 ranking, not by capping Stage1's search breadth.
+    """
+    assert config.STAGE1_MAX_CANDIDATES_PER_CHUNK == 6
     assert Stage1Output(candidates=[]).candidates == []
-    for n in (1, 2, 3):
+    for n in range(1, 7):
         out = Stage1Output(candidates=[Stage1CandidateOutput(**_valid_candidate_kwargs()) for _ in range(n)])
         assert len(out.candidates) == n
     with pytest.raises(ValidationError):
-        Stage1Output(candidates=[Stage1CandidateOutput(**_valid_candidate_kwargs()) for _ in range(4)])
+        Stage1Output(candidates=[Stage1CandidateOutput(**_valid_candidate_kwargs()) for _ in range(7)])
 
 
 def test_stage1_candidate_output_segments_length_bounds():

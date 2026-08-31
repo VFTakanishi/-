@@ -17,6 +17,19 @@ OUTPUT_DIR = Path(os.environ.get("PODCAST_CLIPPER_OUTPUT_DIR", BASE_DIR / "outpu
 
 # --- Candidate selection (absolute conditions #1, #4, #5, #12) --------
 NUM_CANDIDATES = 3
+
+# Stage1's per-chunk candidate cap. This is *search breadth*, not the final
+# candidate count: raising MIN_OPENING_HOOK_STRENGTH to 80 means Stage1
+# capping itself at 3 candidates/chunk can leave too few survivors for
+# Stage2 to pick NUM_CANDIDATES from, especially when only one or two
+# utterances per chunk actually clear that bar. Stage1's role is recall
+# (cast a wide net of everything that could plausibly score >=80), not
+# picking the final best-3 -- that's still Stage2's job, applied to
+# candidates pooled across every chunk. Local quality filtering + Stage2
+# ranking narrow this back down to NUM_CANDIDATES; nothing here changes
+# what the user ultimately sees.
+STAGE1_MAX_CANDIDATES_PER_CHUNK = 6
+
 TARGET_DURATION_MIN_SEC = 25.0
 TARGET_DURATION_MAX_SEC = 45.0
 # Hard validation bounds: outside this range triggers one feedback+retry
@@ -66,7 +79,7 @@ END_EXTENSION_CONTINUATION_MAX_GAP_SEC = 1.5
 # and treats a mismatch as a cache miss (falls back to a fresh Stage1/Stage2
 # run) rather than trying to deserialize old-shape data. The Whisper
 # transcript cache has no dependency on this and is unaffected.
-CANDIDATE_SCHEMA_VERSION = 5
+CANDIDATE_SCHEMA_VERSION = 6
 
 CHUNK_MINUTES = 10.0
 CHUNK_OVERLAP_MINUTES = 1.0
