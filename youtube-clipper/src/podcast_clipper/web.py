@@ -11,13 +11,15 @@ returns the mp4 (plan fix #4: nothing else) once QA allows it.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -36,6 +38,95 @@ async def _lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Podcast Clipper", lifespan=_lifespan)
+
+
+# --- cloud deployment: simple password gate (see config.TOOL_PASSWORD) --
+# Deliberately not a real auth system (no OAuth, no user DB, no server-side
+# session store) -- a single shared password, gating every route except
+# /health (Railway's health checker never has a cookie) and /auth/login
+# (must be reachable *before* authenticating). The cookie holds only an
+# HMAC-SHA256 digest of the password (never the password itself), so it's
+# both unforgeable without knowing TOOL_PASSWORD and safe to store
+# stateless-ly with no server-side session table. When config.TOOL_PASSWORD
+# is unset (the local/default case), _is_authenticated always returns True
+# and the gate is a complete no-op -- existing local usage (and every
+# existing test using TestClient(web.app) with no TOOL_PASSWORD set) is
+# unaffected.
+_AUTH_COOKIE_NAME = "pc_auth"
+_AUTH_PAYLOAD = b"podcast-clipper-authenticated"
+_AUTH_EXEMPT_PATHS = {"/health", "/auth/login"}
+
+_LOGIN_PAGE_HTML = """<!doctype html>
+<html lang="ja"><head><meta charset="utf-8">
+<title>Podcast Clipper - ログイン</title>
+<style>
+body{{font-family:sans-serif;display:flex;align-items:center;justify-content:center;
+height:100vh;margin:0;background:#111;color:#eee;}}
+form{{background:#1c1c1c;padding:2rem 2.5rem;border-radius:10px;text-align:center;}}
+input[type=password]{{padding:.6rem;font-size:1rem;border-radius:4px;border:1px solid #444;
+background:#222;color:#eee;}}
+button{{margin-left:.5rem;padding:.6rem 1.2rem;font-size:1rem;border-radius:4px;border:none;
+background:#3a9a5c;color:#fff;cursor:pointer;}}
+.error{{color:#f66;margin-top:.7rem;font-size:.9rem;}}
+</style></head>
+<body>
+<form method="post" action="/auth/login">
+<div style="margin-bottom:1rem;">Podcast Clipper</div>
+<input type="password" name="password" placeholder="パスワード" autofocus required>
+<button type="submit">入る</button>
+{error}
+</form>
+</body></html>"""
+
+
+def _expected_auth_token() -> str | None:
+    if not config.TOOL_PASSWORD:
+        return None
+    return hmac.new(config.TOOL_PASSWORD.encode("utf-8"), _AUTH_PAYLOAD, hashlib.sha256).hexdigest()
+
+
+def _is_authenticated(request: Request) -> bool:
+    expected = _expected_auth_token()
+    if expected is None:
+        return True
+    cookie = request.cookies.get(_AUTH_COOKIE_NAME)
+    return bool(cookie) and hmac.compare_digest(cookie, expected)
+
+
+def _password_matches(candidate: str) -> bool:
+    if not config.TOOL_PASSWORD:
+        return False
+    return hmac.compare_digest(candidate.encode("utf-8"), config.TOOL_PASSWORD.encode("utf-8"))
+
+
+@app.middleware("http")
+async def _tool_password_gate(request: Request, call_next):
+    if request.url.path in _AUTH_EXEMPT_PATHS or _is_authenticated(request):
+        return await call_next(request)
+    return HTMLResponse(_LOGIN_PAGE_HTML.format(error=""), status_code=401)
+
+
+@app.post("/auth/login")
+def auth_login(password: str = Form(...)) -> Response:
+    if not _password_matches(password):
+        return HTMLResponse(
+            _LOGIN_PAGE_HTML.format(error='<div class="error">パスワードが違います</div>'),
+            status_code=401,
+        )
+    resp = RedirectResponse(url="/", status_code=303)
+    resp.set_cookie(
+        _AUTH_COOKIE_NAME, _expected_auth_token(),
+        httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30,
+    )
+    return resp
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    """Railway health check target. Deliberately makes no Anthropic API
+    call and touches no cache/job state -- just confirms the process is up.
+    """
+    return {"status": "ok"}
 
 
 class RenderRequest(BaseModel):

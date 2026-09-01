@@ -146,12 +146,37 @@ RELATED_VIDEO_INSTRUCTIONS = (
     "元のポッドキャスト本編を設定してください。"
 )
 
-# --- Japanese font handling (Windows-oriented) --------------------------
+# --- Japanese font handling (Windows-oriented, with a Linux/Docker fallback) -
 # A single .ttf/.otf is recommended over a .ttc (see README) because a
 # TrueType Collection can resolve to an unexpected face inside drawtext.
-FONT_PATH = os.environ.get(
-    "PODCAST_CLIPPER_FONT_PATH", "C:/Windows/Fonts/meiryo.ttc"
+# PODCAST_CLIPPER_FONT_PATH always wins when set (unchanged). When it isn't,
+# the previous behavior was to hardcode the Windows path even though it
+# never exists on Linux (Docker/Railway) -- _default_font_path() now checks
+# for that Windows path first (local Windows users see no change at all)
+# and only falls back to a common Noto Sans CJK JP install location
+# (installed via the Dockerfile's `fonts-noto-cjk` apt package -- see
+# tests/conftest.py's find_available_japanese_font, which already looks in
+# the same place for local dev) if neither exists, this still returns the
+# Windows path unchanged, so text_overlay.ensure_font_available()'s
+# existing "not found" error message and behavior are unaffected.
+_WINDOWS_DEFAULT_FONT_PATH = "C:/Windows/Fonts/meiryo.ttc"
+_LINUX_FONT_PATH_CANDIDATES = (
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
 )
+
+
+def _default_font_path(_exists=lambda p: Path(p).exists()) -> str:
+    if _exists(_WINDOWS_DEFAULT_FONT_PATH):
+        return _WINDOWS_DEFAULT_FONT_PATH
+    for candidate in _LINUX_FONT_PATH_CANDIDATES:
+        if _exists(candidate):
+            return candidate
+    return _WINDOWS_DEFAULT_FONT_PATH
+
+
+FONT_PATH = os.environ.get("PODCAST_CLIPPER_FONT_PATH") or _default_font_path()
 
 # --- QA thresholds (absolute condition #13) ------------------------------
 BLACKDETECT_MIN_DURATION_SEC = 0.5
@@ -181,3 +206,13 @@ SPEECH_ALIGNMENT_TOLERANCE_SEC = 0.35
 # --- Jobs ------------------------------------------------------------
 JOB_STATES_IN_PROGRESS = {"queued", "analyzing", "rendering"}
 JOB_STATE_INTERRUPTED = "interrupted"
+
+# --- Cloud deployment: simple password gate (see web.py) ----------------
+# When this is a public Railway URL rather than localhost, a bare password
+# check keeps strangers out without any user database/OAuth/session store
+# -- deliberately not a real auth system. Unset (the local/default case)
+# means the gate is disabled entirely, so nothing changes for local use.
+# Server-side only: never sent to the frontend, never logged (see web.py's
+# _tool_password_gate/_password_matches -- only an HMAC digest of this
+# value is ever placed in a cookie, never the raw password itself).
+TOOL_PASSWORD = os.environ.get("TOOL_PASSWORD") or None

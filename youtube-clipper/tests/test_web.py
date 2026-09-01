@@ -490,3 +490,103 @@ def test_serialize_candidate_includes_total_duration():
     assert "total_duration" in data
     assert data["total_duration"] == candidate.total_duration
     assert isinstance(data["total_duration"], (int, float))
+
+
+# --- round 8 (cloud deploy): GET /health + TOOL_PASSWORD gate ------------
+# See config.TOOL_PASSWORD and web.py's _tool_password_gate/_expected_auth_
+# token/_is_authenticated/_password_matches. No Anthropic API call is
+# reachable from any of these routes.
+
+
+def test_health_endpoint_returns_200_with_no_auth_required(monkeypatch):
+    # I: Railway's health check must succeed even when TOOL_PASSWORD is
+    # set (its checker has no cookie), and must never touch the Anthropic
+    # API or any job/cache state.
+    monkeypatch.setattr(config, "TOOL_PASSWORD", "sekret123")
+    client = TestClient(web.app)
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+
+def test_tool_password_unset_leaves_local_behavior_unchanged(monkeypatch):
+    # E: the default (existing) local case -- no TOOL_PASSWORD env var --
+    # every route must remain reachable with no cookie at all, exactly as
+    # every other test in this file (which never sets TOOL_PASSWORD)
+    # already relies on.
+    monkeypatch.setattr(config, "TOOL_PASSWORD", None)
+    client = TestClient(web.app)
+    resp = client.get("/api/jobs/does-not-exist")
+    assert resp.status_code == 404  # reached the real route, not a 401 gate
+
+
+def test_tool_password_set_blocks_unauthenticated_access(monkeypatch):
+    # F: with TOOL_PASSWORD set, both the UI root and the API are gated
+    # behind the login page for a request with no valid cookie.
+    monkeypatch.setattr(config, "TOOL_PASSWORD", "sekret123")
+    client = TestClient(web.app)
+
+    resp = client.get("/")
+    assert resp.status_code == 401
+    assert "パスワード" in resp.text
+
+    resp = client.get("/api/jobs/does-not-exist")
+    assert resp.status_code == 401
+
+
+def test_tool_password_wrong_password_rejected(monkeypatch):
+    monkeypatch.setattr(config, "TOOL_PASSWORD", "sekret123")
+    client = TestClient(web.app)
+    resp = client.post("/auth/login", data={"password": "wrong-one"})
+    assert resp.status_code == 401
+    assert "違います" in resp.text
+    assert "pc_auth" not in resp.cookies
+
+
+def test_tool_password_correct_password_grants_cookie_then_access(monkeypatch):
+    # G: a correct password sets a cookie that then unlocks every route,
+    # with no further password prompts.
+    monkeypatch.setattr(config, "TOOL_PASSWORD", "sekret123")
+    client = TestClient(web.app)
+
+    resp = client.post("/auth/login", data={"password": "sekret123"}, follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/"
+    assert client.cookies.get("pc_auth")
+
+    resp = client.get("/api/jobs/does-not-exist")
+    assert resp.status_code == 404  # authenticated -- reached the real route
+
+
+def test_tool_password_cookie_never_contains_raw_password(monkeypatch):
+    # H: the cookie must be an opaque, unforgeable token -- never the
+    # plaintext password itself (which would otherwise be readable from
+    # any browser's dev tools / cookie jar).
+    monkeypatch.setattr(config, "TOOL_PASSWORD", "sekret123")
+    client = TestClient(web.app)
+    resp = client.post("/auth/login", data={"password": "sekret123"}, follow_redirects=False)
+    cookie_value = resp.cookies.get("pc_auth")
+    assert cookie_value is not None
+    assert "sekret123" not in cookie_value
+
+
+def test_tool_password_never_embedded_in_login_page_html(monkeypatch):
+    # H: the served login page markup must never leak the configured
+    # password into frontend HTML/JS.
+    monkeypatch.setattr(config, "TOOL_PASSWORD", "sekret123")
+    client = TestClient(web.app)
+    resp = client.get("/")
+    assert "sekret123" not in resp.text
+
+
+def test_tool_password_stale_cookie_from_old_password_rejected(monkeypatch):
+    # A cookie computed under a previous TOOL_PASSWORD (e.g. after a
+    # Railway env var change/redeploy) must not silently keep working.
+    monkeypatch.setattr(config, "TOOL_PASSWORD", "old-password")
+    client = TestClient(web.app)
+    client.post("/auth/login", data={"password": "old-password"})
+    assert client.get("/api/jobs/does-not-exist").status_code == 404  # sanity: cookie works
+
+    monkeypatch.setattr(config, "TOOL_PASSWORD", "new-password")
+    resp = client.get("/api/jobs/does-not-exist")
+    assert resp.status_code == 401
