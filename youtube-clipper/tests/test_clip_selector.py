@@ -1368,8 +1368,9 @@ def test_repair_C_sequential_prefix_trim_to_ZN6_86():
         score=83, reasoning="", caveats="",
     )
 
-    trimmed = clip_selector._try_opening_trim_repair(candidate, transcript)
+    trimmed, skip_reason = clip_selector._try_opening_trim_repair(candidate, transcript)
     assert trimmed is not None
+    assert skip_reason is None
     resolved = boundary.resolve_candidate(trimmed, transcript, candidate_id="c1")
     assert resolved.segments[0].text.startswith("ZN6-86であったり")
     assert "よくある話が" not in resolved.segments[0].text
@@ -1415,7 +1416,7 @@ def test_repair_D_candidate2_prepend_previous_segment(monkeypatch):
 
     result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
     assert result.accepted is True
-    assert result.repair_method == "prepend_previous_and_trim"
+    assert result.repair_method == "prepend_previous_1"
     assert result.original_reason == "context_dependent_opening"
     resolved = boundary.resolve_candidate(result.candidate, transcript, candidate_id="c1")
     assert resolved.segments[0].text.startswith("ZN6-86であったり")
@@ -1455,7 +1456,7 @@ def test_repair_E_prepend_previous_still_context_dependent_keeps_rejection(monke
     assert result.accepted is False
     assert result.reason == "context_dependent_opening"
     assert result.repair_method is None
-    assert "prepend_previous_and_trim" in result.attempted_repair_methods
+    assert "prepend_previous_1" in result.attempted_repair_methods
 
 
 def _candidate3_transcript():
@@ -1782,6 +1783,444 @@ def test_repair_Q_zero_api_calls_via_repair(monkeypatch):
     )
     result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
     assert result.accepted is True
+
+
+# --- round 7: real-machine incident -- "候補2" got repaired into "あとGR86
+# もそうだと思うんですけども..." which the diagnostic reported as accepted,
+# but is still a context-dependent opening (an enumeration continuation
+# whose first item, "ZN6-86であったり...", is further back and not in the
+# clip). Fixes: (1) models.CONTEXT_DEPENDENT_OPENING_PREFIXES now also
+# catches leading "あと"/"それから"/"さらに", so a repair landing on one is
+# rejected like any other dependent opening; (2) the previous-segment
+# prepend repair now tries up to 3 real, chronologically-preceding
+# segments (prepend_previous_1/2/3) instead of only ever the immediately
+# preceding one, so it can actually reach the real antecedent; (3) full
+# per-repair-variant diagnostics (RepairAttemptDiagnostic) so a real-
+# machine report shows *why* each attempted method failed (or was never
+# even generated), not just its name. -----------------------------------
+
+
+def _candidate2_round7_transcript():
+    return Transcript(
+        video_id="repairR", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=1.2,
+                text="よくある話が私も乗っているZN6-86であったりです。",
+                words=[
+                    TranscriptWord(start=0.0, end=0.4, text="よくある話が"),
+                    TranscriptWord(start=0.4, end=0.8, text="私も乗っている"),
+                    TranscriptWord(start=0.8, end=1.2, text="ZN6-86であったりです。"),
+                ],
+            ),
+            TranscriptSegment(
+                id=1, start=1.5, end=2.5,
+                text="あとGR86もそうだと思うんですけども。",
+                words=[TranscriptWord(start=1.5, end=2.5, text="あとGR86もそうだと思うんですけども。")],
+            ),
+            TranscriptSegment(
+                id=2, start=2.8, end=5.0,
+                text="これのクラッチ交換の際にメタルクラッチを入れるとミッションが壊れやすくなるっていうのはよく言われてます。",
+                words=[TranscriptWord(
+                    start=2.8, end=5.0,
+                    text="これのクラッチ交換の際にメタルクラッチを入れるとミッションが壊れやすくなるっていうのはよく言われてます。",
+                )],
+            ),
+        ],
+    )
+
+
+def _candidate2_round7_raw():
+    return RawClipCandidate(
+        hook_type="surprising_fact",
+        segments=[RawUsedSegment(role="hook", start_segment_id=2, end_segment_id=2)],
+        hook_text="h", opening_hook_strength=83, title="", description="",
+        score=83, reasoning="", caveats="",
+    )
+
+
+def test_repair_R_ato_prefix_is_context_dependent():
+    # R: "あとGR86も..." must itself be detected as a context-dependent
+    # opening -- the negative signal a repair result is re-checked
+    # against -- not accepted as independent Japanese just because it
+    # happens to be grammatically well-formed.
+    assert clip_selector._looks_context_dependent_opening("あとGR86もそうだと思うんですけども。") is True
+    # A mid-sentence "あと" must never trigger this -- only a leading one.
+    assert clip_selector._looks_context_dependent_opening("ZN6-86であったりあとはBRZです。") is False
+
+
+def test_repair_S_candidate2_prepend_1_still_rejected_then_prepend_2_accepted(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _candidate2_round7_transcript()
+    candidate = _candidate2_round7_raw()
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is True
+    assert result.repair_method == "prepend_previous_2"
+    assert result.original_reason == "context_dependent_opening"
+
+    # prepend_previous_1 must have been attempted and rejected -- landing
+    # on "あとGR86..." is not silently skipped, it's tried and fails.
+    attempt_1 = next(a for a in result.repair_attempts if a.method == "prepend_previous_1")
+    assert attempt_1.generated is True
+    assert attempt_1.accepted is False
+    assert attempt_1.reject_reason == "context_dependent_opening"
+    assert attempt_1.junction_reason == "hook_context_dependent"
+
+    resolved = boundary.resolve_candidate(result.candidate, transcript, candidate_id="c1")
+    assert resolved.segments[0].text.startswith("ZN6-86であったり")
+
+
+def test_repair_T_minimal_change_preferred_when_multiple_would_accept(monkeypatch):
+    # T: when a shallower repair already resolves the dependent opening,
+    # a deeper (larger-change) lookback must never be preferred over it --
+    # generate_local_repair_variants/_build_repair_candidates deliberately
+    # orders shallow-to-deep so "first accepted wins" already implements
+    # this without a separate scoring step.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="repairT", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=1.0, text="今日の天気の話をします。",
+                words=[TranscriptWord(start=0.0, end=1.0, text="x")],
+            ),
+            TranscriptSegment(
+                id=1, start=1.3, end=2.3, text="ZN6-86であったりGR86です。",
+                words=[TranscriptWord(start=1.3, end=2.3, text="x")],
+            ),
+            TranscriptSegment(
+                id=2, start=2.6, end=5.0,
+                text="これのクラッチ交換の際にメタルクラッチを入れるとミッションが壊れやすくなるっていうのはよく言われてます。",
+                words=[TranscriptWord(start=2.6, end=5.0, text="x")],
+            ),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="surprising_fact",
+        segments=[RawUsedSegment(role="hook", start_segment_id=2, end_segment_id=2)],
+        hook_text="h", opening_hook_strength=83, title="", description="",
+        score=83, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is True
+    assert result.repair_method == "prepend_previous_1"
+    # prepend_previous_2 was never even evaluated -- repair stops at the
+    # first accepted (shallowest) variant rather than searching further.
+    assert "prepend_previous_2" not in result.attempted_repair_methods
+
+
+def test_repair_U_prepend_lookback_never_exceeds_3_segments(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 1000.0)
+    segments = [
+        TranscriptSegment(
+            id=i, start=float(i), end=i + 0.8, text=f"話題{i}についてです。",
+            words=[TranscriptWord(start=float(i), end=i + 0.8, text="x")],
+        )
+        for i in range(5)
+    ] + [
+        TranscriptSegment(
+            id=5, start=5.0, end=5.8, text="これのクラッチ交換については以上です。",
+            words=[TranscriptWord(start=5.0, end=5.8, text="x")],
+        )
+    ]
+    transcript = Transcript(video_id="repairU", language="ja", segments=segments)
+    candidate = RawClipCandidate(
+        hook_type="surprising_fact",
+        segments=[RawUsedSegment(role="hook", start_segment_id=5, end_segment_id=5)],
+        hook_text="h", opening_hook_strength=83, title="", description="",
+        score=83, reasoning="", caveats="",
+    )
+
+    built = clip_selector._build_repair_candidates(candidate, transcript, "context_dependent_opening")
+    methods = [r.method for r in built]
+    assert "prepend_previous_1" in methods
+    assert "prepend_previous_2" in methods
+    assert "prepend_previous_3" in methods
+    assert not any(m.startswith("prepend_previous_4") for m in methods)
+    assert clip_selector._MAX_PREPEND_LOOKBACK_SEGMENTS == 3
+
+
+def test_repair_V_prepend_lookback_respects_time_cap(monkeypatch):
+    # V: a segment technically exists far enough back, but pulling it in
+    # would reach well beyond a reasonable "the antecedent is nearby"
+    # window -- reported as skipped, not silently generated.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 1000.0)
+    transcript = Transcript(
+        video_id="repairV", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=1.0, text="遠い昔の話題です。",
+                words=[TranscriptWord(start=0.0, end=1.0, text="x")],
+            ),
+            TranscriptSegment(
+                id=1, start=30.0, end=31.0, text="近い話題です。",
+                words=[TranscriptWord(start=30.0, end=31.0, text="x")],
+            ),
+            TranscriptSegment(
+                id=2, start=31.3, end=32.3, text="これのクラッチ交換については以上です。",
+                words=[TranscriptWord(start=31.3, end=32.3, text="x")],
+            ),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="surprising_fact",
+        segments=[RawUsedSegment(role="hook", start_segment_id=2, end_segment_id=2)],
+        hook_text="h", opening_hook_strength=83, title="", description="",
+        score=83, reasoning="", caveats="",
+    )
+
+    built = clip_selector._build_repair_candidates(candidate, transcript, "context_dependent_opening")
+    by_method = {r.method: r for r in built}
+    assert by_method["prepend_previous_1"].candidate is not None
+    assert by_method["prepend_previous_2"].candidate is None
+    assert by_method["prepend_previous_2"].skip_reason == "lookback_exceeds_time_cap"
+
+
+def test_repair_W_candidate3_diagnostic_shows_per_variant_reject_reason(monkeypatch):
+    # W: candidate3's real-machine report showed "repair_tried=
+    # drop_context_segment → reject" with no further detail -- the
+    # diagnostic must now show *why* each attempted drop variant still
+    # failed (never just the method name).
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
+    transcript = Transcript(
+        video_id="repairW", language="ja",
+        segments=[
+            TranscriptSegment(id=0, start=0.0, end=25.0, text="車を冷やしますっていうのであれば", words=[TranscriptWord(start=0.0, end=25.0, text="x")]),
+            TranscriptSegment(id=1, start=30.0, end=32.7, text="無関係な話題です。", words=[TranscriptWord(start=30.0, end=32.7, text="x")]),
+            TranscriptSegment(id=2, start=45.3, end=48.0, text="別の話題の説明です。", words=[TranscriptWord(start=45.3, end=48.0, text="x")]),
+            TranscriptSegment(id=3, start=100.3, end=125.3, text="連続周回をする場合は違う話になります", words=[TranscriptWord(start=100.3, end=125.3, text="x")]),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="answer", start_segment_id=3, end_segment_id=3),
+        ],
+        hook_text="h", opening_hook_strength=80, title="", description="",
+        score=80, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is False
+    assert len(result.repair_attempts) == 2
+    by_method = {a.method: a for a in result.repair_attempts}
+    assert by_method["drop_context_segment"].generated is True
+    assert by_method["drop_context_segment"].reject_reason is not None
+    assert by_method["drop_non_context_segment"].reject_reason == "unsafe_junction"
+    assert by_method["drop_non_context_segment"].junction_reason == "jump_prev_incomplete"
+
+    summary = clip_selector._format_diagnostic_summary([result])
+    assert "repair_attempts:" in summary
+    assert "drop_context_segment → reject=" in summary
+    assert "drop_non_context_segment → reject=unsafe_junction junction=jump_prev_incomplete" in summary
+
+
+def _candidate4_round7_transcript():
+    return Transcript(
+        video_id="repairX", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=5.0,
+                text="冷却効率を上げるために重量を増やすというのはアンチパターンになると思います。",
+                words=[TranscriptWord(start=0.0, end=5.0, text="x")],
+            ),
+            TranscriptSegment(
+                id=1, start=5.3, end=25.0,
+                text="真冬のサーキットで2、3周しかアタックをしません。それが理由です。",
+                words=[TranscriptWord(start=5.3, end=25.0, text="x")],
+            ),
+            TranscriptSegment(
+                id=2, start=25.3, end=29.0,
+                text="冷却不足という弱点はなくなるんですけども",
+                words=[TranscriptWord(start=25.3, end=29.0, text="x")],
+            ),
+        ],
+    )
+
+
+def _candidate4_round7_raw():
+    return RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=1, end_segment_id=1),
+            RawUsedSegment(role="answer", start_segment_id=2, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=80, title="", description="",
+        score=80, reasoning="", caveats="",
+    )
+
+
+def test_repair_X_candidate4_3segment_replace_final_with_hook_payoff(monkeypatch):
+    # X: real-machine bug -- the old _try_hook_repeat_payoff_repair
+    # guard (2 <= len(segments) < 3) silently refused any 3-segment
+    # candidate, which is exactly candidate4's real shape
+    # (hook+context+answer, answer incomplete) -- so no repair was even
+    # attempted and the diagnostic showed nothing. The 3-segment case now
+    # replaces the incomplete final segment with an exact hook repeat
+    # instead of only ever appending (which would exceed the 3-segment
+    # ceiling).
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
+    transcript = _candidate4_round7_transcript()
+    candidate = _candidate4_round7_raw()
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is True
+    assert result.repair_method == "replace_incomplete_final_with_hook_payoff"
+    assert result.original_reason == "incomplete_final_ending"
+    assert [s.role for s in result.candidate.segments] == ["hook", "context", "payoff"]
+    assert result.candidate.segments[-1].start_segment_id == result.candidate.segments[0].start_segment_id
+    assert len(result.candidate.segments) == 3
+
+
+def test_repair_Y_replace_final_over_duration_cap_keeps_rejection(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 30.0)  # tight ceiling
+    transcript = _candidate4_round7_transcript()
+    candidate = _candidate4_round7_raw()
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is False
+    attempt = next(a for a in result.repair_attempts if a.method == "replace_incomplete_final_with_hook_payoff")
+    assert attempt.generated is True
+    assert attempt.reject_reason == "duration_too_long"
+
+
+def test_repair_Z_replace_final_not_generated_when_hook_ending_not_confident(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="repairZ", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=5.0,
+                text="冷却効率を上げるために重量を増やすというのはアンチパターンになりますので",
+                words=[TranscriptWord(start=0.0, end=5.0, text="x")],
+            ),
+            TranscriptSegment(
+                id=1, start=5.3, end=25.0,
+                text="真冬のサーキットで2、3周しかアタックをしません。それが理由です。",
+                words=[TranscriptWord(start=5.3, end=25.0, text="x")],
+            ),
+            TranscriptSegment(
+                id=2, start=25.3, end=29.0,
+                text="冷却不足という弱点はなくなるんですけども",
+                words=[TranscriptWord(start=25.3, end=29.0, text="x")],
+            ),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=1, end_segment_id=1),
+            RawUsedSegment(role="answer", start_segment_id=2, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=80, title="", description="",
+        score=80, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is False
+    attempt = next(
+        a for a in result.repair_attempts if a.method == "replace_incomplete_final_with_hook_payoff"
+    )
+    assert attempt.generated is False
+    assert attempt.generation_skip_reason == "hook_ending_not_confident"
+
+
+def test_repair_AA_single_segment_hook_repeat_payoff_not_generated(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 1000.0)
+    transcript = Transcript(
+        video_id="repairAA", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=5.0, text="今日は天気がとても良いので",
+                words=[TranscriptWord(start=0.0, end=5.0, text="x")],
+            ),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
+        hook_text="h", opening_hook_strength=83, title="", description="",
+        score=83, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is False
+    assert result.reason == "incomplete_final_ending"
+    attempt = next(a for a in result.repair_attempts if a.method == "hook_repeat_payoff")
+    assert attempt.generated is False
+    assert attempt.generation_skip_reason == "single_segment_candidate"
+
+
+def test_repair_AB_evaluated_variant_count_never_exceeds_cap(monkeypatch):
+    # AB: the _MAX_LOCAL_REPAIR_VARIANTS bound applies to *evaluated*
+    # (evaluate_local_candidate-called) variants -- lower it to 1 and
+    # confirm at most 1 evaluate_local_candidate call happens for repair,
+    # with the rest reported as skipped (generation_skip_reason=
+    # "repair_variant_cap_reached") rather than silently dropped.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
+    monkeypatch.setattr(clip_selector, "_MAX_LOCAL_REPAIR_VARIANTS", 1)
+    transcript = Transcript(
+        video_id="repairAB", language="ja",
+        segments=[
+            TranscriptSegment(id=0, start=0.0, end=25.0, text="車を冷やしますっていうのであれば", words=[TranscriptWord(start=0.0, end=25.0, text="x")]),
+            TranscriptSegment(id=1, start=30.0, end=32.7, text="無関係な話題です。", words=[TranscriptWord(start=30.0, end=32.7, text="x")]),
+            TranscriptSegment(id=2, start=45.3, end=48.0, text="別の話題の説明です。", words=[TranscriptWord(start=45.3, end=48.0, text="x")]),
+            TranscriptSegment(id=3, start=100.3, end=125.3, text="連続周回をする場合は違う話になります", words=[TranscriptWord(start=100.3, end=125.3, text="x")]),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="answer", start_segment_id=3, end_segment_id=3),
+        ],
+        hook_text="h", opening_hook_strength=80, title="", description="",
+        score=80, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert len(result.attempted_repair_methods) <= 1
+    capped = [a for a in result.repair_attempts if a.generation_skip_reason == "repair_variant_cap_reached"]
+    assert len(capped) >= 1
+
+
+def test_repair_AC_round7_repairs_make_zero_api_calls(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+
+    def _forbidden(*a, **k):
+        raise AssertionError("repair must never call the Anthropic API")
+
+    monkeypatch.setattr(clip_selector.structured_output, "call", _forbidden)
+
+    transcript = _candidate2_round7_transcript()
+    candidate = _candidate2_round7_raw()
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is True
+
+    transcript4 = _candidate4_round7_transcript()
+    candidate4 = _candidate4_round7_raw()
+    config.DURATION_HARD_MIN_SEC = 20.0
+    config.DURATION_HARD_MAX_SEC = 50.0
+    result4 = clip_selector.evaluate_local_candidate_with_repair(candidate4, transcript4)
+    assert result4.accepted is True
 
 
 # --- B (most important): a cache hit must go through the same correction -

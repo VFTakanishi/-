@@ -112,9 +112,22 @@ WEAK_OPENING_PREFIXES = (
 # trim) a context-dependent opening; clip_selector.py rejects a candidate
 # whose resolved opening still starts with one of these after any
 # start_anchor_text trim, rather than guessing a substitute.
+#
+# Real-machine incident (candidate2, round 7): a repair that only trimmed
+# filler off the *front* of the hook's own segment still landed on "あと
+# GR86もそうだと思うんですけども..." -- grammatically fine Japanese, but
+# "あと" ("also"/"additionally") explicitly continues an enumeration whose
+# first item ("ZN6-86であったり...") was spoken earlier and is not in the
+# clip, so the opening is just as context-dependent as "これの...". These
+# enumeration-continuation words are included here (leading-position only,
+# same as every other entry -- a mid-sentence "あと" is never matched) so
+# a repair landing on one of them is rejected and a deeper repair (e.g.
+# clip_selector's multi-segment prepend) is required instead of silently
+# accepting a still-dependent opening.
 CONTEXT_DEPENDENT_OPENING_PREFIXES = (
     "これの", "これ", "それ", "この", "その", "こういう", "こういった",
     "なので", "だから", "それで", "ということで", "その場合",
+    "あと", "それから", "さらに",
 )
 
 
