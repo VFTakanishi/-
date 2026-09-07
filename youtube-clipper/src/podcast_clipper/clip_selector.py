@@ -125,6 +125,42 @@ def _looks_context_dependent_opening(text: str) -> bool:
     return any(stripped.startswith(p) for p in models.CONTEXT_DEPENDENT_OPENING_PREFIXES)
 
 
+# A short trailing clause that's nothing but a bare topic/case particle,
+# with no terminal punctuation reached anywhere in the hook, reads as
+# "started, but never arrived at a claim/question/fact"
+# (e.g. "一般的な車、エンジン車は、"). Length-gated so a long,
+# already-substantial hook that happens to trail into the next segment on
+# a topic marker -- the explicitly-preserved "chronological continuation"
+# case (see _is_chronological_continuation) -- is never penalized; only a
+# hook that is STILL short by the time it dangles is flagged.
+_DANGLING_PARTICLE_ENDINGS = ("は、", "が、", "を、", "に、", "で、", "と、", "も、")
+_HOOK_INCOMPLETE_MAX_CHARS = 30
+
+
+def _looks_like_hook_incomplete_thought(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or _ends_with_terminal_punctuation(stripped):
+        return False
+    return stripped.endswith(_DANGLING_PARTICLE_ENDINGS) and len(stripped) <= _HOOK_INCOMPLETE_MAX_CHARS
+
+
+def _body_disfluency_marker(
+    raw: RawClipCandidate, transcript: Transcript
+) -> tuple[str, str] | None:
+    """Checks every resolved segment *other than* the hook (context/
+    answer/payoff) for a word-search/self-correction marker
+    (models.has_speech_disfluency) -- a strong hook never excuses a
+    garbled body. Returns (segment_role, matched_marker) for the first
+    one found, or None if every non-hook segment is clean.
+    """
+    resolved = boundary.resolve_candidate(raw, transcript, candidate_id="_tmp")
+    for seg in resolved.segments[1:]:
+        marker = models.has_speech_disfluency(seg.text)
+        if marker is not None:
+            return (seg.role, marker)
+    return None
+
+
 def _force_first_segment_is_hook(raw: RawClipCandidate) -> None:
     """The first segment of a candidate must be tagged role=hook (this is a
     labeling/consistency requirement, not a semantic judgement -- whatever
@@ -712,6 +748,8 @@ LocalRejectReason = Literal[
     "duration_too_long",
     "hook_strength_below_80",
     "weak_opening_prefix",
+    "speech_disfluency",
+    "hook_incomplete_thought",
     "context_dependent_opening",
     "unsafe_junction",
     "accepted",
@@ -728,6 +766,7 @@ LocalRejectReason = Literal[
 # any diagnostic report.
 RepairMethod = Literal[
     "opening_trim",
+    "disfluency_trim",
     "prepend_previous_1",
     "prepend_previous_2",
     "prepend_previous_3",
@@ -774,6 +813,7 @@ class RepairAttemptDiagnostic:
     accepted: bool = False
     reject_reason: LocalRejectReason | None = None
     junction_reason: JunctionRejectReason | None = None
+    disfluency_detail: str | None = None
     duration_sec: float = 0.0
     opening_text: str = ""
 
@@ -802,6 +842,11 @@ class LocalCandidateEvaluation:
     opening_text: str = ""
     duration_sec: float = 0.0
     junction_reason: JunctionRejectReason | None = None
+    # Set only when reason is "speech_disfluency" or "hook_incomplete_
+    # thought": "<segment_role>: <matched marker or trailing text>" (e.g.
+    # "hook: 表現が難しい", "context: っていうのか+違って") -- named which
+    # segment and what was matched, never the full candidate text.
+    disfluency_detail: str | None = None
     internal_extension_applied: bool = False
     final_extension_applied: bool = False
     # Set only by evaluate_local_candidate_with_repair when a repair
@@ -856,10 +901,21 @@ def evaluate_local_candidate(
        "duration_too_short" / "duration_too_long"
     7. opening_hook_strength vs config.MIN_OPENING_HOOK_STRENGTH ->
        "hook_strength_below_80" (named for the current default; see
-       config.py for the live threshold)
+       config.py for the live threshold) -- this AI self-rating can never
+       override the fluency checks below it: a real-machine incident had
+       a disfluent, unfinished hook self-rated 85/100.
     8. _looks_like_weak_opening on the resolved opening
        (models.WEAK_OPENING_PREFIXES) -> "weak_opening_prefix"
-    9. evaluate_candidate_junctions -- the hook itself opening on a
+    9. models.has_speech_disfluency on the resolved opening (word-search/
+       self-correction, e.g. "実は逆っていうのか、間違っていて") ->
+       "speech_disfluency"; then _looks_like_hook_incomplete_thought (a
+       short, punctuation-less hook dangling on a bare topic/case
+       particle, never reaching a claim/question/fact) ->
+       "hook_incomplete_thought"; then the same disfluency check against
+       every *other* resolved segment (context/answer/payoff -- a
+       disfluent body is enough to fail the whole candidate even with a
+       strong hook) -> "speech_disfluency"
+    10. evaluate_candidate_junctions -- the hook itself opening on a
        dangling reference maps to "context_dependent_opening"
        (junction_reason="hook_context_dependent"); an unsafe A->B cut
        elsewhere maps to "unsafe_junction" (junction_reason=
@@ -885,12 +941,14 @@ def evaluate_local_candidate(
     duration_sec = _candidate_duration(c, transcript)
 
     def _rejected(
-        reason: LocalRejectReason, junction_reason: JunctionRejectReason | None = None
+        reason: LocalRejectReason,
+        junction_reason: JunctionRejectReason | None = None,
+        disfluency_detail: str | None = None,
     ) -> LocalCandidateEvaluation:
         return LocalCandidateEvaluation(
             accepted=False, reason=reason, candidate=c,
             opening_text=opening_text, duration_sec=duration_sec,
-            junction_reason=junction_reason,
+            junction_reason=junction_reason, disfluency_detail=disfluency_detail,
             internal_extension_applied=internal_extension_applied,
             final_extension_applied=final_extension_applied,
         )
@@ -910,6 +968,16 @@ def evaluate_local_candidate(
         return _rejected("hook_strength_below_80")
     if _looks_like_weak_opening(opening_text):
         return _rejected("weak_opening_prefix")
+
+    hook_marker = models.has_speech_disfluency(opening_text)
+    if hook_marker is not None:
+        return _rejected("speech_disfluency", disfluency_detail=f"hook: {hook_marker}")
+    if _looks_like_hook_incomplete_thought(opening_text):
+        return _rejected("hook_incomplete_thought", disfluency_detail=f"hook: {opening_text[-15:]}")
+    body_finding = _body_disfluency_marker(c, transcript)
+    if body_finding is not None:
+        body_role, body_marker = body_finding
+        return _rejected("speech_disfluency", disfluency_detail=f"{body_role}: {body_marker}")
 
     junction = evaluate_candidate_junctions(c, transcript)
     if not junction.safe:
@@ -960,6 +1028,35 @@ def _try_opening_trim_repair(
     trim_word = models.find_sequential_removable_prefix_word(hook_seg)
     if trim_word is None:
         return None, "no_removable_prefix"
+    anchor_text = "".join(w.text for w in hook_seg.words if w.start >= trim_word.start)
+    if not anchor_text:
+        return None, "trim_would_empty_segment"
+    new_hook = replace(hook, start_anchor_text=anchor_text)
+    return replace(candidate, segments=[new_hook] + candidate.segments[1:]), None
+
+
+def _try_disfluency_trim_repair(
+    candidate: RawClipCandidate, transcript: Transcript
+) -> tuple[RawClipCandidate | None, str | None]:
+    """Targets speech_disfluency when it was the *hook's own* opening
+    that triggered it: if the hook's disfluency is confined to a short,
+    comma-delimited preamble followed by an independent clean remainder
+    (models.find_disfluent_hook_repair_point), sets start_anchor_text to
+    that remainder's real text so boundary.py starts playback there.
+    Never guesses -- returns (None, skip_reason) if there's nothing
+    safely repairable: "no_word_timestamps", "no_repairable_disfluency"
+    (the disfluency isn't confined to a skippable preamble -- most often
+    because the body, not the hook, is where the marker matched, which
+    this repair can't fix; see _try_drop_optional_segment_repairs instead),
+    or "trim_would_empty_segment". Returns (candidate, None) on success.
+    """
+    hook = candidate.segments[0]
+    hook_seg = transcript.segment_by_id(hook.start_segment_id)
+    if not hook_seg.words:
+        return None, "no_word_timestamps"
+    trim_word = models.find_disfluent_hook_repair_point(hook_seg)
+    if trim_word is None:
+        return None, "no_repairable_disfluency"
     anchor_text = "".join(w.text for w in hook_seg.words if w.start >= trim_word.start)
     if not anchor_text:
         return None, "trim_would_empty_segment"
@@ -1156,6 +1253,9 @@ def _build_repair_candidates(
     only from real transcript text/word timestamps/existing segments (see
     each _try_*_repair*'s docstring) -- nothing here ever authors new
     speech, reorders words within a sentence, or guesses a timestamp.
+    hook_incomplete_thought has no known repair either (a hook that never
+    delivered a claim within its own segment isn't fixable by mechanically
+    skipping a preamble) -- yields an empty list, same as the others.
     """
     if reason == "context_dependent_opening":
         trimmed, skip = _try_opening_trim_repair(candidate, transcript)
@@ -1168,6 +1268,20 @@ def _build_repair_candidates(
 
     if reason == "incomplete_final_ending":
         return _try_hook_repeat_payoff_repairs(candidate, transcript)
+
+    if reason == "speech_disfluency":
+        # Tries both directions: disfluency_trim only helps when the
+        # *hook's own* opening was the culprit (skips its disfluent
+        # preamble); dropping an optional segment helps when a body
+        # (context/answer/payoff) segment was the culprit instead. Either
+        # way, the repaired variant is re-run through the exact same
+        # evaluate_local_candidate, so a variant that merely relocates the
+        # disfluency (rather than removing it) is rejected again, not
+        # silently accepted.
+        trimmed, skip = _try_disfluency_trim_repair(candidate, transcript)
+        return [RepairBuildResult("disfluency_trim", trimmed, skip)] + _try_drop_optional_segment_repairs(
+            candidate
+        )
 
     return []
 
@@ -1236,6 +1350,7 @@ def evaluate_local_candidate_with_repair(
             method=r.method, generated=True, accepted=repaired.accepted,
             reject_reason=None if repaired.accepted else repaired.reason,
             junction_reason=repaired.junction_reason,
+            disfluency_detail=repaired.disfluency_detail,
             duration_sec=repaired.duration_sec, opening_text=repaired.opening_text,
         ))
         if repaired.accepted:
@@ -1280,6 +1395,8 @@ _LOCAL_REJECT_REASON_LABELS: dict[str, str] = {
     "duration_too_long": "尺超過(50秒超)",
     "hook_strength_below_80": "hook強度不足",
     "weak_opening_prefix": "弱い導入句",
+    "speech_disfluency": "言い淀み・自己修正",
+    "hook_incomplete_thought": "hookが未完結",
     "context_dependent_opening": "文脈依存の冒頭",
     "unsafe_junction": "カット接続不自然",
 }
@@ -1334,6 +1451,8 @@ def _format_diagnostic_summary(evaluations: list[LocalCandidateEvaluation]) -> s
         )
         if e.junction_reason:
             detail += f" junction={e.junction_reason}"
+        if e.disfluency_detail:
+            detail += f" disfluency={e.disfluency_detail}"
         lines.append(detail)
 
         # Full per-method repair breakdown, so a rejection that survived
@@ -1350,6 +1469,8 @@ def _format_diagnostic_summary(evaluations: list[LocalCandidateEvaluation]) -> s
                 a_detail = f"  - {a.method} → reject={a.reject_reason}"
                 if a.junction_reason:
                     a_detail += f" junction={a.junction_reason}"
+                if a.disfluency_detail:
+                    a_detail += f" disfluency={a.disfluency_detail}"
                 a_detail += f" duration={a.duration_sec:.1f}秒"
                 lines.append(a_detail)
 
@@ -1453,6 +1574,13 @@ def finalize_candidates(
     re-applies _extend_internal_junctions/_has_overlapping_segments/
     _validate_candidate_junctions, the identical junction-safety rules
     _filter_local_quality uses, so a cache hit can never bypass them.
+    The speech-fluency veto (models.has_speech_disfluency /
+    _looks_like_hook_incomplete_thought) is re-checked here too -- this is
+    the *only* enforcement point a cache-hit or web.py's render path
+    (_run_render, which reads cache.load_stage2 directly) ever goes
+    through, so a candidate already sitting in a stale Stage2 cache from
+    before this check existed is caught on its very next read, without
+    needing a fresh Stage1/Stage2 re-analysis.
 
     select_candidates and refresh_candidates_only both call this on every
     return path -- and, critically, *before* cache.save_stage2 rather than
@@ -1484,6 +1612,13 @@ def finalize_candidates(
             continue
         if not _validate_candidate_junctions(extended, transcript):
             continue
+        opening_text = _opening_text(extended, transcript)
+        if models.has_speech_disfluency(opening_text) is not None:
+            continue
+        if _looks_like_hook_incomplete_thought(opening_text):
+            continue
+        if _body_disfluency_marker(extended, transcript) is not None:
+            continue
         dur = _candidate_duration(extended, transcript)
         if config.DURATION_HARD_MIN_SEC <= dur <= config.DURATION_HARD_MAX_SEC:
             finalized.append(extended)
@@ -1491,7 +1626,8 @@ def finalize_candidates(
     if len(finalized) < config.NUM_CANDIDATES:
         raise RuntimeError(
             "保存済み候補のうち、自然な発話終端を確保できない候補（例: 「〜ので」等の"
-            "継続表現で終わっており、これ以上延長できないもの）、または延長後の尺が"
+            "継続表現で終わっており、これ以上延長できないもの）、発話の流暢性チェックに"
+            "失敗した候補（言い淀み・自己修正・未完のhook）、または延長後の尺が"
             f"目標範囲（{config.DURATION_HARD_MIN_SEC:.0f}〜{config.DURATION_HARD_MAX_SEC:.0f}秒）"
             f"を外れる候補があり、有効な{config.NUM_CANDIDATES}候補を確保できませんでした"
             f"（有効{len(finalized)}件）。再解析が必要です。APIへの自動再要求は行いません。"

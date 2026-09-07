@@ -7,7 +7,9 @@ from podcast_clipper.models import (
     TranscriptSegment,
     TranscriptWord,
     UsedSegment,
+    find_disfluent_hook_repair_point,
     find_opening_trim_point,
+    has_speech_disfluency,
 )
 
 
@@ -155,3 +157,118 @@ def test_find_opening_trim_point_returns_none_when_prefix_is_last_word():
     words = _words(("このように", 0.0, 0.55))
     seg = TranscriptSegment(id=0, start=0.0, end=0.55, text="このように", words=words)
     assert find_opening_trim_point(seg) is None
+
+
+# --- has_speech_disfluency (real-machine incident: word-search / -------
+# --- self-correction detection) -----------------------------------------
+
+
+def test_has_speech_disfluency_detects_word_search_marker():
+    marker = has_speech_disfluency(
+        "タイヤが丸い状態になるので、ちょっと表現が難しいんですけども、接地面が丸くなるので"
+    )
+    assert marker is not None
+    assert "表現が難しい" in marker
+
+
+def test_has_speech_disfluency_detects_self_correction_reversal_before_connective():
+    # "逆" (reversal marker) appears *before* the connective "っていうのか"
+    # -- proximity check must be bidirectional, not just connective-then-
+    # marker order.
+    marker = has_speech_disfluency("でもこれって、実は逆っていうのか、間違っていて")
+    assert marker is not None
+
+
+def test_has_speech_disfluency_detects_self_correction_reversal_after_connective():
+    marker = has_speech_disfluency("燃費改善というか、違ってて")
+    assert marker is not None
+
+
+def test_has_speech_disfluency_detects_standalone_correction_phrase():
+    marker = has_speech_disfluency("いや、そうじゃなくて、これはニュートラルの話です。")
+    assert marker is not None
+
+
+def test_has_speech_disfluency_ignores_benign_kanjishi_looking_particle():
+    # っていうの"が" (nominalizer) is NOT っていうの"か" (reformulation) --
+    # must not be confused by substring overlap.
+    assert has_speech_disfluency("ギアを入れてアクセルオフっていうのが、実はニュートラルよりも燃費は良いです") is None
+
+
+def test_has_speech_disfluency_does_not_reject_plain_reformulation_connective():
+    # A bare "というか" used as an ordinary paraphrase connective, with no
+    # nearby reversal/negation signal, must never be treated as
+    # self-correction on its own.
+    assert has_speech_disfluency("燃費改善というか、時短のためにやっています。") is None
+
+
+def test_has_speech_disfluency_does_not_reject_single_hesitation_filler():
+    assert has_speech_disfluency("あの、今日はいい天気ですね。") is None
+    assert has_speech_disfluency("まあ、そういうことです。") is None
+
+
+# --- find_disfluent_hook_repair_point (bounded, word-timestamp-only ----
+# --- repair of a disfluent hook preamble) --------------------------------
+
+
+def _clause_words(*texts: str) -> list[TranscriptWord]:
+    """Word list where each string in `texts` is its own single "word"
+    (already comma-terminated where relevant) -- sufficient for testing
+    clause-boundary detection, which only looks at trailing commas.
+    """
+    words = []
+    t = 0.0
+    for text in texts:
+        words.append(TranscriptWord(start=t, end=t + 0.5, text=text))
+        t += 0.5
+    return words
+
+
+def test_find_disfluent_hook_repair_point_repairs_clean_case():
+    # A word-search filler clause immediately followed by an independent,
+    # disfluency-free complete sentence -- exactly the "safe to repair"
+    # shape (item 6: repair only when the rest of the segment is clean).
+    words = _clause_words("ちょっと表現が難しいんですけども、", "要するに新品タイヤは長持ちします。")
+    seg = TranscriptSegment(id=0, start=0.0, end=1.0, text="".join(w.text for w in words), words=words)
+    repair = find_disfluent_hook_repair_point(seg)
+    assert repair is not None
+    assert repair.text == "要するに新品タイヤは長持ちします。"
+
+
+def test_find_disfluent_hook_repair_point_declines_when_disfluency_recurs():
+    words = _clause_words(
+        "ちょっと表現が難しいんですけども、",
+        "こういうことなんですが、",
+        "また表現が難しいんですけど、",
+        "結局はこういうことです。",
+    )
+    seg = TranscriptSegment(id=0, start=0.0, end=2.0, text="".join(w.text for w in words), words=words)
+    assert find_disfluent_hook_repair_point(seg) is None
+
+
+def test_find_disfluent_hook_repair_point_declines_candidate3_shaped_hook():
+    # The real "candidate 3" incident shape: a disfluent clause
+    # ("実は逆っていうのか、") followed by a bare continuative clause
+    # ("間違っていて、") that's still grammatically glued to it (not an
+    # independent clean clause) -- must never be "repaired" into starting
+    # playback mid-correction. This must be rejected outright, not
+    # force-rescued.
+    words = _clause_words(
+        "でもこれって、", "実は逆っていうのか、", "間違っていて、", "一般的な車、", "エンジン車は、",
+    )
+    seg = TranscriptSegment(id=0, start=0.0, end=2.5, text="".join(w.text for w in words), words=words)
+    assert find_disfluent_hook_repair_point(seg) is None
+
+
+def test_find_disfluent_hook_repair_point_returns_none_without_word_timestamps():
+    seg = TranscriptSegment(
+        id=0, start=0.0, end=1.0,
+        text="ちょっと表現が難しいんですけども、要するにこうです。", words=[],
+    )
+    assert find_disfluent_hook_repair_point(seg) is None
+
+
+def test_find_disfluent_hook_repair_point_returns_none_when_nothing_disfluent():
+    words = _clause_words("これはとても分かりやすい説明です。")
+    seg = TranscriptSegment(id=0, start=0.0, end=0.5, text="".join(w.text for w in words), words=words)
+    assert find_disfluent_hook_repair_point(seg) is None

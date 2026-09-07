@@ -212,6 +212,151 @@ def find_sequential_removable_prefix_word(segment: TranscriptSegment) -> Transcr
     return words[idx] if idx > 0 else None
 
 
+# --- Speech fluency: word-search / self-correction / hesitation --------
+#
+# Real-machine incident: a candidate's hook and/or body text can be
+# fluent-looking on paper (no filler prefix, no context-dependent
+# pronoun) while still being the speaker visibly searching for words or
+# correcting themselves mid-thought -- a genuinely separate quality axis
+# from every check above, checked against the *whole* resolved candidate
+# (every segment, not just the opening) and treated as a hard local veto:
+# Claude's own opening_hook_strength self-rating must never override it
+# (a real "opening_hook_strength=85" case was written against this).
+
+# Meta-commentary about the act of speaking itself -- there is no natural,
+# benign use of "表現が難しい" etc. the way there is for a bare "というか",
+# so these are checked via plain substring containment anywhere in the
+# text (not just the start) and treated as an unconditional signal.
+WORD_SEARCH_MARKERS = (
+    "表現が難しい", "説明が難しい", "言い方が難しい",
+    "なんていうか", "なんて言うか", "なんていうんですかね",
+    "どう言えばいいか", "どう説明すれば",
+)
+
+# Self-correction: "というか"/"というより" are extremely common, entirely
+# benign connectives on their own, so a bare match on them is never
+# enough. They only count as self-correction when a nearby reversal/
+# negation word, or an immediately-following hesitation filler, confirms
+# the speaker is actually taking back what they just said (e.g. "実は逆
+# っていうのか" -- reversal marker "逆" appears *before* the connective;
+# "というか、違って" -- reversal marker appears after; "というより、えー"
+# -- trails straight into a hesitation filler).
+_REFORMULATION_CONNECTIVES = ("というのか", "っていうのか", "というか", "っていうか", "というより")
+_REVERSAL_MARKERS = ("じゃなくて", "ではなくて", "ではなく", "そうじゃな", "違って", "逆", "間違って", "訂正")
+_ADJACENT_HESITATION_FILLERS = ("えー", "えっと", "あの", "その")
+_PROXIMITY_WINDOW = 20  # chars on each side of the connective to search for a reversal marker
+_ADJACENT_WINDOW = 6  # chars immediately after the connective a hesitation filler must fall within
+
+# Standalone phrases unambiguous enough to need no nearby-connective check.
+_STANDALONE_SELF_CORRECTION_MARKERS = ("そうじゃなくて", "そうじゃない", "じゃなくて、", "ではなくて、")
+
+
+def has_speech_disfluency(text: str) -> str | None:
+    """Returns the matched marker (for diagnostics) if `text` contains a
+    word-search marker or a self-correction pattern, else None. This is
+    the single detector shared by clip_selector.py's local quality gate
+    and find_disfluent_hook_repair_point below, so the reject-check and
+    the repair-attempt can never disagree about what counts as disfluent.
+    """
+    for marker in WORD_SEARCH_MARKERS:
+        if marker in text:
+            return marker
+    for marker in _STANDALONE_SELF_CORRECTION_MARKERS:
+        if marker in text:
+            return marker
+    for connective in _REFORMULATION_CONNECTIVES:
+        idx = text.find(connective)
+        if idx == -1:
+            continue
+        window = text[max(0, idx - _PROXIMITY_WINDOW): idx + len(connective) + _PROXIMITY_WINDOW]
+        for marker in _REVERSAL_MARKERS:
+            if marker in window:
+                return f"{connective}+{marker}"
+        adjacent = text[idx + len(connective): idx + len(connective) + _ADJACENT_WINDOW]
+        for filler in _ADJACENT_HESITATION_FILLERS:
+            if filler in adjacent:
+                return f"{connective}+{filler}"
+    return None
+
+
+def _split_into_clauses(segment: TranscriptSegment) -> list[tuple[int, int, str]]:
+    """Groups segment.words into comma-delimited clauses using real word
+    text only (never estimating boundaries): each entry is
+    (start_word_index, end_word_index_exclusive, clause_text_incl_comma).
+    """
+    clauses: list[tuple[int, int, str]] = []
+    start = 0
+    accumulated = ""
+    for i, word in enumerate(segment.words):
+        accumulated += word.text
+        if word.text.endswith(("、", "，", ",")) or i == len(segment.words) - 1:
+            clauses.append((start, i + 1, accumulated))
+            start = i + 1
+            accumulated = ""
+    return clauses
+
+
+# A clause immediately following an already-disfluent one that ends in a
+# bare continuative form (te-form etc.) is still grammatically glued to
+# what was just skipped -- it can't stand alone as a hook opening even
+# though it triggers no marker of its own (e.g. "間違っていて、" right
+# after "実は逆っていうのか、"). Only applied to extend an already-started
+# skip run (never to a clean clause 0 on its own), so this can only make
+# the repair *more* conservative -- it never rejects a candidate outright,
+# it only ever declines to repair one, leaving the veto check to decide.
+_CONTINUATION_CLAUSE_SUFFIXES = ("て、", "で、", "し、", "くて、", "けど、", "ので、")
+
+
+def find_disfluent_hook_repair_point(
+    segment: TranscriptSegment, max_clauses_to_skip: int = 3
+) -> TranscriptWord | None:
+    """Bounded, deterministic repair for a hook whose disfluency is
+    confined to a short preamble: reads the segment's words as
+    comma-delimited clauses from the very start, and if the first (up to
+    max_clauses_to_skip) clauses are each disfluent (has_speech_disfluency,
+    a known _REPAIR_REMOVABLE_OPENING_PREFIXES phrase, or a bare
+    continuative clause directly extending an already-disfluent run -- see
+    _CONTINUATION_CLAUSE_SUFFIXES) and are followed by a clause that is
+    itself clean AND whose remainder (all the way to the end of the
+    segment) never re-triggers has_speech_disfluency, returns the first
+    word of that clean remainder so playback can start there instead.
+
+    Returns None (never guesses, never force-rescues) if: there's no
+    word-timestamp data, the disfluent preamble exceeds
+    max_clauses_to_skip, no clean remainder is ever reached within that
+    budget, or the disfluency recurs later in the segment -- a candidate
+    whose problem isn't confined to a skippable preamble is left for the
+    caller to reject outright, not repaired into something it never
+    actually said.
+    """
+    if not segment.words:
+        return None
+    clauses = _split_into_clauses(segment)
+    if len(clauses) < 2:
+        return None
+
+    in_disfluent_run = False
+    for idx, (start_idx, _end_idx, text) in enumerate(clauses):
+        if idx >= max_clauses_to_skip:
+            return None
+        stripped = text.rstrip("、，,")
+        is_disfluent_clause = (
+            has_speech_disfluency(text) is not None
+            or stripped in _REPAIR_REMOVABLE_OPENING_PREFIXES
+            or (in_disfluent_run and stripped.endswith(_CONTINUATION_CLAUSE_SUFFIXES))
+        )
+        if is_disfluent_clause:
+            in_disfluent_run = True
+            continue
+        if idx == 0:
+            return None  # first clause is already clean -- nothing to skip
+        remainder_text = "".join(c[2] for c in clauses[idx:])
+        if has_speech_disfluency(remainder_text) is not None:
+            return None  # disfluency recurs later -- don't force-rescue
+        return segment.words[start_idx]
+    return None  # every clause within the budget was disfluent -- unrepairable
+
+
 def find_anchor_start_word(segment: TranscriptSegment, anchor_text: str) -> TranscriptWord | None:
     """Locates an AI-chosen start_anchor_text (e.g. "86は" within a segment
     whose full text is "これも私の愛車である86はスープラを...") as an exact,

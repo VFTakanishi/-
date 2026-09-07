@@ -2955,3 +2955,341 @@ def test_refresh_stage1_and_candidates_does_not_overwrite_stage2_cache_when_fina
     reloaded = cache.load_stage2(transcript.video_id)
     assert len(reloaded) == 3
     assert all(c.segments[0].end_segment_id == 2 for c in reloaded)  # untouched old cache
+
+
+# --- speech fluency gate: real-machine incident (word-search/self- -------
+# --- correction/incomplete-thought hooks must be rejected, never a -------
+# --- matter of AI opening_hook_strength self-rating) ---------------------
+
+
+def test_evaluate_local_candidate_drops_body_disfluency(monkeypatch):
+    # A clean hook followed by a context segment where the speaker
+    # searches for words and re-explains the same content -- no check
+    # before this gate ever inspected body/context/answer/payoff text at
+    # all, so this must be the thing that catches it.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidBodyDisfluency", language="ja",
+        segments=[
+            _segment(0, start=0.0, text="Nレンジでの走行、高めの空気圧、これ全部損している可能性があります。"),
+            _segment(
+                1, start=5.0,
+                text="空気圧が高くなりすぎるとタイヤが丸い状態になるので、ちょっと表現が難しいんですけども、"
+                     "接地面が丸くなるので、実は転がり抵抗が増えるんです。",
+            ),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=1, end_segment_id=1),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=80, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.accepted is False
+    assert result.reason == "speech_disfluency"
+    assert result.disfluency_detail == "context: 表現が難しい"
+
+
+def test_evaluate_local_candidate_drops_the_real_candidate1_body(monkeypatch):
+    # Pinned against the exact real-machine incident text -- word-search
+    # marker sandwiched between two re-explanations of the same concept
+    # ("丸い状態になるので" / "丸くなるので").
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidCandidate1", language="ja",
+        segments=[
+            _segment(
+                0, start=0.0,
+                text="Nレンジでの走行、高めの空気圧、エアコンを切って窓を開ける。"
+                     "これ、全部損している可能性があります。",
+            ),
+            _segment(
+                1, start=5.0,
+                text="空気圧が高くなりすぎると、タイヤが丸い状態になるので、"
+                     "ちょっと表現が難しいんですけども、接地面が丸くなるので、",
+            ),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=1, end_segment_id=1),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=80, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.accepted is False
+    assert result.reason == "speech_disfluency"
+
+
+def test_evaluate_local_candidate_drops_incomplete_disfluent_hook(monkeypatch):
+    # The real "candidate 3" hook -- front-dependent, self-correcting, and
+    # trails off unfinished. opening_hook_strength=85 (a high AI
+    # self-rating, above config.MIN_OPENING_HOOK_STRENGTH) must never
+    # override the local veto.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidCandidate3", language="ja",
+        segments=[
+            _segment(0, start=0.0, text="でもこれって、実は逆っていうのか、間違っていて、一般的な車、エンジン車は、"),
+            _segment(1, start=5.0, text="アクセルオフのほうが実は効率がいいんです。"),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="answer", start_segment_id=1, end_segment_id=1),
+        ],
+        hook_text="h", opening_hook_strength=85, title="", description="",
+        score=80, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.accepted is False
+    assert result.reason == "speech_disfluency"
+    assert result.disfluency_detail is not None
+    assert result.disfluency_detail.startswith("hook:")
+
+
+def test_evaluate_local_candidate_keeps_natural_colloquial_hook(monkeypatch):
+    # A previously-good, natural colloquial hook must not be broken by
+    # the new gate -- "っていうのが" (nominalizer) is not "っていうのか"
+    # (reformulation connective).
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidNaturalHook", language="ja",
+        segments=[_segment(0, start=0.0, text="ギアを入れてアクセルオフっていうのが、実はニュートラルよりも燃費は良いです。")],
+    )
+    raw = _raw_candidate(0, 0, opening_hook_strength=90)
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.accepted is True
+
+
+def test_evaluate_local_candidate_keeps_plain_reformulation_connective(monkeypatch):
+    # A bare "というか" used as an ordinary paraphrase connective must
+    # never be rejected on its own.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidPlainConnective", language="ja",
+        segments=[_segment(0, start=0.0, text="燃費改善というか、時短のためにやっています。")],
+    )
+    raw = _raw_candidate(0, 0, opening_hook_strength=90)
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.accepted is True
+
+
+def test_evaluate_local_candidate_keeps_mild_filler_in_body(monkeypatch):
+    # A single "あの" mid-sentence in a body segment is normal,
+    # unremarkable speech -- must not trigger the fluency veto.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidMildFiller", language="ja",
+        segments=[
+            _segment(0, start=0.0, text="86はエンジン特性が独特です。"),
+            _segment(1, start=5.0, text="そこはですね、あの、少し複雑な話になるんですが、結論だけ言うと問題ありません。"),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=1, end_segment_id=1),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=80, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.accepted is True
+
+
+def test_repair_disfluency_trim_repairs_clean_hook_preamble(monkeypatch):
+    # A word-search filler clause immediately followed by an independent,
+    # clean complete sentence, with real word timestamps -- repair should
+    # move the start point past the filler via start_anchor_text.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="repairDisfluencyClean", language="ja",
+        segments=[
+            _segment_with_words(0, 0.0, "ちょっと表現が難しいんですけども、", "要するに新品タイヤは長持ちします。"),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
+        hook_text="h", opening_hook_strength=85, title="", description="",
+        score=85, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is True
+    assert result.repair_method == "disfluency_trim"
+    assert result.original_reason == "speech_disfluency"
+    resolved = boundary.resolve_candidate(result.candidate, transcript, candidate_id="c1")
+    assert resolved.segments[0].text.startswith("要するに")
+    assert "表現が難しい" not in resolved.segments[0].text
+
+
+def test_repair_disfluency_trim_declines_without_word_timestamps(monkeypatch):
+    # Same shape as the repair case above, but with no word-timestamp
+    # data at all -- must never guess a cut point, so the candidate stays
+    # rejected with no repair applied.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="repairDisfluencyNoWords", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=0, start=0.0, end=2.0,
+                text="ちょっと表現が難しいんですけども、要するに新品タイヤは長持ちします。",
+                words=[],
+            ),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
+        hook_text="h", opening_hook_strength=85, title="", description="",
+        score=85, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is False
+    assert result.reason == "speech_disfluency"
+    assert result.repair_method is None
+
+
+def test_repair_disfluency_trim_declines_candidate3_shaped_hook(monkeypatch):
+    # The real "candidate 3" incident shape: a disfluent clause followed
+    # by a bare continuative clause ("間違っていて、") still grammatically
+    # glued to it, not an independent clean clause -- must never be
+    # "repaired" into starting playback mid-correction. Rejected outright,
+    # not force-rescued (item 6's explicit instruction).
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="repairDisfluencyCandidate3", language="ja",
+        segments=[
+            _segment_with_words(
+                0, 0.0,
+                "でもこれって、", "実は逆っていうのか、", "間違っていて、", "一般的な車、", "エンジン車は、",
+            ),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
+        hook_text="h", opening_hook_strength=85, title="", description="",
+        score=85, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is False
+    assert result.reason == "speech_disfluency"
+    assert result.repair_method is None
+
+
+def test_repair_disfluency_drops_disfluent_body_segment(monkeypatch):
+    # When the hook itself is clean but a body (context/answer/payoff)
+    # segment is disfluent, disfluency_trim can't help (it only targets
+    # the hook's own preamble) -- dropping the offending optional segment
+    # (the existing drop_context_segment/drop_non_context_segment repair)
+    # rescues the candidate instead.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="repairDisfluencyDropBody", language="ja",
+        segments=[
+            _segment(0, start=0.0, text="空気圧管理は重要なポイントです。多くの人が見落としています。"),
+            _segment(
+                1, start=5.0,
+                text="空気圧が高くなりすぎるとタイヤが丸い状態になるので、ちょっと表現が難しいんですけども、"
+                     "接地面が丸くなるので、実は転がり抵抗が増えるんです。",
+            ),
+        ],
+    )
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=1, end_segment_id=1),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=80, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate_with_repair(candidate, transcript)
+    assert result.accepted is True
+    assert result.repair_method == "drop_context_segment"
+    assert result.original_reason == "speech_disfluency"
+    assert len(result.candidate.segments) == 1
+
+
+def test_diagnostic_summary_shows_disfluency_reason_segment_and_marker(monkeypatch):
+    # Diagnostic output should name the reason/segment/marker, not dump
+    # the full candidate text.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidDiagDisfluency", language="ja",
+        segments=[_segment(0, start=0.0, text="ちょっと表現が難しいんですけども、要するにこうです。")],
+    )
+    raw = _raw_candidate(0, 0, opening_hook_strength=90)
+
+    evaluations = clip_selector._evaluate_all_local_candidates([raw], transcript)
+    summary = clip_selector._format_diagnostic_summary(evaluations)
+
+    assert "reject=speech_disfluency" in summary
+    assert "disfluency=hook: 表現が難しい" in summary
+
+
+def test_finalize_candidates_also_rejects_disfluent_candidates(monkeypatch):
+    # The cache-hit / render-defensive enforcement point
+    # (finalize_candidates) must independently apply the same fluency
+    # veto -- not just the fresh-selection path (_filter_local_quality).
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidFinalizeDisfluency", language="ja",
+        segments=[_segment(0, start=0.0, text="ちょっと表現が難しいんですけども、要するにこうです。")],
+    )
+    raw = _raw_candidate(0, 0, opening_hook_strength=90)
+
+    with pytest.raises(RuntimeError, match="流暢性"):
+        clip_selector.finalize_candidates([raw, raw, raw], transcript)
+
+
+def test_select_candidates_cache_hit_rejects_disfluent_cached_candidates(monkeypatch):
+    # The exact real-world scenario this whole gate exists for: a
+    # disfluent candidate already sitting in a stale Stage2 cache (from
+    # before this gate existed) must be caught on its very next read,
+    # with zero Anthropic API calls -- no re-analysis needed.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidCacheHitDisfluency", language="ja",
+        segments=[_segment(0, start=0.0, text="ちょっと表現が難しいんですけども、要するにこうです。")],
+    )
+    stale_bad = _raw_candidate(0, 0, opening_hook_strength=90)
+    cache.save_stage2(transcript.video_id, [stale_bad] * 3)
+
+    with pytest.raises(RuntimeError, match="流暢性"):
+        clip_selector.select_candidates(transcript, "タイトル")
