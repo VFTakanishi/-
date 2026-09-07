@@ -695,15 +695,18 @@ class RawUsedSegment:
     segment's own start) if it doesn't match exactly.
 
     end_anchor_text is the symmetric counterpart for the *end* of the
-    end_segment_id transcript segment -- but unlike start_anchor_text,
-    Claude never sets this (it is not a field on Stage1SegmentOutput at
-    all). It exists purely for clip_selector.py's own deterministic,
-    API-0 duration_too_long repair (_try_end_trim_repairs): the real
-    text from the segment's own start through a natural, confidently-
-    complete internal clause boundary (models.find_natural_end_trim_
-    points), verified the same way at resolve time (models.
-    find_anchor_end_word) and falling back to "no trim" (the segment's
-    own natural end) if it doesn't match exactly.
+    end_segment_id transcript segment. Two sources set it: clip_
+    selector.py's own deterministic, API-0 duration_too_long repair
+    (_try_end_trim_repairs -- the real text from the segment's own start
+    through a natural, confidently-complete internal clause boundary,
+    models.find_natural_end_trim_points), and -- since the Stage2
+    final-edit-design redesign -- Stage2 itself (Stage2SegmentOutput has
+    an end_anchor_text field Stage1SegmentOutput does not), when it needs
+    to end a segment it designed at an earlier natural point than the
+    segment's own real end. Either way it is verified identically at
+    resolve time (models.find_anchor_end_word) and falls back to "no
+    trim" (the segment's own natural end) if it doesn't match real
+    transcript text exactly -- never AI-authored replacement text.
     """
 
     role: SegmentRole

@@ -94,10 +94,56 @@ class Stage1Output(BaseModel):
     )
 
 
-class Stage2RankingOutput(BaseModel):
+class Stage2SegmentOutput(BaseModel):
+    """Identical shape to Stage1SegmentOutput, plus one addition:
+    end_anchor_text. Unlike start_anchor_text (which Stage1 can also set),
+    end_anchor_text is a genuinely new capability -- Stage2 designs the
+    final candidate, so it needs the same word-boundary-verified control
+    over where a segment *ends* that Stage1 already had over where it
+    *starts*. Both anchors are verified the identical way at resolve
+    time (models.find_anchor_start_word / find_anchor_end_word) and
+    silently fall back to "no trim" if they don't match real transcript
+    text exactly -- never AI-authored replacement text.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    ranked_candidate_ids: list[str]
+    role: Literal["hook", "context", "answer", "payoff"]
+    start_segment_id: int
+    end_segment_id: int
+    start_anchor_text: str | None = Field(default=None, min_length=1, max_length=60)
+    end_anchor_text: str | None = Field(default=None, min_length=1, max_length=60)
+
+
+class Stage2CandidateOutput(BaseModel):
+    """Identical shape to Stage1CandidateOutput. Stage2 now designs
+    complete final candidates (not just a ranking of Stage1's own), so it
+    re-scores opening_hook_strength/score itself for whatever it actually
+    constructed -- these are never copied forward from a source material,
+    since a recombined candidate's real opening/overall quality can differ
+    from any single material it drew from.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    hook_type: Literal["open_loop", "strong_take", "surprising_fact", "story"]
+    segments: list[Stage2SegmentOutput] = Field(min_length=1, max_length=3)
+    opening_hook_strength: int = Field(ge=0, le=100)
+    score: int = Field(ge=0, le=100)
+
+
+class Stage2Output(BaseModel):
+    """Replaces the old ranking-only Stage2RankingOutput. min_length=0 lets
+    Stage2 return fewer than config.NUM_CANDIDATES designs when it can't
+    construct that many that satisfy semantic closure -- the caller must
+    never pad this back up (see _design_finalize_and_cache). max_length
+    enforces "never more than NUM_CANDIDATES" at the schema level, so
+    Stage2 can't return an oversized list to begin with.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: list[Stage2CandidateOutput] = Field(min_length=0, max_length=config.NUM_CANDIDATES)
 
 
 # Weak "warm-up" openings explicitly called out as unacceptable: a mechanical
@@ -255,6 +301,41 @@ def _raw_candidate_from_stage1_output(
         segments=segments,
         hook_text=_deterministic_hook_text(
             segments[0].start_segment_id, segments[0].start_anchor_text, chunk_segments
+        ),
+        opening_hook_strength=c.opening_hook_strength,
+        title="",
+        description="",
+        score=c.score,
+        reasoning="",
+        caveats="",
+    )
+
+
+def _raw_candidate_from_stage2_output(
+    c: Stage2CandidateOutput, all_segments: list[TranscriptSegment]
+) -> RawClipCandidate:
+    """The Stage2 mirror of _raw_candidate_from_stage1_output -- identical
+    conversion, plus copying end_anchor_text. Takes the transcript's full
+    segment list (not one chunk's) since Stage2 designs a final candidate
+    by freely referencing segment_ids from *any* Stage1 material, not
+    just ones that happened to share a chunk; _deterministic_hook_text's
+    linear id lookup works identically either way.
+    """
+    segments = [
+        RawUsedSegment(
+            role=s.role,
+            start_segment_id=s.start_segment_id,
+            end_segment_id=s.end_segment_id,
+            start_anchor_text=s.start_anchor_text,
+            end_anchor_text=s.end_anchor_text,
+        )
+        for s in c.segments
+    ]
+    return RawClipCandidate(
+        hook_type=c.hook_type,
+        segments=segments,
+        hook_text=_deterministic_hook_text(
+            segments[0].start_segment_id, segments[0].start_anchor_text, all_segments
         ),
         opening_hook_strength=c.opening_hook_strength,
         title="",
@@ -1588,7 +1669,12 @@ def _format_diagnostic_summary(evaluations: list[LocalCandidateEvaluation]) -> s
     for e in evaluations:
         counts[e.reason] = counts.get(e.reason, 0) + 1
 
-    lines = ["", "【診断】", f"Stage1候補: {len(evaluations)}件", f"通過: {accepted}件"]
+    # Label is deliberately generic ("評価対象候補", not "Stage1候補"): this
+    # function is shared by diagnose_local_filter (evaluating Stage1's raw
+    # materials directly) and _design_finalize_and_cache's error message
+    # (evaluating Stage2's designed final candidates) -- "Stage1候補"
+    # would be inaccurate for the latter.
+    lines = ["", "【診断】", f"評価対象候補: {len(evaluations)}件", f"通過: {accepted}件"]
     if repaired:
         lines.append(f"（うちローカル自動修復: {repaired}件）")
     lines += ["", "不合格内訳:"]
@@ -1668,57 +1754,124 @@ def diagnose_local_filter(transcript: Transcript) -> list[LocalCandidateEvaluati
     return _evaluate_all_local_candidates(stage1_candidates, transcript)
 
 
-def _stage2_summary(candidate_id: str, raw: RawClipCandidate, transcript: Transcript) -> dict:
-    """Builds the compact per-candidate summary Stage2 sees -- never the
-    full transcript. Stage1 already narrowed the search space to a
-    handful of candidates, so Stage2 only needs enough to rank/dedupe
-    them: the real text they'd actually use, their duration, and their
-    Stage1 scores.
+def _material_is_usable(raw: RawClipCandidate, transcript: Transcript) -> bool:
+    """The only filter a Stage1 *material* goes through before being shown
+    to Stage2 -- deliberately much lighter than evaluate_local_candidate.
+    A material is recall-priority raw ingredient, not a final candidate:
+    it doesn't need to stand alone at 20-50s, have a confidently complete
+    ending, or form a safe junction with anything, because Stage2 (not
+    Stage1) is now responsible for assembling those properties into the
+    final design. What's checked here is only what's disqualifying no
+    matter which role a piece of material eventually plays: real segment
+    references, and speech that's actively broken (word-search/self-
+    correction, or an abandoned-and-restarted clause) -- reusing models.
+    has_speech_disfluency and _candidate_speech_restart_marker exactly as
+    evaluate_local_candidate does, rather than inventing a new detector.
+    Duration/ending-completeness/junction-safety/hook-strength/weak-
+    opening are deliberately NOT checked here; they're re-checked (via the
+    unchanged evaluate_local_candidate_with_repair) against whatever
+    Stage2 actually designs, since only *that* is a claimed-final
+    candidate.
     """
-    resolved = boundary.resolve_candidate(raw, transcript, candidate_id=candidate_id)
-    segments_text = "\n".join(f"[{s.role}] {s.text}" for s in resolved.segments)
+    try:
+        for s in raw.segments:
+            transcript.segment_by_id(s.start_segment_id)
+            transcript.segment_by_id(s.end_segment_id)
+    except KeyError:
+        return False
+    resolved = boundary.resolve_candidate(raw, transcript, candidate_id="_material_check")
+    for seg in resolved.segments:
+        if models.has_speech_disfluency(seg.text) is not None:
+            return False
+    if _candidate_speech_restart_marker(raw, transcript) is not None:
+        return False
+    return True
+
+
+def _stage2_material_summary(material_id: str, raw: RawClipCandidate, transcript: Transcript) -> dict:
+    """Builds the compact per-material summary Stage2 sees -- never the
+    full transcript. Unlike the old ranking-only _stage2_summary (one
+    joined segments_text string per candidate), this exposes each
+    segment's own start_segment_id/end_segment_id and real timing/text
+    individually, since Stage2 now needs to reference (and recombine)
+    real segment ids across *different* materials to design a final
+    candidate, not just judge a pre-joined block of text.
+    """
+    resolved = boundary.resolve_candidate(raw, transcript, candidate_id=material_id)
     return {
-        "candidate_id": candidate_id,
+        "material_id": material_id,
         "hook_type": raw.hook_type,
         "opening_hook_strength": raw.opening_hook_strength,
         "score": raw.score,
-        "duration_sec": round(resolved.total_duration, 1),
-        "segments_text": segments_text,
+        "segments": [
+            {
+                "role": seg.role,
+                "start_segment_id": raw_seg.start_segment_id,
+                "end_segment_id": raw_seg.end_segment_id,
+                "text": seg.text,
+                "start_sec": round(seg.start, 1),
+                "end_sec": round(seg.end, 1),
+            }
+            for seg, raw_seg in zip(resolved.segments, raw.segments)
+        ],
     }
 
 
-def rank_candidates(
-    id_map: dict[str, RawClipCandidate], transcript: Transcript, video_title: str
-) -> list[str]:
-    """Stage2: ranking only. Claude sees compact per-candidate summaries
-    (never the full transcript) and returns nothing but an ordered list of
-    candidate ids -- no new title/description/reasoning/caveats/hook_text
-    is generated here. Unknown or duplicate ids in the response are
-    filtered out (referential-integrity check, not JSON repair); the
-    caller decides what to do if too few valid ids remain.
+def _dedupe_by_segment_sequence(candidates: list[RawClipCandidate]) -> list[RawClipCandidate]:
+    """Safety-net dedup for Stage2's own output: drops a later candidate
+    whose segment sequence -- (role, start_segment_id, end_segment_id,
+    start_anchor_text, end_anchor_text) for every segment, in order -- is
+    byte-identical to an earlier one's. rank_and_finalize.md also
+    instructs Stage2 not to design near-duplicate final candidates itself;
+    this only catches the cheap, exact-duplicate case deterministically,
+    it never judges "large overlap" (that nuance stays Stage2's editorial
+    call, same as before).
+    """
+    seen: set[tuple] = set()
+    deduped: list[RawClipCandidate] = []
+    for c in candidates:
+        key = tuple(
+            (s.role, s.start_segment_id, s.end_segment_id, s.start_anchor_text, s.end_anchor_text)
+            for s in c.segments
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(c)
+    return deduped
+
+
+def design_final_candidates(
+    materials: dict[str, RawClipCandidate], transcript: Transcript, video_title: str
+) -> list[RawClipCandidate]:
+    """Stage2: final edit design (replaces the old ranking-only Stage2).
+    Claude sees compact per-material summaries (never the full transcript)
+    and returns up to config.NUM_CANDIDATES fully-designed final
+    candidates -- real segment references it may freely recombine across
+    different materials, never new/fabricated speech. Exactly one
+    Anthropic call, exactly like before; the only difference from the old
+    rank_candidates is what Claude is asked to produce (a designed
+    candidate list, not an id ranking) and what it's given to work with
+    (per-segment ids/text/timing, not one joined text block per
+    candidate).
     """
     system_prompt = (_PROMPTS_DIR / "rank_and_finalize.md").read_text(encoding="utf-8")
-    summaries = [_stage2_summary(cid, c, transcript) for cid, c in id_map.items()]
+    summaries = [_stage2_material_summary(mid, m, transcript) for mid, m in materials.items()]
     user_content = (
         f"# 番組タイトル\n{video_title}\n\n"
-        f"# Stage1候補一覧（重複あり得る）\n{json.dumps(summaries, ensure_ascii=False, indent=2)}"
+        f"# Stage1素材一覧\n{json.dumps(summaries, ensure_ascii=False, indent=2)}"
     )
 
     parsed = structured_output.call(
-        Stage2RankingOutput,
+        Stage2Output,
         stage="Stage2",
         system_prompt=system_prompt,
         user_content=user_content,
         max_tokens=config.STAGE2_MAX_OUTPUT_TOKENS,
     )
 
-    seen: set[str] = set()
-    ranked: list[str] = []
-    for cid in parsed.ranked_candidate_ids:
-        if cid in id_map and cid not in seen:
-            seen.add(cid)
-            ranked.append(cid)
-    return ranked
+    candidates = [_raw_candidate_from_stage2_output(c, transcript.segments) for c in parsed.candidates]
+    return _dedupe_by_segment_sequence(candidates)
 
 
 def finalize_candidates(
@@ -1807,20 +1960,21 @@ def finalize_candidates(
 def select_candidates(
     transcript: Transcript, video_title: str, force_refresh: bool = False
 ) -> list[RawClipCandidate]:
-    """Runs Stage1 (per-chunk cached) -> local quality filter -> Stage2
-    (ranking only) and returns exactly config.NUM_CANDIDATES candidates.
-    Neither stage retries automatically: if the local filter leaves too
-    few candidates, or Stage2 doesn't return enough valid ids, this raises
-    immediately rather than requesting more from the API. Every return
-    path calls finalize_candidates *before* cache.save_stage2 (never
-    after), so the Stage2 cache on disk always holds the finalized
-    (ending-corrected, duration-validated) result -- a cache hit never
-    bypasses that correction, and render.py's cache.load_stage2 reads
-    (see web._run_render) always see the same finalized state the UI
-    already showed. A cache hit whose candidates are no longer
-    sufficiently valid (finalize_candidates raises) leaves the on-disk
-    cache completely untouched -- it is never overwritten with a
-    known-bad/insufficient result.
+    """Runs Stage1 (per-chunk cached, recall-priority materials) -> a
+    lightweight material prefilter -> Stage2 (final edit design) and
+    returns exactly config.NUM_CANDIDATES candidates. Neither stage
+    retries automatically: if no usable material survives the prefilter,
+    or too few of Stage2's designed candidates survive local validation,
+    this raises immediately rather than requesting more from the API.
+    Every return path calls finalize_candidates *before*
+    cache.save_stage2 (never after), so the Stage2 cache on disk always
+    holds the finalized (ending-corrected, duration-validated) result --
+    a cache hit never bypasses that correction, and render.py's
+    cache.load_stage2 reads (see web._run_render) always see the same
+    finalized state the UI already showed. A cache hit whose candidates
+    are no longer sufficiently valid (finalize_candidates raises) leaves
+    the on-disk cache completely untouched -- it is never overwritten
+    with a known-bad/insufficient result.
     """
     if not force_refresh:
         cached = cache.load_stage2(transcript.video_id)
@@ -1829,51 +1983,74 @@ def select_candidates(
             cache.save_stage2(transcript.video_id, finalized)
             return finalized
 
-    stage1_candidates = run_stage1(transcript, video_title, force_refresh=force_refresh)
-    evaluations = _evaluate_all_local_candidates(stage1_candidates, transcript)
-    filtered = [e.candidate for e in evaluations if e.accepted]
-    if len(filtered) < config.NUM_CANDIDATES:
+    stage1_materials = run_stage1(transcript, video_title, force_refresh=force_refresh)
+    usable_materials = [m for m in stage1_materials if _material_is_usable(m, transcript)]
+    if not usable_materials:
         raise RuntimeError(
-            f"ローカル品質フィルタを通過した候補が{len(filtered)}件しかありません"
-            f"（{config.NUM_CANDIDATES}件必要）。APIへの自動再要求は行いません。"
+            f"Stage1から得られた素材{len(stage1_materials)}件のうち、"
+            "参照整合性・発話品質の基本チェックを通過したものが0件でした。"
+            "APIへの自動再要求は行いません。"
+        )
+
+    return _design_finalize_and_cache(usable_materials, transcript, video_title)
+
+
+def _design_finalize_and_cache(
+    materials: list[RawClipCandidate], transcript: Transcript, video_title: str
+) -> list[RawClipCandidate]:
+    """Stage2 final-edit-design (at most once) -> the unchanged local
+    quality gate (evaluate_local_candidate_with_repair) -> the unchanged
+    finalize_candidates -> cache.save_stage2 on success only. Shared by
+    select_candidates, refresh_candidates_only, and
+    refresh_stage1_and_candidates so all three apply the identical final
+    correction/caching rule instead of each re-implementing it.
+
+    Unlike the old ranking-only design (which only had to referential-
+    integrity-check an id list), Stage2's designed candidates are brand
+    new RawClipCandidate structures that have never been validated at
+    all -- so this is the *first* point they ever go through evaluate_
+    local_candidate_with_repair (referential integrity, duration, ending
+    completeness, speech disfluency/restart, junction safety, hook
+    strength -- all unchanged code, see clip_selector.py's local-gate
+    section). A candidate Stage2 designed poorly (e.g. an invented
+    segment_id, or a duration outside bounds) is rejected here exactly
+    like any other candidate always has been; the local repair-before-
+    reject methods still apply as a safety net, matching item 7's "don't
+    delete existing gates yet."
+
+    If finalize_candidates raises (too few candidates remain eligible
+    after ending-completeness/duration re-validation), the Stage2 cache
+    is never touched -- callers only ever see either a full, cached,
+    finalized result or an exception, never a partially-written cache.
+    """
+    material_map = {f"s1_m{i:03d}": m for i, m in enumerate(materials)}
+    designed = design_final_candidates(material_map, transcript, video_title)
+
+    evaluations = _evaluate_all_local_candidates(designed, transcript)
+    # Stage2Output.candidates already caps at config.NUM_CANDIDATES for the
+    # real API path, but design_final_candidates is a normal function a
+    # caller/test can substitute directly (bypassing that schema) -- this
+    # truncation is the actual enforcement of "never more than
+    # NUM_CANDIDATES", not merely a mirror of the schema.
+    accepted = [e.candidate for e in evaluations if e.accepted][: config.NUM_CANDIDATES]
+    if len(accepted) < config.NUM_CANDIDATES:
+        # Stage2's prompt excludes a design entirely (rather than
+        # returning a broken one) when it can't satisfy semantic closure
+        # or duration bounds -- see rank_and_finalize.md. So "too few"
+        # here can mean Stage2 itself returned fewer than NUM_CANDIDATES
+        # designs, or it returned enough but one failed local validation
+        # (an invented segment_id, an unsafe junction, ...) -- either way,
+        # never padded to reach config.NUM_CANDIDATES, and never
+        # auto-retried.
+        raise RuntimeError(
+            f"Stage2が設計した完成candidateのうち、ローカル検証を通過したのは{len(accepted)}件です"
+            f"（{config.NUM_CANDIDATES}件必要）。フックが提示した問い・主張を本文で"
+            "回収できていない設計、または実在しないsegment参照・尺・接続の不備がある設計は"
+            "除外される仕様です。APIへの自動再要求は行いません。"
             + _format_diagnostic_summary(evaluations)
         )
 
-    return _rank_finalize_and_cache(filtered, transcript, video_title)
-
-
-def _rank_finalize_and_cache(
-    filtered: list[RawClipCandidate], transcript: Transcript, video_title: str
-) -> list[RawClipCandidate]:
-    """Stage2 ranking (at most once) -> finalize_candidates -> cache.save_stage2
-    on success only. Shared by select_candidates, refresh_candidates_only,
-    and refresh_stage1_and_candidates so all three apply the identical
-    final correction/caching rule instead of each re-implementing it. If
-    finalize_candidates raises (too few candidates remain eligible after
-    ending-completeness/duration re-validation), the Stage2 cache is never
-    touched -- callers only ever see either a full, cached, finalized
-    result or an exception, never a partially-written cache.
-    """
-    id_map = {f"s1_c{i:03d}": c for i, c in enumerate(filtered)}
-    ranked_ids = rank_candidates(id_map, transcript, video_title)
-    top_ids = ranked_ids[: config.NUM_CANDIDATES]
-    if len(top_ids) < config.NUM_CANDIDATES:
-        # Stage2's prompt now also excludes an id entirely (rather than
-        # merely ranking it low) when the candidate fails semantic closure
-        # -- a strong hook whose body never actually answers the
-        # question/claim it posed (see rank_and_finalize.md). So "too few
-        # ids" here can mean either referential-integrity noise (unknown/
-        # duplicate ids, already filtered in rank_candidates) or a
-        # legitimate closure failure -- either way, never padded to reach
-        # config.NUM_CANDIDATES, and never auto-retried.
-        raise RuntimeError(
-            f"Stage2が意味的に完結した候補IDを{len(top_ids)}件しか返しませんでした"
-            f"（{config.NUM_CANDIDATES}件必要）。フックが提示した問い・主張を本文で"
-            "回収できていない候補は除外される仕様です。APIへの自動再要求は行いません。"
-        )
-
-    finalists = [id_map[cid] for cid in top_ids]
-    finalized = finalize_candidates(finalists, transcript)
+    finalized = finalize_candidates(accepted, transcript)
     cache.save_stage2(transcript.video_id, finalized)
     return finalized
 
@@ -1903,73 +2080,66 @@ def refresh_candidates_only(
     transcript: Transcript, video_title: str
 ) -> list[RawClipCandidate]:
     """Low-cost re-selection: reuses the already-cached Transcript (passed
-    in by the caller) and Stage1 chunk cache, re-applies the current local
-    quality filter (opening trim / natural ending / duration / hook
-    strength), and -- only if that leaves enough candidates -- runs
-    Stage2 ranking exactly once. Never calls the Stage1 API and never
-    re-runs Whisper: this exists specifically so a candidate set that's
-    become insufficient after a local-rule change (e.g. the ending-
-    completeness fix) can be re-derived without paying for a full
-    Stage1+Stage2 re-analysis.
+    in by the caller) and Stage1 chunk cache, re-applies the current
+    material prefilter (_material_is_usable), and -- only if at least one
+    usable material remains -- runs Stage2 final-edit-design exactly
+    once. Never calls the Stage1 API and never re-runs Whisper: this
+    exists specifically so a candidate set that's become insufficient
+    after a local-rule change (e.g. the ending-completeness fix) can be
+    re-derived without paying for a full Stage1+Stage2 re-analysis.
 
-    Ignores any existing Stage2 cache -- a fresh Stage2 ranking always
+    Ignores any existing Stage2 cache -- a fresh Stage2 design always
     runs here -- but that Stage2 call is the *only* Anthropic API request
-    this function can ever make, and only after confirming enough valid
-    Stage1 candidates exist locally. Both failure paths below (missing
-    Stage1 cache, too few candidates after the local filter) raise before
-    ever calling rank_candidates, so they're guaranteed to cost 0 API
+    this function can ever make, and only after confirming at least one
+    usable Stage1 material exists locally. Both failure paths below
+    (missing Stage1 cache, zero usable materials) raise before ever
+    calling design_final_candidates, so they're guaranteed to cost 0 API
     calls. A full re-analysis (Stage1 from scratch) is never triggered
     automatically -- the caller must request that separately.
     """
-    stage1_candidates = _load_stage1_from_cache_only(transcript)
-    if stage1_candidates is None:
+    stage1_materials = _load_stage1_from_cache_only(transcript)
+    if stage1_materials is None:
         raise RuntimeError(
             "保存済みのStage1候補キャッシュが見つからないか不完全です。"
             "完全な再解析（Stage1からのやり直し）が必要です。"
         )
 
-    evaluations = _evaluate_all_local_candidates(stage1_candidates, transcript)
-    filtered = [e.candidate for e in evaluations if e.accepted]
-    if len(filtered) < config.NUM_CANDIDATES:
+    usable_materials = [m for m in stage1_materials if _material_is_usable(m, transcript)]
+    if not usable_materials:
         raise RuntimeError(
-            f"保存済みStage1候補のうちローカル品質フィルタを通過したのは{len(filtered)}件です"
-            f"（{config.NUM_CANDIDATES}件必要）。完全な再解析が必要です。"
-            + _format_diagnostic_summary(evaluations)
+            f"保存済みStage1素材{len(stage1_materials)}件のうち、"
+            "参照整合性・発話品質の基本チェックを通過したものが0件でした。完全な再解析が必要です。"
         )
 
-    return _rank_finalize_and_cache(filtered, transcript, video_title)
+    return _design_finalize_and_cache(usable_materials, transcript, video_title)
 
 
 def refresh_stage1_and_candidates(
     transcript: Transcript, video_title: str
 ) -> list[RawClipCandidate]:
     """Mid-cost re-analysis: reuses the already-cached Transcript (never
-    re-runs Whisper) but regenerates Stage1 candidates for every chunk via
+    re-runs Whisper) but regenerates Stage1 materials for every chunk via
     run_stage1(..., force_refresh=True) -- ignoring any existing Stage1
     chunk cache entirely -- because the whole point of this path is that
-    the old Stage1 candidates no longer clear the current local quality
-    filter (refresh_candidates_only, which only reuses cached Stage1
+    the old Stage1 materials no longer clear the current material
+    prefilter (refresh_candidates_only, which only reuses cached Stage1
     results, can't fix that). Each chunk's new result is still saved the
     moment it succeeds (run_stage1 -> cache.save_stage1_chunk), so a later
     chunk's API failure never discards an earlier chunk's freshly-paid-for
     result, and there are zero automatic retries either way
     (structured_output.py's max_retries=0, unchanged).
 
-    After Stage1, the identical local quality filter runs, and if fewer
-    than config.NUM_CANDIDATES candidates survive, this raises *before*
-    ever calling Stage2 ranking -- a mid-cost re-analysis attempt must
-    never silently cascade into more API spend than Stage1 (chunk count)
-    + at most one Stage2 call.
+    After Stage1, the identical material prefilter runs, and if zero
+    materials survive, this raises *before* ever calling Stage2 -- a
+    mid-cost re-analysis attempt must never silently cascade into more
+    API spend than Stage1 (chunk count) + at most one Stage2 call.
     """
-    stage1_candidates = run_stage1(transcript, video_title, force_refresh=True)
-    evaluations = _evaluate_all_local_candidates(stage1_candidates, transcript)
-    filtered = [e.candidate for e in evaluations if e.accepted]
-    if len(filtered) < config.NUM_CANDIDATES:
+    stage1_materials = run_stage1(transcript, video_title, force_refresh=True)
+    usable_materials = [m for m in stage1_materials if _material_is_usable(m, transcript)]
+    if not usable_materials:
         raise RuntimeError(
-            f"Stage1を再解析しましたが、現在の品質基準を満たす候補が{len(filtered)}件しか"
-            f"ありませんでした（{config.NUM_CANDIDATES}件必要）。"
-            "Stage2ランキングは実行していません。"
-            + _format_diagnostic_summary(evaluations)
+            f"Stage1を再解析しましたが、参照整合性・発話品質の基本チェックを通過した素材が"
+            f"{len(stage1_materials)}件中0件でした。Stage2は実行していません。"
         )
 
-    return _rank_finalize_and_cache(filtered, transcript, video_title)
+    return _design_finalize_and_cache(usable_materials, transcript, video_title)

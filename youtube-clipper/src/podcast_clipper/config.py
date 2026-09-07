@@ -18,16 +18,24 @@ OUTPUT_DIR = Path(os.environ.get("PODCAST_CLIPPER_OUTPUT_DIR", BASE_DIR / "outpu
 # --- Candidate selection (absolute conditions #1, #4, #5, #12) --------
 NUM_CANDIDATES = 3
 
-# Stage1's per-chunk candidate cap. This is *search breadth*, not the final
-# candidate count: raising MIN_OPENING_HOOK_STRENGTH to 80 means Stage1
-# capping itself at 3 candidates/chunk can leave too few survivors for
-# Stage2 to pick NUM_CANDIDATES from, especially when only one or two
-# utterances per chunk actually clear that bar. Stage1's role is recall
-# (cast a wide net of everything that could plausibly score >=80), not
-# picking the final best-3 -- that's still Stage2's job, applied to
-# candidates pooled across every chunk. Local quality filtering + Stage2
-# ranking narrow this back down to NUM_CANDIDATES; nothing here changes
-# what the user ultimately sees.
+# Stage1's per-chunk candidate (material) cap. This is *search breadth*,
+# not the final candidate count: raising MIN_OPENING_HOOK_STRENGTH to 80
+# means Stage1 capping itself at 3 candidates/chunk can leave too few
+# survivors for Stage2 to design NUM_CANDIDATES final candidates from,
+# especially when only one or two utterances per chunk actually clear that
+# bar. Stage1's role is recall (cast a wide net of everything usable --
+# strong conclusions, reasons, examples, potential hooks/context, not
+# necessarily complete 20-50s constructs), not picking or assembling the
+# final best-3 -- that's Stage2's job (final edit design), applied to
+# materials pooled across every chunk, recombining across them freely.
+# Deliberately left at 6, not raised, for the Stage1/Stage2 responsibility
+# redesign: test_stage1_output_max_json_size_is_well_under_max_tokens
+# already showed the worst-case Stage1Output JSON grows close to half of
+# STAGE1_MAX_OUTPUT_TOKENS at 6; raising this without also raising that
+# ceiling would reopen the exact max_tokens-truncation risk that test
+# guards against, and this redesign doesn't need a wider per-chunk cap to
+# work (recall breadth comes from Stage1 no longer needing to bundle a
+# complete hook+reason+example into one candidate, not from more of them).
 STAGE1_MAX_CANDIDATES_PER_CHUNK = 6
 
 TARGET_DURATION_MIN_SEC = 25.0
@@ -79,23 +87,27 @@ END_EXTENSION_CONTINUATION_MAX_GAP_SEC = 1.5
 # and treats a mismatch as a cache miss (falls back to a fresh Stage1/Stage2
 # run) rather than trying to deserialize old-shape data. The Whisper
 # transcript cache has no dependency on this and is unaffected.
-CANDIDATE_SCHEMA_VERSION = 9
+CANDIDATE_SCHEMA_VERSION = 10
 
 CHUNK_MINUTES = 10.0
 CHUNK_OVERLAP_MINUTES = 1.0
 
 ANTHROPIC_MODEL = os.environ.get("PODCAST_CLIPPER_ANTHROPIC_MODEL", "claude-sonnet-5")
 
-# Ceilings for Stage1/Stage2 Structured Outputs responses. Claude now only
+# Ceilings for Stage1/Stage2 Structured Outputs responses. Claude only ever
 # generates hook_type/segments/opening_hook_strength/score per candidate
-# (Stage1) or a plain list of candidate ids (Stage2) -- everything else
-# (hook_text/title/description/reasoning/caveats) is filled in
-# deterministically by the program, so the schemas are small and these
-# ceilings are sized to match, not left at a large shared default. Each is
-# a ceiling, not a fixed cost: a response that finishes naturally does not
-# consume all of it.
+# for both stages now (Stage2 designs full final candidates, the same
+# shape as Stage1's, plus end_anchor_text -- it no longer returns a plain
+# id list) -- everything else (hook_text/title/description/reasoning/
+# caveats) is filled in deterministically by the program, so the schemas
+# are small and these ceilings are sized to match, not left at a large
+# shared default. Each is a ceiling, not a fixed cost: a response that
+# finishes naturally does not consume all of it. STAGE2_MAX_OUTPUT_TOKENS
+# raised 512->1024 for the Stage2 redesign: its output now includes a
+# full segments array (with anchors) per candidate instead of a bare id
+# list.
 STAGE1_MAX_OUTPUT_TOKENS = 2048
-STAGE2_MAX_OUTPUT_TOKENS = 512
+STAGE2_MAX_OUTPUT_TOKENS = 1024
 
 # hook_text is the candidate's real opening transcript text (never
 # AI-authored -- see clip_selector.py's _deterministic_hook_text), truncated

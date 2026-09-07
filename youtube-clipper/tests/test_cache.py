@@ -152,7 +152,7 @@ def test_schema_v3_is_miss_and_current_version_is_hit():
     stage1 and stage2, while a cache written under the current schema
     version must hit normally.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 9
+    assert config.CANDIDATE_SCHEMA_VERSION == 10
 
     v3_stage2_payload = {
         "schema_version": 3,
@@ -199,7 +199,7 @@ def test_schema_v4_is_miss_after_hook_scoring_prompt_bump():
     written under version 4 must still be treated as a miss under the
     current (later-bumped) schema version too.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 9
+    assert config.CANDIDATE_SCHEMA_VERSION == 10
 
     v4_stage2_payload = {
         "schema_version": 4,
@@ -242,7 +242,7 @@ def test_schema_v5_is_miss_after_stage1_recall_widening():
     missing viable candidates the wider search would have found). A cache
     written under version 5 must be treated as a miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 9
+    assert config.CANDIDATE_SCHEMA_VERSION == 10
 
     v5_stage1_payload = {
         "schema_version": 5,
@@ -290,7 +290,7 @@ def test_schema_v6_is_miss_after_anchor_trim_and_reorder_support():
     caches to be recomputed. A cache written under version 6 must be
     treated as a miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 9
+    assert config.CANDIDATE_SCHEMA_VERSION == 10
 
     v6_stage1_payload = {
         "schema_version": 6,
@@ -339,7 +339,7 @@ def test_schema_v7_is_miss_after_junction_safety_support():
     recomputed. A cache written under version 7 must be treated as a
     miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 9
+    assert config.CANDIDATE_SCHEMA_VERSION == 10
 
     v7_stage1_payload = {
         "schema_version": 7,
@@ -391,7 +391,7 @@ def test_schema_v8_is_miss_after_restart_and_closure_support():
     be recomputed. A cache written under version 8 must be treated as a
     miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 9
+    assert config.CANDIDATE_SCHEMA_VERSION == 10
 
     v8_stage1_payload = {
         "schema_version": 8,
@@ -418,6 +418,58 @@ def test_schema_v8_is_miss_after_restart_and_closure_support():
         json.dumps(v8_stage2_payload, ensure_ascii=False), encoding="utf-8"
     )
     assert cache.load_stage2("vidV8") is None
+
+
+def test_schema_v9_is_miss_after_stage2_final_design_support():
+    """Real-machine feedback showed that Stage1 alone can't reliably
+    assemble a complete Shorts construct (hook + reason + example) within
+    one chunk's single API call, and Stage2's old ranking-only role
+    (Stage2RankingOutput -- a bare id list) had no way to fix that: it
+    could only pick from or exclude Stage1's own already-complete
+    candidates, never recombine segments across them. Stage2 was
+    redesigned into a final-edit-design role (Stage2Output/
+    Stage2CandidateOutput/Stage2SegmentOutput -- the same shape as
+    Stage1's own schema, plus end_anchor_text) that can freely recombine
+    real segments from any Stage1 material into a new final candidate.
+    This is a genuine Structured Outputs schema change on the Stage2 side
+    (Claude's output contract itself is different), so CANDIDATE_SCHEMA_
+    VERSION was bumped 9->10. A cache written under version 9 must be
+    treated as a miss -- it holds candidates Stage2 only ever ranked/
+    excluded, never validated against the new final-design local gate.
+    """
+    assert config.CANDIDATE_SCHEMA_VERSION == 10
+
+    v9_stage1_payload = {
+        "schema_version": 9,
+        "chunks": [{"chunk_index": 0, "candidates": []}],
+    }
+    cache.stage1_path("vidV9").write_text(
+        json.dumps(v9_stage1_payload, ensure_ascii=False), encoding="utf-8"
+    )
+    assert cache.load_stage1_chunk("vidV9", 0) is None
+
+    v9_stage2_payload = {
+        "schema_version": 9,
+        "candidates": [
+            {
+                "hook_type": "story",
+                "segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}],
+                "hook_text": "h", "opening_hook_strength": 85,
+                "title": "t", "description": "d", "score": 85,
+                "reasoning": "r", "caveats": "",
+            }
+        ],
+    }
+    cache.stage2_path("vidV9").write_text(
+        json.dumps(v9_stage2_payload, ensure_ascii=False), encoding="utf-8"
+    )
+    assert cache.load_stage2("vidV9") is None
+
+    raw = _raw_candidate(hook_type="story")
+    cache.save_stage1_chunk("vidV9", 0, [raw])
+    assert cache.load_stage1_chunk("vidV9", 0) is not None
+    cache.save_stage2("vidV9", [raw, raw, raw])
+    assert cache.load_stage2("vidV9") is not None
 
     raw = _raw_candidate(hook_type="story")
     cache.save_stage1_chunk("vidV8", 0, [raw])

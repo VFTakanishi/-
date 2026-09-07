@@ -23,7 +23,7 @@ import pytest
 from pydantic import ValidationError
 
 from podcast_clipper import clip_selector, structured_output
-from podcast_clipper.clip_selector import Stage1Output, Stage2RankingOutput
+from podcast_clipper.clip_selector import Stage1Output, Stage2Output
 
 
 # --- Layer 1: fake-response unit tests -----------------------------------
@@ -268,20 +268,20 @@ def test_stage2_request_body_has_no_unsupported_constraint_keys_and_no_tools():
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         captured["request"] = request
-        return _message_response(text=json.dumps({"ranked_candidate_ids": []}))
+        return _message_response(text=json.dumps({"candidates": []}))
 
     client = _client_with_mock_transport(handler)
     real_client = structured_output._client
     structured_output._client = lambda: client
     try:
         result = structured_output.call(
-            Stage2RankingOutput, stage="Stage2", system_prompt="sys prompt",
+            Stage2Output, stage="Stage2", system_prompt="sys prompt",
             user_content="user content", max_tokens=512,
         )
     finally:
         structured_output._client = real_client
 
-    assert result.ranked_candidate_ids == []
+    assert result.candidates == []
 
     body = json.loads(captured["request"].content)
     assert body["max_tokens"] == 512
@@ -456,16 +456,26 @@ def test_pseudo_api_boundary_e2e_reaches_three_final_candidates(monkeypatch):
 
     call_log = []
 
+    stage2_payload = json.dumps({
+        "candidates": [
+            {
+                "hook_type": "story",
+                "segments": [{"role": "hook", "start_segment_id": i, "end_segment_id": i}],
+                "opening_hook_strength": 90,
+                "score": 80,
+            }
+            for i in range(3)
+        ]
+    })
+
     def handler(request: httpx2.Request) -> httpx2.Response:
         body = json.loads(request.content)
         schema_title = body["output_config"]["format"]["schema"].get("title", "")
         call_log.append(schema_title)
         if schema_title == "Stage1Output":
             return _message_response(text=stage1_payload)
-        # Stage2: rank all 3 candidate ids.
-        return _message_response(
-            text=json.dumps({"ranked_candidate_ids": [f"s1_c{i:03d}" for i in range(3)]})
-        )
+        # Stage2: design final candidates reusing all 3 materials as-is.
+        return _message_response(text=stage2_payload)
 
     client = _client_with_mock_transport(handler)
     real_client = structured_output._client
@@ -476,4 +486,4 @@ def test_pseudo_api_boundary_e2e_reaches_three_final_candidates(monkeypatch):
         structured_output._client = real_client
 
     assert len(result) == 3
-    assert call_log == ["Stage1Output", "Stage2RankingOutput"]
+    assert call_log == ["Stage1Output", "Stage2Output"]
