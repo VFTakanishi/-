@@ -7,7 +7,9 @@ from podcast_clipper.models import (
     TranscriptSegment,
     TranscriptWord,
     UsedSegment,
+    find_anchor_end_word,
     find_disfluent_hook_repair_point,
+    find_natural_end_trim_points,
     find_opening_trim_point,
     find_speech_restart_marker,
     has_speech_disfluency,
@@ -392,3 +394,105 @@ def test_find_speech_restart_marker_detects_restart_inside_body_not_only_hook():
     marker = find_speech_restart_marker(words)
     assert marker is not None
     assert "燃費" in marker
+
+
+# --- find_anchor_end_word / find_natural_end_trim_points (real-machine ---
+# --- incident: duration_too_long repair could only drop a whole segment,
+# --- swinging duration far more than needed -- these give a symmetric, --
+# --- word-timestamp-verified way to shorten a segment's own *end* to a --
+# --- natural clause boundary within it) ----------------------------------
+
+
+def test_find_anchor_end_word_returns_word_ending_the_match():
+    words = _words(
+        ("これは", 0.0, 0.3), ("完結した", 0.3, 0.6), ("文です。", 0.6, 1.0),
+        ("補足の一文です。", 1.0, 1.6),
+    )
+    seg = TranscriptSegment(id=0, start=0.0, end=1.6, text="".join(w.text for w in words), words=words)
+    trim_word = find_anchor_end_word(seg, "これは完結した文です。")
+    assert trim_word is not None
+    assert trim_word.text == "文です。"
+    assert trim_word.end == 1.0
+
+
+def test_find_anchor_end_word_rejects_mid_word_end():
+    words = _words(("これは完結した文です。", 0.0, 1.0), ("補足です。", 1.0, 1.5))
+    seg = TranscriptSegment(id=0, start=0.0, end=1.5, text="".join(w.text for w in words), words=words)
+    # "これは完結した" ends partway through the first (atomic) word -- not a
+    # real word boundary -- must be rejected, never approximated.
+    assert find_anchor_end_word(seg, "これは完結した") is None
+
+
+def test_find_anchor_end_word_returns_none_when_text_not_found():
+    words = _words(("これは完結した文です。", 0.0, 1.0))
+    seg = TranscriptSegment(id=0, start=0.0, end=1.0, text="".join(w.text for w in words), words=words)
+    assert find_anchor_end_word(seg, "存在しない文字列") is None
+
+
+def test_find_anchor_end_word_returns_none_without_word_timestamps():
+    seg = TranscriptSegment(id=0, start=0.0, end=1.0, text="これは完結した文です。", words=[])
+    assert find_anchor_end_word(seg, "これは完結した文です。") is None
+
+
+def test_find_natural_end_trim_points_orders_closest_to_end_first():
+    # Three independent complete sentences concatenated in one segment --
+    # every boundary before the segment's own last sentence is a safe
+    # trim point, ordered from the smallest trim (closest to the real
+    # end) to the largest.
+    words = _words(
+        ("最初の文です。", 0.0, 0.5),
+        ("二番目の文です。", 0.5, 1.0),
+        ("三番目の文です。", 1.0, 1.5),
+    )
+    seg = TranscriptSegment(id=0, start=0.0, end=1.5, text="".join(w.text for w in words), words=words)
+    points = find_natural_end_trim_points(seg)
+    assert [p.text for p in points] == ["二番目の文です。", "最初の文です。"]
+    assert points[0].end == 1.0  # smallest trim (cuts off only the 3rd sentence)
+    assert points[1].end == 0.5  # largest trim (keeps only the 1st sentence)
+
+
+def test_find_natural_end_trim_points_never_cuts_within_a_single_sentence():
+    # Real-machine-shaped content: one long sentence with several internal
+    # commas (the exact kind of text has_speech_disfluency/find_speech_
+    # restart_marker look inside). Sentence boundaries are terminal
+    # punctuation only ("。"), not commas -- there is only ONE sentence
+    # here, so there is no safe internal cut point at all: never cut mid-
+    # sentence at a comma.
+    words = _words(
+        ("空気圧が高くなりすぎると、", 0.0, 0.4),
+        ("タイヤが丸い状態になるので、", 0.4, 0.8),
+        ("接地面が丸くなるので、", 0.8, 1.2),
+        ("実は転がり抵抗が増えるんです。", 1.2, 1.6),
+    )
+    seg = TranscriptSegment(id=0, start=0.0, end=1.6, text="".join(w.text for w in words), words=words)
+    assert find_natural_end_trim_points(seg) == []
+
+
+def test_find_natural_end_trim_points_still_finds_earlier_points_when_trailing_sentence_is_unfinished():
+    # Two complete sentences followed by a trailing, unfinished one (the
+    # segment's own real ending trails off) -- the two earlier, genuinely
+    # complete sentence boundaries must still be offered as safe trim
+    # points; only the segment's own final (unfinished) sentence is never
+    # itself a candidate (it's excluded outright, not because it fails
+    # _clause_ending_is_confident).
+    words = _words(
+        ("最初の文です。", 0.0, 0.5),
+        ("二番目の文です。", 0.5, 1.0),
+        ("三番目は未完成なので、", 1.0, 1.5),
+    )
+    seg = TranscriptSegment(id=0, start=0.0, end=1.5, text="".join(w.text for w in words), words=words)
+    points = find_natural_end_trim_points(seg)
+    assert [p.text for p in points] == ["二番目の文です。", "最初の文です。"]
+
+
+def test_find_natural_end_trim_points_empty_for_single_sentence():
+    words = _words(("完結した一文だけです。", 0.0, 1.0))
+    seg = TranscriptSegment(id=0, start=0.0, end=1.0, text="".join(w.text for w in words), words=words)
+    assert find_natural_end_trim_points(seg) == []
+
+
+def test_find_natural_end_trim_points_returns_none_without_word_timestamps():
+    seg = TranscriptSegment(
+        id=0, start=0.0, end=1.0, text="最初の文です。二番目の文です。", words=[],
+    )
+    assert find_natural_end_trim_points(seg) == []

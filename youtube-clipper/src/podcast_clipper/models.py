@@ -527,6 +527,159 @@ def resolve_segment_start_word(
     return find_opening_trim_point(segment)
 
 
+# --- End-side trimming (real-machine incident: duration_too_long repair --
+# --- only ever dropped a whole non-hook segment, swinging duration by --
+# --- far more than needed -- e.g. 51.0s -> 20.7s -- because there was no
+# --- symmetric way to shorten a segment's own *end* using real word ------
+# --- timestamps, the way start_anchor_text already shortens its start) ---
+
+
+def find_anchor_end_word(segment: TranscriptSegment, anchor_text: str) -> TranscriptWord | None:
+    """The end-side mirror of find_anchor_start_word: locates anchor_text
+    as an exact, contiguous substring of the segment's word sequence whose
+    *end* lands exactly on a real word boundary, and returns that last
+    included word (so a candidate can end mid-segment at a natural clause
+    boundary instead of always running through the segment's own last
+    word). Never fuzzy-matches and never guesses: returns None if
+    anchor_text is falsy, the segment has no word-timestamp data, the
+    exact text doesn't appear in the segment at all, or the match's end
+    falls in the middle of a word. The caller (boundary.py) must treat
+    None as "don't trim" and fall back to the segment's own natural end.
+    """
+    if not segment.words or not anchor_text:
+        return None
+    concatenated = ""
+    word_end_offsets: list[int] = []
+    for word in segment.words:
+        concatenated += word.text
+        word_end_offsets.append(len(concatenated))
+    idx = concatenated.find(anchor_text)
+    if idx == -1:
+        return None
+    end_offset = idx + len(anchor_text)
+    try:
+        return segment.words[word_end_offsets.index(end_offset)]
+    except ValueError:
+        # anchor_text was found, but doesn't end exactly on a word
+        # boundary -- that would be a mid-word end, which is forbidden.
+        return None
+
+
+def resolve_segment_end_word(
+    segment: TranscriptSegment, end_anchor_text: str | None
+) -> TranscriptWord | None:
+    """The end-side mirror of resolve_segment_start_word. Unlike the start
+    side, there is no fixed-vocabulary fallback heuristic here (there is
+    no generalizable "known trailing filler phrase" list the way
+    WEAK_OPENING_PREFIXES exists for openings) -- if end_anchor_text isn't
+    set, this returns None (no trim at all; boundary.py uses the
+    segment's own natural end), rather than inventing one.
+    """
+    if not end_anchor_text:
+        return None
+    return find_anchor_end_word(segment, end_anchor_text)
+
+
+# clip_selector._segment_ending_is_confident's judgement, deliberately
+# duplicated rather than imported (models.py must never depend on
+# clip_selector.py -- same rationale as DANGLING_CLAUSE_PARTICLE_ENDINGS
+# above), so find_natural_end_trim_points can judge whether a *sub*-
+# segment sentence boundary is a safe place to cut. Unlike clip_selector's
+# version (which only ever judges a *whole segment's own real* final
+# ending -- one Stage1 already chose as presumably complete), this must
+# also positively rule out a sentence dangling on a bare topic/case
+# particle (e.g. "それについては、") -- an internal boundary is exactly
+# where that shape shows up, so DANGLING_CLAUSE_PARTICLE_ENDINGS (already
+# defined above, same module -- no duplication needed here) is checked
+# too, not just the continuation-connective suffixes. Also deliberately
+# narrower than clip_selector's own marker list: "」"/"』" (closing
+# quotation marks) are excluded here because this same tuple doubles as
+# _split_words_into_sentences' split points -- a closing quote can appear
+# *mid*-sentence when quoting speech ("彼は「はい」と言いました"), so
+# treating it as a sentence boundary could produce a cut point that isn't
+# actually a complete sentence. clip_selector's version never has this
+# problem (it only ever judges a segment's own real, already-chosen final
+# word, never uses its marker list to *decide* where an internal boundary
+# is), so it can safely include them.
+_CLAUSE_TERMINAL_MARKERS = ("。", "！", "？", "!", "?")
+_CLAUSE_CONTINUATION_SUFFIXES = (
+    "ので", "から", "けど", "けども", "けれど", "けれども", "ですが", "ますが",
+    "という", "ということで", "し", "て", "で", "たら", "れば",
+)
+
+
+def _clause_ending_is_confident(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.endswith(_CLAUSE_TERMINAL_MARKERS):
+        return True
+    if stripped.endswith(DANGLING_CLAUSE_PARTICLE_ENDINGS):
+        return False
+    return not stripped.endswith(_CLAUSE_CONTINUATION_SUFFIXES)
+
+
+def _split_words_into_sentences(words: list[TranscriptWord]) -> list[tuple[int, int, str]]:
+    """Groups a flat word list into sentence-terminal-punctuation-
+    delimited spans (_CLAUSE_TERMINAL_MARKERS: "。", "！", "？", ...) --
+    the same accumulate-and-split shape as _split_words_into_clauses, but
+    keyed on sentence endings rather than commas. A segment often
+    contains several independent, complete sentences run together with no
+    comma at all between them (e.g. "最初の文です。二番目の文です。"), which
+    _split_words_into_clauses (comma-only) would never separate -- this is
+    the natural unit find_natural_end_trim_points needs ("does this
+    segment contain a later, independent sentence that can be safely
+    dropped from the end"). Kept deliberately separate from
+    _split_words_into_clauses (used by find_disfluent_hook_repair_point/
+    find_speech_restart_marker for a different purpose -- detecting
+    disfluency/restart *within* one sentence) so neither's already-tested
+    behavior is put at risk by changing its delimiter set.
+    """
+    sentences: list[tuple[int, int, str]] = []
+    start = 0
+    accumulated = ""
+    for i, word in enumerate(words):
+        accumulated += word.text
+        if word.text.endswith(_CLAUSE_TERMINAL_MARKERS) or i == len(words) - 1:
+            sentences.append((start, i + 1, accumulated))
+            start = i + 1
+            accumulated = ""
+    return sentences
+
+
+def find_natural_end_trim_points(segment: TranscriptSegment) -> list[TranscriptWord]:
+    """Finds every word in `segment` that a trailing portion of it could
+    safely be cut after: every sentence boundary (_split_words_into_
+    sentences) other than the segment's own final one, whose accumulated
+    text from the segment's start up through that sentence already reads
+    as a confidently complete unit (_clause_ending_is_confident --
+    terminal punctuation, or at least no dangling particle/grammatical
+    continuation marker). Returned ordered from closest to the segment's
+    own natural end (the smallest possible trim) to closest to its start
+    (the largest), so a caller trying the smallest change first can
+    simply iterate in order.
+
+    Never guesses: returns [] if there's no word-timestamp data, or the
+    segment has only one sentence (nothing before its own natural end to
+    cut after). Never a mid-word or mid-sentence point -- only real
+    sentence boundaries whose text is already itself confidently
+    complete.
+    """
+    if not segment.words:
+        return []
+    sentences = _split_words_into_sentences(segment.words)
+    if len(sentences) < 2:
+        return []
+    points: list[TranscriptWord] = []
+    accumulated = ""
+    for _start_idx, end_idx, text in sentences[:-1]:  # never the segment's own last sentence -- that's "no trim"
+        accumulated += text
+        if _clause_ending_is_confident(accumulated):
+            points.append(segment.words[end_idx - 1])
+    points.reverse()
+    return points
+
+
 @dataclass
 class RawUsedSegment:
     """A semantic range Claude selected, referencing transcript segment IDs.
@@ -540,12 +693,24 @@ class RawUsedSegment:
     text -- boundary.py verifies it against the real transcript
     (models.find_anchor_start_word) and falls back to "no trim" (the
     segment's own start) if it doesn't match exactly.
+
+    end_anchor_text is the symmetric counterpart for the *end* of the
+    end_segment_id transcript segment -- but unlike start_anchor_text,
+    Claude never sets this (it is not a field on Stage1SegmentOutput at
+    all). It exists purely for clip_selector.py's own deterministic,
+    API-0 duration_too_long repair (_try_end_trim_repairs): the real
+    text from the segment's own start through a natural, confidently-
+    complete internal clause boundary (models.find_natural_end_trim_
+    points), verified the same way at resolve time (models.
+    find_anchor_end_word) and falling back to "no trim" (the segment's
+    own natural end) if it doesn't match exactly.
     """
 
     role: SegmentRole
     start_segment_id: int
     end_segment_id: int  # inclusive
     start_anchor_text: str | None = None
+    end_anchor_text: str | None = None
 
 
 @dataclass

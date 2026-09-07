@@ -19,7 +19,18 @@ segment -- an AI-chosen start_anchor_text, which is only ever trusted
 after models.find_anchor_start_word verifies it's an exact, contiguous,
 word-boundary-aligned substring of that segment's real transcript text.
 Neither ever invents or rewrites words; both only ever move the start
-point later within words Claude (or Whisper) already produced. Segment
+point later within words Claude (or Whisper) already produced.
+
+A symmetric adjustment (_apply_end_trim) moves a segment's *end* earlier,
+back to a real, verified word boundary -- but its only source is an
+end_anchor_text clip_selector.py computes itself for its deterministic,
+API-0 duration_too_long repair (_try_end_trim_repairs); Claude never sets
+it (there is no such field on Stage1SegmentOutput). It is only ever
+trusted after models.find_anchor_end_word verifies it's an exact,
+contiguous, word-boundary-aligned substring of that segment's real
+transcript text, and only ever moves the end point earlier within words
+already produced -- never invents, rewrites, or guesses a cut point.
+Segment
 *order* itself (which segment plays first, second, ...) is entirely
 clip_selector.py's/Claude's choice, expressed as the order of
 raw.segments -- this module resolves each segment independently and never
@@ -115,12 +126,49 @@ def _apply_start_trim(
     return replace(used, start=new_start, text=trimmed_text or used.text)
 
 
+def _apply_end_trim(
+    used: UsedSegment, raw_used: RawUsedSegment, transcript: Transcript
+) -> UsedSegment:
+    """The end-side mirror of _apply_start_trim: mechanically moves this
+    segment's end back to whichever real word models.resolve_segment_
+    end_word decides -- a deterministic, locally-computed end_anchor_text
+    (see RawUsedSegment's docstring: unlike start_anchor_text, Claude
+    never sets this; it's clip_selector.py's own API-0 duration_too_long
+    repair, _try_end_trim_repairs), verified as an exact, word-boundary-
+    aligned match within the end_segment_id transcript segment. Returns
+    `used` unchanged if there's nothing to trim, no word-timestamp data,
+    or trimming would collapse the segment to empty/inverted -- this
+    never guesses an approximate cut point.
+    """
+    end_seg = transcript.segment_by_id(raw_used.end_segment_id)
+    trim_word = models.resolve_segment_end_word(end_seg, raw_used.end_anchor_text)
+    if trim_word is None:
+        return used
+
+    padding = config.BOUNDARY_PADDING_MS / 1000.0
+    new_end = min(trim_word.end + padding, used.end)
+    if new_end <= used.start:
+        return used
+
+    # used.text ends with end_seg.text verbatim (resolve_segment joins
+    # segments in order with no trailing text after the last one), so the
+    # trailing span's word-length can be stripped directly off the back of
+    # it.
+    tail_len = sum(len(w.text) for w in end_seg.words if w.start >= trim_word.end)
+    trimmed_text = used.text[: len(used.text) - tail_len].rstrip() if tail_len else used.text
+    return replace(used, end=new_end, text=trimmed_text or used.text)
+
+
 def resolve_candidate(
     raw: RawClipCandidate, transcript: Transcript, candidate_id: str
 ) -> ClipCandidate:
     segments = [resolve_segment(rs, transcript) for rs in raw.segments]
     segments = [
         _apply_start_trim(seg, raw_used, transcript)
+        for seg, raw_used in zip(segments, raw.segments)
+    ]
+    segments = [
+        _apply_end_trim(seg, raw_used, transcript)
         for seg, raw_used in zip(segments, raw.segments)
     ]
     return ClipCandidate(

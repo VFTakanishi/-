@@ -801,6 +801,8 @@ RepairMethod = Literal[
     "prepend_previous_1",
     "prepend_previous_2",
     "prepend_previous_3",
+    "body_opening_trim",
+    "body_ending_trim",
     "drop_context_segment",
     "drop_non_context_segment",
     "hook_repeat_payoff",
@@ -1188,6 +1190,102 @@ def _try_prepend_previous_segments_repairs(
     return results
 
 
+def _try_body_opening_trim_repairs(
+    candidate: RawClipCandidate, transcript: Transcript
+) -> list[RepairBuildResult]:
+    """Targets duration_too_long: for each non-hook segment (context/
+    answer/payoff), tries shaving a known weak lead-in phrase off its own
+    start (models.find_sequential_removable_prefix_word -- the exact same
+    primitive _try_opening_trim_repair already uses for the hook, applied
+    here to every other segment instead; that function only ever operates
+    on the segment it's given, so no new models.py logic is needed).
+    Never touches the hook: its own start is already covered by opening_
+    trim/disfluency_trim, which exist for different reasons (context_
+    dependent_opening/speech_disfluency) and are tried independently of
+    duration. Never overrides a start_anchor_text Claude (or an earlier
+    repair) already set. Real-machine incident: a 52s candidate whose
+    context segment opens on a removable lead-in needs only this small a
+    trim to fit under 50s -- dropping the whole segment (_try_drop_
+    optional_segment_repairs) would be a far bigger, unnecessary change.
+    """
+    results: list[RepairBuildResult] = []
+    found_any = False
+    for i in range(1, len(candidate.segments)):
+        seg_raw = candidate.segments[i]
+        if seg_raw.start_anchor_text:
+            continue
+        seg = transcript.segment_by_id(seg_raw.start_segment_id)
+        if not seg.words:
+            continue
+        trim_word = models.find_sequential_removable_prefix_word(seg)
+        if trim_word is None:
+            continue
+        anchor_text = "".join(w.text for w in seg.words if w.start >= trim_word.start)
+        if not anchor_text:
+            continue
+        found_any = True
+        new_segments = list(candidate.segments)
+        new_segments[i] = replace(seg_raw, start_anchor_text=anchor_text)
+        results.append(
+            RepairBuildResult("body_opening_trim", replace(candidate, segments=new_segments), None)
+        )
+    if not found_any:
+        results.append(RepairBuildResult("body_opening_trim", None, "no_removable_prefix"))
+    return results
+
+
+# How many of a segment's own natural internal cut points (models.
+# find_natural_end_trim_points, ordered smallest-trim-first) _try_end_
+# trim_repairs actually turns into variants -- bounded so a segment with
+# many clauses can't crowd out _try_drop_optional_segment_repairs' whole-
+# segment variants within the shared _MAX_LOCAL_REPAIR_VARIANTS budget.
+_MAX_END_TRIM_POINTS_PER_SEGMENT = 3
+
+
+def _try_end_trim_repairs(
+    candidate: RawClipCandidate, transcript: Transcript
+) -> list[RepairBuildResult]:
+    """Targets duration_too_long: for each non-hook segment, tries
+    shortening it from its own natural end back to an earlier natural
+    clause boundary *within that same segment* (models.find_natural_end_
+    trim_points -- never guesses a cut point without real word
+    timestamps, never invents text, never cuts mid-sentence: every
+    candidate point is chosen because the text up to it already reads as
+    a complete, confidently-ending clause). The hook is never end-trimmed
+    by this repair (only ever start-trimmed, by opening_trim/disfluency_
+    trim, to protect its own strength/meaning -- see module-level repair
+    docs). Every (segment, cutoff) combination across all non-hook
+    segments is returned ordered by trimmed amount, smallest first,
+    consistent with every other duration_too_long repair being tried
+    smallest-change-first before falling back to whole-segment removal
+    (_try_drop_optional_segment_repairs). Real-machine incident: a 51s
+    candidate whose last segment has an independent ~2s trailing
+    supplementary sentence needs only this small a trim to fit under
+    50s -- dropping the whole segment would remove far more than needed
+    (and could easily drop below DURATION_HARD_MIN_SEC instead).
+    """
+    scored: list[tuple[float, RepairBuildResult]] = []
+    for i in range(1, len(candidate.segments)):
+        seg_raw = candidate.segments[i]
+        seg = transcript.segment_by_id(seg_raw.end_segment_id)
+        if not seg.words:
+            continue
+        points = models.find_natural_end_trim_points(seg)[:_MAX_END_TRIM_POINTS_PER_SEGMENT]
+        for trim_word in points:
+            anchor_text = "".join(w.text for w in seg.words if w.end <= trim_word.end)
+            if not anchor_text:
+                continue
+            trimmed_amount = seg.words[-1].end - trim_word.end
+            new_segments = list(candidate.segments)
+            new_segments[i] = replace(seg_raw, end_anchor_text=anchor_text)
+            variant = replace(candidate, segments=new_segments)
+            scored.append((trimmed_amount, RepairBuildResult("body_ending_trim", variant, None)))
+    if not scored:
+        return [RepairBuildResult("body_ending_trim", None, "no_natural_end_trim_point")]
+    scored.sort(key=lambda pair: pair[0])
+    return [r for _, r in scored]
+
+
 def _try_drop_optional_segment_repairs(candidate: RawClipCandidate) -> list[RepairBuildResult]:
     """Targets duration_too_long: for a multi-segment candidate, drops one
     non-hook segment at a time (the hook is never dropped) and lets the
@@ -1279,8 +1377,14 @@ def _try_hook_repeat_payoff_repairs(
 # can actually get *evaluated* (built-but-skipped diagnostic entries --
 # see RepairBuildResult -- don't count against this), so a pathological
 # multi-segment candidate can never balloon into an unbounded local
-# re-evaluation loop.
-_MAX_LOCAL_REPAIR_VARIANTS = 8
+# re-evaluation loop. Raised from 8 to 12 when body_opening_trim/body_
+# ending_trim were added: duration_too_long alone can now generate more
+# small, already-safe, already-bounded (_MAX_END_TRIM_POINTS_PER_SEGMENT)
+# variants than before, and the whole-segment-drop fallback must still
+# get a chance to run within the same budget rather than being crowded
+# out -- this widens how many *safe* variants get tried, it does not
+# loosen what evaluate_local_candidate accepts.
+_MAX_LOCAL_REPAIR_VARIANTS = 12
 
 
 def _build_repair_candidates(
@@ -1313,7 +1417,19 @@ def _build_repair_candidates(
         )
 
     if reason == "duration_too_long":
-        return _try_drop_optional_segment_repairs(candidate)
+        # Smallest change first: a small lead-in trim on a non-hook
+        # segment, then a natural-clause-boundary trim off a non-hook
+        # segment's own end, and only as a last resort dropping a whole
+        # non-hook segment outright (real-machine incident: whole-segment
+        # drop alone swings duration far more than needed -- e.g.
+        # 51.0s -> 20.7s -- and the result then fails some other check,
+        # like duration_too_short or hook_strength_below_80, that a
+        # smaller trim would never have triggered).
+        return (
+            _try_body_opening_trim_repairs(candidate, transcript)
+            + _try_end_trim_repairs(candidate, transcript)
+            + _try_drop_optional_segment_repairs(candidate)
+        )
 
     if reason == "incomplete_final_ending":
         return _try_hook_repeat_payoff_repairs(candidate, transcript)

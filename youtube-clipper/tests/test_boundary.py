@@ -415,3 +415,131 @@ def test_start_anchor_text_collapsing_segment_to_empty_falls_back(monkeypatch):
     assert resolved.start < resolved.end
     assert resolved.start == 0.0
     assert "B" in resolved.text
+
+
+# --- end_anchor_text / _apply_end_trim (real-machine incident: -----------
+# --- duration_too_long repair could only drop a whole segment; this is --
+# --- the symmetric mechanism letting clip_selector.py's own deterministic
+# --- repair shorten a segment's own *end* to a real, verified word ------
+# --- boundary instead) ----------------------------------------------------
+
+
+def test_resolve_candidate_trims_via_end_anchor_text(monkeypatch):
+    monkeypatch.setattr(config, "BOUNDARY_PADDING_MS", 0)
+    words = [
+        _word(0.0, 0.5, "最初の文です。"),
+        _word(0.5, 1.0, "二番目の文です。"),
+        _word(1.0, 1.5, "三番目の文です。"),
+    ]
+    transcript = Transcript(
+        video_id="vid1", language="ja",
+        segments=[
+            TranscriptSegment(id=0, start=0.0, end=1.5, text="".join(w.text for w in words), words=words),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(
+                role="hook", start_segment_id=0, end_segment_id=0,
+                end_anchor_text="最初の文です。二番目の文です。",
+            )
+        ],
+        hook_text="h", opening_hook_strength=85, title="t", description="d",
+        score=85, reasoning="r", caveats="",
+    )
+    candidate = boundary.resolve_candidate(raw, transcript, candidate_id="c1")
+    resolved = candidate.segments[0]
+
+    assert resolved.text == "最初の文です。二番目の文です。"
+    assert "三番目の文です。" not in resolved.text
+    assert resolved.end == 1.0
+
+
+def test_end_anchor_text_not_found_falls_back_to_segment_end(monkeypatch):
+    # Anchor text that doesn't exist in the transcript must never cause a
+    # guessed/approximate cut -- falls back to the segment's own natural
+    # end.
+    monkeypatch.setattr(config, "BOUNDARY_PADDING_MS", 0)
+    words = [_word(0.0, 0.5, "最初の文です。"), _word(0.5, 1.0, "二番目の文です。")]
+    transcript = Transcript(
+        video_id="vid1", language="ja",
+        segments=[
+            TranscriptSegment(id=0, start=0.0, end=1.0, text="".join(w.text for w in words), words=words),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(
+                role="hook", start_segment_id=0, end_segment_id=0,
+                end_anchor_text="存在しない発話テキスト",
+            )
+        ],
+        hook_text="h", opening_hook_strength=85, title="t", description="d",
+        score=85, reasoning="r", caveats="",
+    )
+    candidate = boundary.resolve_candidate(raw, transcript, candidate_id="c1")
+    resolved = candidate.segments[0]
+
+    assert resolved.text == "最初の文です。二番目の文です。"
+    assert resolved.end == 1.0
+
+
+def test_end_anchor_text_without_word_timestamps_falls_back_safely():
+    # No word-timestamp data at all -- never guess a cut point, even with
+    # an anchor supplied.
+    transcript = Transcript(
+        video_id="vid1", language="ja",
+        segments=[
+            TranscriptSegment(id=0, start=0.0, end=1.0, text="最初の文です。二番目の文です。", words=[]),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(
+                role="hook", start_segment_id=0, end_segment_id=0,
+                end_anchor_text="最初の文です。",
+            )
+        ],
+        hook_text="h", opening_hook_strength=85, title="t", description="d",
+        score=85, reasoning="r", caveats="",
+    )
+    candidate = boundary.resolve_candidate(raw, transcript, candidate_id="c1")
+    assert candidate.segments[0].text == "最初の文です。二番目の文です。"
+
+
+def test_end_anchor_text_collapsing_segment_to_empty_falls_back(monkeypatch):
+    # A pathologically tight preceding-segment gap can clamp this
+    # segment's resolved start (used.start) to well after the anchor
+    # word's own end (e.g. overlapping/misaligned Whisper timestamps) --
+    # trimming to the anchor would then collapse or invert the used
+    # range. That trim must be rejected, falling back to the untrimmed
+    # segment.
+    monkeypatch.setattr(config, "BOUNDARY_PADDING_MS", 0)
+    transcript = Transcript(
+        video_id="vid1", language="ja",
+        segments=[
+            TranscriptSegment(id=0, start=0.0, end=1.0, text="prev", words=[_word(0.0, 1.0, "prev")]),
+            # Word timestamps start *before* segment 0 even ends --
+            # clamps used.start for segment 1 up to 1.0, past "A"'s end.
+            TranscriptSegment(
+                id=1, start=0.3, end=2.0, text="AB",
+                words=[_word(0.3, 0.6, "A"), _word(0.6, 2.0, "B")],
+            ),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[RawUsedSegment(role="hook", start_segment_id=1, end_segment_id=1, end_anchor_text="A")],
+        hook_text="h", opening_hook_strength=85, title="t", description="d",
+        score=85, reasoning="r", caveats="",
+    )
+    candidate = boundary.resolve_candidate(raw, transcript, candidate_id="c1")
+    resolved = candidate.segments[0]
+    # Falls back to the untrimmed resolved segment (start=1.0, end=2.0),
+    # never an inverted/empty range, and never silently drops "B".
+    assert resolved.start < resolved.end
+    assert resolved.end == 2.0
+    assert "B" in resolved.text
