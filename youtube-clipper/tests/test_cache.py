@@ -152,7 +152,7 @@ def test_schema_v3_is_miss_and_current_version_is_hit():
     stage1 and stage2, while a cache written under the current schema
     version must hit normally.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 8
+    assert config.CANDIDATE_SCHEMA_VERSION == 9
 
     v3_stage2_payload = {
         "schema_version": 3,
@@ -199,7 +199,7 @@ def test_schema_v4_is_miss_after_hook_scoring_prompt_bump():
     written under version 4 must still be treated as a miss under the
     current (later-bumped) schema version too.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 8
+    assert config.CANDIDATE_SCHEMA_VERSION == 9
 
     v4_stage2_payload = {
         "schema_version": 4,
@@ -242,7 +242,7 @@ def test_schema_v5_is_miss_after_stage1_recall_widening():
     missing viable candidates the wider search would have found). A cache
     written under version 5 must be treated as a miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 8
+    assert config.CANDIDATE_SCHEMA_VERSION == 9
 
     v5_stage1_payload = {
         "schema_version": 5,
@@ -290,7 +290,7 @@ def test_schema_v6_is_miss_after_anchor_trim_and_reorder_support():
     caches to be recomputed. A cache written under version 6 must be
     treated as a miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 8
+    assert config.CANDIDATE_SCHEMA_VERSION == 9
 
     v6_stage1_payload = {
         "schema_version": 6,
@@ -339,7 +339,7 @@ def test_schema_v7_is_miss_after_junction_safety_support():
     recomputed. A cache written under version 7 must be treated as a
     miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 8
+    assert config.CANDIDATE_SCHEMA_VERSION == 9
 
     v7_stage1_payload = {
         "schema_version": 7,
@@ -372,6 +372,58 @@ def test_schema_v7_is_miss_after_junction_safety_support():
     assert cache.load_stage1_chunk("vidV7", 0) is not None
     cache.save_stage2("vidV7", [raw, raw, raw])
     assert cache.load_stage2("vidV7") is not None
+
+
+def test_schema_v8_is_miss_after_restart_and_closure_support():
+    """Real-machine feedback showed two further gaps: (1) a candidate could
+    contain a speech restart -- an abandoned, unfinished clause immediately
+    restarted with the same content phrase in a different construction
+    (e.g. "Nレンジで下るというのは、Nレンジにすると...") -- that the existing
+    marker/connective-based speech_disfluency check could not catch, and
+    (2) a candidate could rank highly in Stage2 despite its body never
+    resolving the question/claim its hook posed (e.g. a fuel-economy
+    comparison hook followed only by a safety aside and a "気がする"-style
+    guess). find_speech_restart_marker/_candidate_speech_restart_marker adds
+    a local veto for (1), and the rank_and_finalize.md prompt now excludes
+    an id from ranked_candidate_ids entirely for (2) -- neither changes the
+    Stage1 output shape, so CANDIDATE_SCHEMA_VERSION was bumped 8->9 purely
+    to force caches built under the old, restart/closure-unaware rubric to
+    be recomputed. A cache written under version 8 must be treated as a
+    miss.
+    """
+    assert config.CANDIDATE_SCHEMA_VERSION == 9
+
+    v8_stage1_payload = {
+        "schema_version": 8,
+        "chunks": [{"chunk_index": 0, "candidates": []}],
+    }
+    cache.stage1_path("vidV8").write_text(
+        json.dumps(v8_stage1_payload, ensure_ascii=False), encoding="utf-8"
+    )
+    assert cache.load_stage1_chunk("vidV8", 0) is None
+
+    v8_stage2_payload = {
+        "schema_version": 8,
+        "candidates": [
+            {
+                "hook_type": "story",
+                "segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}],
+                "hook_text": "h", "opening_hook_strength": 85,
+                "title": "t", "description": "d", "score": 85,
+                "reasoning": "r", "caveats": "",
+            }
+        ],
+    }
+    cache.stage2_path("vidV8").write_text(
+        json.dumps(v8_stage2_payload, ensure_ascii=False), encoding="utf-8"
+    )
+    assert cache.load_stage2("vidV8") is None
+
+    raw = _raw_candidate(hook_type="story")
+    cache.save_stage1_chunk("vidV8", 0, [raw])
+    assert cache.load_stage1_chunk("vidV8", 0) is not None
+    cache.save_stage2("vidV8", [raw, raw, raw])
+    assert cache.load_stage2("vidV8") is not None
 
 
 def test_transcript_cache_is_unaffected_by_candidate_schema_versioning():

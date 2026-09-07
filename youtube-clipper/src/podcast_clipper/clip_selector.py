@@ -161,6 +161,36 @@ def _body_disfluency_marker(
     return None
 
 
+def _segment_has_speech_restart(raw_used: RawUsedSegment, transcript: Transcript) -> str | None:
+    """Concatenates the real word list of every original transcript
+    segment in raw_used's [start_segment_id, end_segment_id] range (not
+    just the resolved/trimmed text) and checks it for a speech restart
+    (models.find_speech_restart_marker) -- so a restart split by
+    faster-whisper's VAD across two adjacent original segments is caught
+    just as reliably as one confined to a single segment.
+    """
+    start_idx = transcript.segment_index(raw_used.start_segment_id)
+    end_idx = transcript.segment_index(raw_used.end_segment_id)
+    words = [w for i in range(start_idx, end_idx + 1) for w in transcript.segments[i].words]
+    return models.find_speech_restart_marker(words)
+
+
+def _candidate_speech_restart_marker(
+    raw: RawClipCandidate, transcript: Transcript
+) -> tuple[str, str] | None:
+    """Checks every segment of the candidate (hook included -- unlike
+    _body_disfluency_marker, a restart is exactly as disqualifying in the
+    hook as in the body) for a speech restart. Returns (segment_role,
+    shared_phrase) for the first one found, or None if none of them have
+    one.
+    """
+    for raw_used in raw.segments:
+        marker = _segment_has_speech_restart(raw_used, transcript)
+        if marker is not None:
+            return (raw_used.role, marker)
+    return None
+
+
 def _force_first_segment_is_hook(raw: RawClipCandidate) -> None:
     """The first segment of a candidate must be tagged role=hook (this is a
     labeling/consistency requirement, not a semantic judgement -- whatever
@@ -750,6 +780,7 @@ LocalRejectReason = Literal[
     "weak_opening_prefix",
     "speech_disfluency",
     "hook_incomplete_thought",
+    "speech_restart",
     "context_dependent_opening",
     "unsafe_junction",
     "accepted",
@@ -842,9 +873,10 @@ class LocalCandidateEvaluation:
     opening_text: str = ""
     duration_sec: float = 0.0
     junction_reason: JunctionRejectReason | None = None
-    # Set only when reason is "speech_disfluency" or "hook_incomplete_
-    # thought": "<segment_role>: <matched marker or trailing text>" (e.g.
-    # "hook: 表現が難しい", "context: っていうのか+違って") -- named which
+    # Set only when reason is "speech_disfluency", "hook_incomplete_
+    # thought", or "speech_restart": "<segment_role>: <matched marker,
+    # trailing text, or shared restart phrase>" (e.g. "hook: 表現が難しい",
+    # "context: っていうのか+違って", "context: Nレンジ") -- named which
     # segment and what was matched, never the full candidate text.
     disfluency_detail: str | None = None
     internal_extension_applied: bool = False
@@ -915,7 +947,13 @@ def evaluate_local_candidate(
        every *other* resolved segment (context/answer/payoff -- a
        disfluent body is enough to fail the whole candidate even with a
        strong hook) -> "speech_disfluency"
-    10. evaluate_candidate_junctions -- the hook itself opening on a
+    10. _candidate_speech_restart_marker across every segment (hook and
+       body alike -- models.find_speech_restart_marker, e.g. "Nレンジで
+       下るというのは、Nレンジにすると、..."; an abandoned, unfinished
+       clause restarted with the same content word in a different
+       construction, distinct from speech_disfluency's marker/connective
+       vocabulary) -> "speech_restart"
+    11. evaluate_candidate_junctions -- the hook itself opening on a
        dangling reference maps to "context_dependent_opening"
        (junction_reason="hook_context_dependent"); an unsafe A->B cut
        elsewhere maps to "unsafe_junction" (junction_reason=
@@ -978,6 +1016,11 @@ def evaluate_local_candidate(
     if body_finding is not None:
         body_role, body_marker = body_finding
         return _rejected("speech_disfluency", disfluency_detail=f"{body_role}: {body_marker}")
+
+    restart_finding = _candidate_speech_restart_marker(c, transcript)
+    if restart_finding is not None:
+        restart_role, restart_marker = restart_finding
+        return _rejected("speech_restart", disfluency_detail=f"{restart_role}: {restart_marker}")
 
     junction = evaluate_candidate_junctions(c, transcript)
     if not junction.safe:
@@ -1256,6 +1299,12 @@ def _build_repair_candidates(
     hook_incomplete_thought has no known repair either (a hook that never
     delivered a claim within its own segment isn't fixable by mechanically
     skipping a preamble) -- yields an empty list, same as the others.
+    speech_restart also has no repair (deliberate scope decision, not an
+    oversight): the abandoned clause and its restart could in principle be
+    disambiguated the same way disfluency_trim skips a preamble, but this
+    was not requested and the reject-only behavior already matches every
+    other reason without a bespoke repair strategy -- yields an empty
+    list too.
     """
     if reason == "context_dependent_opening":
         trimmed, skip = _try_opening_trim_repair(candidate, transcript)
@@ -1397,6 +1446,7 @@ _LOCAL_REJECT_REASON_LABELS: dict[str, str] = {
     "weak_opening_prefix": "弱い導入句",
     "speech_disfluency": "言い淀み・自己修正",
     "hook_incomplete_thought": "hookが未完結",
+    "speech_restart": "文の言い直し(restart)",
     "context_dependent_opening": "文脈依存の冒頭",
     "unsafe_junction": "カット接続不自然",
 }
@@ -1575,8 +1625,9 @@ def finalize_candidates(
     _validate_candidate_junctions, the identical junction-safety rules
     _filter_local_quality uses, so a cache hit can never bypass them.
     The speech-fluency veto (models.has_speech_disfluency /
-    _looks_like_hook_incomplete_thought) is re-checked here too -- this is
-    the *only* enforcement point a cache-hit or web.py's render path
+    _looks_like_hook_incomplete_thought / _candidate_speech_restart_marker)
+    is re-checked here too -- this is the *only* enforcement point a
+    cache-hit or web.py's render path
     (_run_render, which reads cache.load_stage2 directly) ever goes
     through, so a candidate already sitting in a stale Stage2 cache from
     before this check existed is caught on its very next read, without
@@ -1619,6 +1670,8 @@ def finalize_candidates(
             continue
         if _body_disfluency_marker(extended, transcript) is not None:
             continue
+        if _candidate_speech_restart_marker(extended, transcript) is not None:
+            continue
         dur = _candidate_duration(extended, transcript)
         if config.DURATION_HARD_MIN_SEC <= dur <= config.DURATION_HARD_MAX_SEC:
             finalized.append(extended)
@@ -1627,7 +1680,7 @@ def finalize_candidates(
         raise RuntimeError(
             "保存済み候補のうち、自然な発話終端を確保できない候補（例: 「〜ので」等の"
             "継続表現で終わっており、これ以上延長できないもの）、発話の流暢性チェックに"
-            "失敗した候補（言い淀み・自己修正・未完のhook）、または延長後の尺が"
+            "失敗した候補（言い淀み・自己修正・言い直し(restart)・未完のhook）、または延長後の尺が"
             f"目標範囲（{config.DURATION_HARD_MIN_SEC:.0f}〜{config.DURATION_HARD_MAX_SEC:.0f}秒）"
             f"を外れる候補があり、有効な{config.NUM_CANDIDATES}候補を確保できませんでした"
             f"（有効{len(finalized)}件）。再解析が必要です。APIへの自動再要求は行いません。"
@@ -1689,9 +1742,18 @@ def _rank_finalize_and_cache(
     ranked_ids = rank_candidates(id_map, transcript, video_title)
     top_ids = ranked_ids[: config.NUM_CANDIDATES]
     if len(top_ids) < config.NUM_CANDIDATES:
+        # Stage2's prompt now also excludes an id entirely (rather than
+        # merely ranking it low) when the candidate fails semantic closure
+        # -- a strong hook whose body never actually answers the
+        # question/claim it posed (see rank_and_finalize.md). So "too few
+        # ids" here can mean either referential-integrity noise (unknown/
+        # duplicate ids, already filtered in rank_candidates) or a
+        # legitimate closure failure -- either way, never padded to reach
+        # config.NUM_CANDIDATES, and never auto-retried.
         raise RuntimeError(
-            f"Stage2ランキングが有効な候補ID{len(top_ids)}件しか返しませんでした"
-            f"（{config.NUM_CANDIDATES}件必要）。APIへの自動再要求は行いません。"
+            f"Stage2が意味的に完結した候補IDを{len(top_ids)}件しか返しませんでした"
+            f"（{config.NUM_CANDIDATES}件必要）。フックが提示した問い・主張を本文で"
+            "回収できていない候補は除外される仕様です。APIへの自動再要求は行いません。"
         )
 
     finalists = [id_map[cid] for cid in top_ids]

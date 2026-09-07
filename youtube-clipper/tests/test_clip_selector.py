@@ -1264,11 +1264,14 @@ def test_diagnose_local_filter_L_raises_clearly_without_cache():
         clip_selector.diagnose_local_filter(transcript)
 
 
-def test_candidate_schema_version_still_8():
-    # L: this round adds diagnostics only -- no Stage1 output shape
-    # change, so the schema version must stay exactly where the previous
-    # round (junction safety) left it.
-    assert config.CANDIDATE_SCHEMA_VERSION == 8
+def test_candidate_schema_version_still_9():
+    # This round adds the speech_restart local veto and the Stage2
+    # semantic-closure prompt gate -- no Stage1/Stage2 output shape change,
+    # but the ranking behavior itself changed (Stage2 can now omit an id
+    # for a reason no earlier cache entry was ever judged against), so the
+    # schema version was bumped once (8->9) to force recomputation; it must
+    # not drift further within this round.
+    assert config.CANDIDATE_SCHEMA_VERSION == 9
 
 
 # --- repair-before-reject: real-machine incident (4/4 Stage1 candidates
@@ -2414,7 +2417,23 @@ def test_select_candidates_raises_when_stage2_returns_too_few_ids(monkeypatch):
     monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: candidates)
     monkeypatch.setattr(clip_selector, "rank_candidates", lambda id_map, t, title: list(id_map.keys())[:1])
 
-    with pytest.raises(RuntimeError, match="Stage2ランキング"):
+    with pytest.raises(RuntimeError, match="意味的に完結した候補ID"):
+        clip_selector.select_candidates(transcript, "タイトル")
+
+
+def test_select_candidates_raises_when_only_two_candidates_pass_semantic_closure(monkeypatch):
+    # J: exactly the "only 2 pass semantic closure" shape -- Stage2 must
+    # not pad ranked_candidate_ids back up to config.NUM_CANDIDATES, and
+    # the existing no-auto-retry RuntimeError must fire exactly as it does
+    # for any other id shortfall (referential-integrity or closure alike).
+    transcript = _long_transcript(minutes=1)
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    candidates = [_raw_candidate(0, 2), _raw_candidate(0, 2), _raw_candidate(0, 2)]
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: candidates)
+    monkeypatch.setattr(clip_selector, "rank_candidates", lambda id_map, t, title: list(id_map.keys())[:2])
+
+    with pytest.raises(RuntimeError, match="意味的に完結した候補ID"):
         clip_selector.select_candidates(transcript, "タイトル")
 
 
@@ -2428,6 +2447,36 @@ def test_select_candidates_happy_path(monkeypatch):
 
     result = clip_selector.select_candidates(transcript, "タイトル")
     assert len(result) == config.NUM_CANDIDATES
+
+
+def test_select_candidates_accepts_when_stage2_excludes_one_closure_failing_candidate_of_four(monkeypatch):
+    # I/K: Stage2's semantic-closure gate expresses "this candidate fails"
+    # by omitting its id entirely (see rank_and_finalize.md), not by
+    # ranking it lower. When 3 of 4 locally-valid candidates pass, the
+    # result must contain exactly config.NUM_CANDIDATES candidates (never
+    # padded back up with the excluded one), reached via exactly one
+    # Stage2 call -- zero additional Anthropic API calls.
+    transcript = _long_transcript(minutes=1)
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    candidates = [_raw_candidate(0, 2, score=s) for s in (10, 20, 30, 40)]
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: candidates)
+
+    call_count = {"n": 0}
+
+    def _fake_rank(id_map, t, title):
+        call_count["n"] += 1
+        # Simulate Stage2 omitting one id entirely for failing semantic
+        # closure -- the remaining 3 of 4 are returned, never padded back.
+        assert len(id_map) == 4
+        return list(id_map.keys())[:3]
+
+    monkeypatch.setattr(clip_selector, "rank_candidates", _fake_rank)
+
+    result = clip_selector.select_candidates(transcript, "タイトル")
+
+    assert len(result) == config.NUM_CANDIDATES
+    assert call_count["n"] == 1
 
 
 def test_select_candidates_caches_and_skips_recompute(monkeypatch):
@@ -2678,6 +2727,31 @@ def test_rank_candidates_does_not_send_full_transcript(monkeypatch):
     clip_selector.rank_candidates(id_map, transcript, "タイトル")
 
     assert "マーカーXYZ123" not in captured["user_content"]
+
+
+# --- Stage2 semantic closure hard gate (real-machine incident: a --------
+# --- candidate whose hook posed "why is X better than Y" ranked high ---
+# --- despite its body never explaining why -- see rank_and_finalize.md) -
+
+
+def test_rank_candidates_supports_omitting_a_closure_failing_id_via_existing_schema(monkeypatch):
+    # Item 12: Stage2RankingOutput needs no new field to express semantic-
+    # closure failure -- the prompt instructs Claude to simply omit the
+    # id (see rank_and_finalize.md's "意味的な完結性" section) rather than
+    # ranking it low, and the existing minimal schema already supports a
+    # shorter-than-input list with no changes.
+    transcript = _long_transcript(minutes=1)
+    id_map = {
+        "s1_c000": _raw_candidate(0, 2),  # hook + real reason: passes closure
+        "s1_c001": _raw_candidate(0, 2),  # hook only, no reason: Stage2 omits this id
+    }
+    output = Stage2RankingOutput(ranked_candidate_ids=["s1_c000"])
+    monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
+
+    ranked = clip_selector.rank_candidates(id_map, transcript, "タイトル")
+
+    assert ranked == ["s1_c000"]
+    assert set(Stage2RankingOutput.model_fields) == {"ranked_candidate_ids"}
 
 
 # --- opening trim: _opening_text/_looks_like_weak_opening must agree with
@@ -2949,7 +3023,7 @@ def test_refresh_stage1_and_candidates_does_not_overwrite_stage2_cache_when_fina
     # cache.save_stage2, leaving the old cache exactly as it was.
     monkeypatch.setattr(clip_selector, "rank_candidates", lambda id_map, t, title: list(id_map.keys())[:2])
 
-    with pytest.raises(RuntimeError, match="有効な候補ID"):
+    with pytest.raises(RuntimeError, match="意味的に完結した候補ID"):
         clip_selector.refresh_stage1_and_candidates(transcript, "タイトル")
 
     reloaded = cache.load_stage2(transcript.video_id)
@@ -3287,6 +3361,188 @@ def test_select_candidates_cache_hit_rejects_disfluent_cached_candidates(monkeyp
     transcript = Transcript(
         video_id="vidCacheHitDisfluency", language="ja",
         segments=[_segment(0, start=0.0, text="ちょっと表現が難しいんですけども、要するにこうです。")],
+    )
+    stale_bad = _raw_candidate(0, 0, opening_hook_strength=90)
+    cache.save_stage2(transcript.video_id, [stale_bad] * 3)
+
+    with pytest.raises(RuntimeError, match="流暢性"):
+        clip_selector.select_candidates(transcript, "タイトル")
+
+
+# --- speech restart: real-machine incident (an unfinished clause -------
+# --- abandoned and restarted with the same content phrase in a --------
+# --- different construction; has_speech_disfluency alone cannot catch --
+# --- this -- no word-search marker, no reformulation/reversal ---------
+# --- connective) ---------------------------------------------------------
+
+
+def test_evaluate_local_candidate_drops_speech_restart_candidate1_example(monkeypatch):
+    # A/E: the real incident -- "Nレンジで下るというのは、" is abandoned
+    # mid-construction and restarted as "Nレンジにすると、". The segment's
+    # own full text still ends confidently ("。"), so this must be caught
+    # by the new speech_restart gate, not incomplete_final_ending.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidSpeechRestart", language="ja",
+        segments=[
+            _segment_with_words(
+                0, 0.0,
+                "ホンダも取扱説明書の中に、",
+                "走行中にNレンジで下るというのは、",
+                "Nレンジにすると、",
+                "エンジンブレーキが効かなくなって、",
+                "思わぬ事故の原因になるので、",
+                "急な坂道では注意が必要です。",
+            ),
+        ],
+    )
+    raw = _raw_candidate(0, 0, opening_hook_strength=90)
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.accepted is False
+    assert result.reason == "speech_restart"
+    assert result.disfluency_detail is not None
+    assert "Nレンジ" in result.disfluency_detail
+    assert result.disfluency_detail.startswith("hook:")
+
+
+def test_evaluate_local_candidate_drops_speech_restart_in_body_segment(monkeypatch):
+    # G: a restart occurring in a BODY segment (not the hook) must still
+    # reject the whole candidate, mirroring how a disfluent body segment
+    # already fails the candidate even with a clean hook.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidSpeechRestartBody", language="ja",
+        segments=[
+            _segment(0, start=0.0, text="86はスープラをベースに作られています。"),
+            _segment_with_words(
+                1, 5.0,
+                "ホンダも取扱説明書の中に、",
+                "走行中にNレンジで下るというのは、",
+                "Nレンジにすると、",
+                "エンジンブレーキが効かなくなって、",
+                "思わぬ事故の原因になるので、",
+                "急な坂道では注意が必要です。",
+            ),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=1, end_segment_id=1),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=80, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.accepted is False
+    assert result.reason == "speech_restart"
+    assert result.disfluency_detail is not None
+    assert result.disfluency_detail.startswith("context:")
+
+
+def test_evaluate_local_candidate_accepts_hook_payoff_exact_repeat_despite_restart_check(monkeypatch):
+    # Regression (item 4/19): the existing, intentionally-allowed hook->
+    # context->payoff exact-repeat structure must keep working -- the
+    # restart check runs independently per RawUsedSegment, so reusing the
+    # same clean segment twice must never be mistaken for a restart.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _junction_transcript()
+    raw = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="context", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="payoff", start_segment_id=2, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+
+    result = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert result.accepted is True
+
+
+def test_diagnostic_summary_shows_speech_restart_reason_segment_and_marker(monkeypatch):
+    # Item 17: diagnostic output should name the reason/segment/marker,
+    # never dump the full candidate text.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidDiagRestart", language="ja",
+        segments=[
+            _segment_with_words(
+                0, 0.0,
+                "ホンダも取扱説明書の中に、",
+                "走行中にNレンジで下るというのは、",
+                "Nレンジにすると、",
+                "エンジンブレーキが効かなくなって、",
+                "思わぬ事故の原因になるので、",
+                "急な坂道では注意が必要です。",
+            ),
+        ],
+    )
+    raw = _raw_candidate(0, 0, opening_hook_strength=90)
+
+    evaluations = clip_selector._evaluate_all_local_candidates([raw], transcript)
+    summary = clip_selector._format_diagnostic_summary(evaluations)
+
+    assert "reject=speech_restart" in summary
+    assert "disfluency=hook: Nレンジ" in summary
+    assert "急な坂道では注意が必要です" not in summary
+
+
+def test_finalize_candidates_also_rejects_restart_candidates(monkeypatch):
+    # The cache-hit / render-defensive enforcement point
+    # (finalize_candidates) must independently apply the same restart
+    # veto -- not just the fresh-selection path (_filter_local_quality).
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidFinalizeRestart", language="ja",
+        segments=[
+            _segment_with_words(
+                0, 0.0,
+                "ホンダも取扱説明書の中に、",
+                "走行中にNレンジで下るというのは、",
+                "Nレンジにすると、",
+                "エンジンブレーキが効かなくなって、",
+                "思わぬ事故の原因になるので、",
+                "急な坂道では注意が必要です。",
+            ),
+        ],
+    )
+    raw = _raw_candidate(0, 0, opening_hook_strength=90)
+
+    with pytest.raises(RuntimeError, match="流暢性"):
+        clip_selector.finalize_candidates([raw, raw, raw], transcript)
+
+
+def test_select_candidates_cache_hit_rejects_restart_cached_candidates(monkeypatch):
+    # The exact real-world scenario this gate exists for: a restart
+    # candidate already sitting in a stale Stage2 cache (from before this
+    # gate existed) must be caught on its very next read, with zero
+    # Anthropic API calls -- no re-analysis needed.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidCacheHitRestart", language="ja",
+        segments=[
+            _segment_with_words(
+                0, 0.0,
+                "ホンダも取扱説明書の中に、",
+                "走行中にNレンジで下るというのは、",
+                "Nレンジにすると、",
+                "エンジンブレーキが効かなくなって、",
+                "思わぬ事故の原因になるので、",
+                "急な坂道では注意が必要です。",
+            ),
+        ],
     )
     stale_bad = _raw_candidate(0, 0, opening_hook_strength=90)
     cache.save_stage2(transcript.video_id, [stale_bad] * 3)

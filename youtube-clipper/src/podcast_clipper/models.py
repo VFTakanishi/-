@@ -279,21 +279,33 @@ def has_speech_disfluency(text: str) -> str | None:
     return None
 
 
-def _split_into_clauses(segment: TranscriptSegment) -> list[tuple[int, int, str]]:
-    """Groups segment.words into comma-delimited clauses using real word
+def _split_words_into_clauses(words: list[TranscriptWord]) -> list[tuple[int, int, str]]:
+    """Groups a flat word list into comma-delimited clauses using real word
     text only (never estimating boundaries): each entry is
     (start_word_index, end_word_index_exclusive, clause_text_incl_comma).
+    `words` may be the word list of a single TranscriptSegment, or a
+    concatenation spanning several consecutive ones (see
+    find_speech_restart_marker, which needs to compare clauses across a
+    candidate's full segment range, not just within one original
+    transcript segment).
     """
     clauses: list[tuple[int, int, str]] = []
     start = 0
     accumulated = ""
-    for i, word in enumerate(segment.words):
+    for i, word in enumerate(words):
         accumulated += word.text
-        if word.text.endswith(("、", "，", ",")) or i == len(segment.words) - 1:
+        if word.text.endswith(("、", "，", ",")) or i == len(words) - 1:
             clauses.append((start, i + 1, accumulated))
             start = i + 1
             accumulated = ""
     return clauses
+
+
+def _split_into_clauses(segment: TranscriptSegment) -> list[tuple[int, int, str]]:
+    """Groups segment.words into comma-delimited clauses -- see
+    _split_words_into_clauses (this is a thin single-segment wrapper).
+    """
+    return _split_words_into_clauses(segment.words)
 
 
 # A clause immediately following an already-disfluent one that ends in a
@@ -355,6 +367,111 @@ def find_disfluent_hook_repair_point(
             return None  # disfluency recurs later -- don't force-rescue
         return segment.words[start_idx]
     return None  # every clause within the budget was disfluent -- unrepairable
+
+
+# --- Speech restart: an unfinished clause abandoned and restarted -------
+#
+# Real-machine incident: "Nレンジで下るというのは、Nレンジにすると、エンジン
+# ブレーキが効かなくなって..." -- has_speech_disfluency cannot catch this
+# (no word-search marker, no "というか"-style self-correction connective).
+# The actual signature is structural: a clause ends dangling on a bare
+# topic/case particle (never completing a predicate) and the *very next*
+# clause restates a shared, content-bearing phrase from it -- the speaker
+# abandoning an unfinished construction and starting over with the same
+# subject, rather than continuing it. Detection is purely text/timing
+# based (TranscriptWord carries no confidence score -- faster-whisper's
+# per-word probability is never captured -- so this can only ever be a
+# deterministic text-structure heuristic, not an audio-confidence one).
+
+# Separate from clip_selector._DANGLING_PARTICLE_ENDINGS (same values, by
+# deliberate duplication rather than a shared import: that tuple is
+# private to clip_selector's already-tested _looks_like_hook_incomplete_
+# thought, and reusing it here isn't worth the risk of coupling two
+# independent checks to one constant).
+DANGLING_CLAUSE_PARTICLE_ENDINGS = ("は、", "が、", "を、", "に、", "で、", "と、", "も、")
+
+_MIN_SHARED_CONTENT_PHRASE_LEN = 2
+
+
+def _longest_common_substring(a: str, b: str) -> str:
+    if not a or not b:
+        return ""
+    lengths = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+    best_len = 0
+    best_end_a = 0
+    for i in range(1, len(a) + 1):
+        for j in range(1, len(b) + 1):
+            if a[i - 1] == b[j - 1]:
+                lengths[i][j] = lengths[i - 1][j - 1] + 1
+                if lengths[i][j] > best_len:
+                    best_len = lengths[i][j]
+                    best_end_a = i
+            else:
+                lengths[i][j] = 0
+    return a[best_end_a - best_len: best_end_a]
+
+
+# U+3040-U+309F is the full Unicode Hiragana block (including the
+# combining marks/small kana at its edges); anything outside it (kanji,
+# katakana, alphanumerics, punctuation) counts as "not pure hiragana".
+_HIRAGANA_RANGE = ("぀", "ゟ")
+
+
+def _is_content_bearing(text: str) -> bool:
+    """True if `text` contains at least one non-hiragana character (kanji,
+    katakana, or alphanumeric). Japanese particles/connectives are almost
+    always pure hiragana, while content words (nouns, technical terms,
+    model names, etc.) almost always contain kanji/katakana/alphanumerics
+    -- this generalizes "is this a real content word" without hardcoding
+    any topic-specific vocabulary (car model names, gear names, ...).
+    """
+    return any(not (_HIRAGANA_RANGE[0] <= ch <= _HIRAGANA_RANGE[1]) for ch in text)
+
+
+def find_speech_restart_marker(words: list[TranscriptWord]) -> str | None:
+    """Detects a clause that ends dangling on a bare topic/case particle
+    (never completing a predicate) immediately followed by a clause that
+    restates a shared, content-bearing phrase from it -- the speaker
+    abandoning an unfinished construction and restarting with the same
+    subject in a different construction, rather than continuing it
+    naturally (e.g. "Nレンジで下るというのは、Nレンジにすると、...").
+
+    `words` may span multiple consecutive original transcript segments
+    (the caller concatenates a candidate's full raw_used range), so a
+    restart that faster-whisper's VAD happened to split across two
+    segments is still caught, not just one confined to a single segment.
+
+    Returns the shared phrase (for diagnostics) or None. Never guesses
+    without word-timestamp data. A pause/gap is never used as a signal by
+    itself -- only this text-level restart pattern matters (deliberately
+    conservative: prefers a missed restart over a false positive on
+    natural emphasis repetition or enumeration, since those have no
+    dangling-particle clause or no shared content word respectively).
+    """
+    if not words:
+        return None
+    clauses = _split_words_into_clauses(words)
+    for i in range(len(clauses) - 1):
+        _, _, text_a = clauses[i]
+        _, _, text_b = clauses[i + 1]
+        # text_a still carries its trailing clause-delimiting comma here
+        # (see _split_words_into_clauses) -- checked directly against the
+        # comma-inclusive particle endings, not stripped first.
+        if not text_a.endswith(DANGLING_CLAUSE_PARTICLE_ENDINGS):
+            continue
+        if has_speech_disfluency(text_a) is not None:
+            continue  # already flagged separately -- avoid double-signaling
+        core_a = text_a.rstrip("、，,")
+        for particle in DANGLING_CLAUSE_PARTICLE_ENDINGS:
+            bare = particle.rstrip("、，,")
+            if core_a.endswith(bare):
+                core_a = core_a[: -len(bare)]
+                break
+        core_b = text_b.rstrip("、，,")
+        shared = _longest_common_substring(core_a, core_b)
+        if len(shared) >= _MIN_SHARED_CONTENT_PHRASE_LEN and _is_content_bearing(shared):
+            return shared
+    return None
 
 
 def find_anchor_start_word(segment: TranscriptSegment, anchor_text: str) -> TranscriptWord | None:
