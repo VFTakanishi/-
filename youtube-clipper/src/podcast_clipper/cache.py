@@ -58,6 +58,10 @@ def stage2_path(video_id: str) -> Path:
     return _cache_dir(video_id) / "stage2_result.json"
 
 
+def stage2_diagnostic_path(video_id: str) -> Path:
+    return _cache_dir(video_id) / "stage2_diagnostic.json"
+
+
 # --- Transcript ---------------------------------------------------------
 
 
@@ -158,6 +162,55 @@ def load_stage2(video_id: str) -> list[RawClipCandidate] | None:
         _raw_candidate_from_dict(c, context=f"cache stage2 video_id={video_id} candidates[{i}]")
         for i, c in enumerate(raw["candidates"])
     ]
+
+
+def save_stage2_diagnostic(
+    video_id: str,
+    candidates: list[RawClipCandidate],
+    *,
+    evaluations: list[dict] | None = None,
+) -> None:
+    """Diagnostic-only snapshot of what Stage2 actually designed, written
+    at two points: (1) immediately after Stage2's Structured Output is
+    successfully parsed, before dedup or any local validation, so even a
+    run that later fails to reach config.NUM_CANDIDATES accepted designs
+    leaves a record of what Stage2 returned, and (2) again once local
+    validation has run, this time including per-candidate evaluations
+    (accepted/reason/duration/opening text) -- see _design_finalize_and_
+    cache. Deliberately separate from stage2_path/save_stage2, which only
+    ever holds the final, finalized, *accepted* candidates from a fully
+    successful run: before this existed, a failed run (too few candidates
+    survived local validation) left stage2_result.json completely
+    untouched (correct -- see finalize_candidates' docstring) but also
+    left NO record anywhere of what Stage2 had actually built, making a
+    real "why did this fail" diagnosis impossible after the fact without
+    a fresh, API-calling re-analysis.
+
+    Never read by the production candidate-selection path -- load_stage2
+    only ever reads stage2_path, never this file. This is purely a
+    developer/diagnostic artifact (see load_stage2_diagnostic).
+    """
+    payload = {
+        "schema_version": config.CANDIDATE_SCHEMA_VERSION,
+        "candidates": [asdict(c) for c in candidates],
+    }
+    if evaluations is not None:
+        payload["evaluations"] = evaluations
+    _atomic_write_text(
+        stage2_diagnostic_path(video_id), json.dumps(payload, ensure_ascii=False, indent=2)
+    )
+
+
+def load_stage2_diagnostic(video_id: str) -> dict | None:
+    """Diagnostic-only read-back (tooling/tests) -- returns the raw parsed
+    JSON dict as-is (schema_version/candidates/optionally evaluations),
+    never deserialized into RawClipCandidate objects, since this is meant
+    to be inspected as data, never fed back into the selection pipeline.
+    """
+    path = stage2_diagnostic_path(video_id)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _raw_candidate_from_dict(d: dict, *, context: str) -> RawClipCandidate:

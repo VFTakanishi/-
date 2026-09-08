@@ -1668,6 +1668,21 @@ _LOCAL_REJECT_REASON_LABELS: dict[str, str] = {
 }
 
 
+def _stage2_diagnostic_evaluation(e: LocalCandidateEvaluation) -> dict:
+    """The per-candidate local-validation detail attached to a Stage2
+    diagnostic snapshot (cache.save_stage2_diagnostic) -- accepted/reason/
+    duration/opening text, the same fields _format_diagnostic_summary
+    renders into a RuntimeError message, but kept here as structured JSON
+    so a diagnostic tool can read it back without re-parsing prose.
+    """
+    return {
+        "accepted": e.accepted,
+        "reason": e.reason,
+        "duration_sec": e.duration_sec,
+        "opening_text": e.opening_text,
+    }
+
+
 def _format_diagnostic_summary(evaluations: list[LocalCandidateEvaluation]) -> str:
     """Renders a compact, scannable breakdown of why each Stage1 candidate
     was accepted/rejected by the local filter, meant to be appended to
@@ -1967,6 +1982,16 @@ def design_final_candidates(
     )
 
     candidates = [_raw_candidate_from_stage2_output(c, transcript.segments) for c in parsed.candidates]
+    # Diagnostic-only snapshot, written immediately after a successful
+    # parse and before dedup/local validation -- see cache.
+    # save_stage2_diagnostic's docstring. Real-machine incident this
+    # exists for: a run that designs too few locally-valid candidates
+    # raises before cache.save_stage2 ever runs (correct -- stage2_
+    # result.json must never hold an unsuccessful run's picks), which
+    # previously meant Stage2's actual raw output was lost the moment the
+    # process exited, making "what did Stage2 actually design" impossible
+    # to answer without a fresh, API-calling re-analysis.
+    cache.save_stage2_diagnostic(transcript.video_id, candidates)
     return _dedupe_by_segment_sequence(candidates)
 
 
@@ -2123,6 +2148,15 @@ def _design_finalize_and_cache(
     designed = design_final_candidates(material_map, transcript, video_title)
 
     evaluations = _evaluate_all_local_candidates(designed, transcript)
+    # Re-saves the same diagnostic snapshot design_final_candidates already
+    # wrote, now with each candidate's local-validation verdict attached --
+    # this runs regardless of whether enough candidates end up accepted
+    # below, so a failed run still leaves a full "what did Stage2 design,
+    # and why did each one pass/fail" record on disk.
+    cache.save_stage2_diagnostic(
+        transcript.video_id, designed,
+        evaluations=[_stage2_diagnostic_evaluation(e) for e in evaluations],
+    )
     # Stage2Output.candidates already caps at config.NUM_CANDIDATES for the
     # real API path, but design_final_candidates is a normal function a
     # caller/test can substitute directly (bypassing that schema) -- this

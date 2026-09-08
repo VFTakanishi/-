@@ -129,6 +129,46 @@ def test_stage2_round_trip():
     assert loaded[0].caveats == "注意"
 
 
+# --- Stage2 diagnostic: raw Stage2 output survives a failed run ---------
+# (separate from stage2_result.json, which only ever holds a fully
+# successful run's finalized, accepted candidates)
+
+
+def test_stage2_diagnostic_round_trip():
+    raw = _raw_candidate(hook_type="strong_take")
+    cache.save_stage2_diagnostic("vidDiag", [raw, raw])
+    loaded = cache.load_stage2_diagnostic("vidDiag")
+
+    assert loaded is not None
+    assert loaded["schema_version"] == config.CANDIDATE_SCHEMA_VERSION
+    assert len(loaded["candidates"]) == 2
+    assert "evaluations" not in loaded
+
+
+def test_stage2_diagnostic_with_evaluations_round_trip():
+    raw = _raw_candidate(hook_type="strong_take")
+    evaluations = [
+        {"accepted": True, "reason": "accepted", "duration_sec": 30.0, "opening_text": "h"},
+        {"accepted": False, "reason": "hook_strength_below_80", "duration_sec": 25.0, "opening_text": "w"},
+    ]
+    cache.save_stage2_diagnostic("vidDiagEval", [raw, raw], evaluations=evaluations)
+    loaded = cache.load_stage2_diagnostic("vidDiagEval")
+
+    assert loaded["evaluations"] == evaluations
+
+
+def test_stage2_diagnostic_missing_returns_none():
+    assert cache.load_stage2_diagnostic("vid-never-cached-diagnostic") is None
+
+
+def test_load_stage2_never_reads_diagnostic_file():
+    raw = _raw_candidate(hook_type="strong_take")
+    cache.save_stage2_diagnostic("vidDiagOnly", [raw])
+    # Only the diagnostic file was written -- the production stage2_result
+    # cache must still read back as a plain miss.
+    assert cache.load_stage2("vidDiagOnly") is None
+
+
 def test_stage2_with_stale_schema_version_is_treated_as_cache_miss():
     """A cache written by an older clip_selector.py schema/prompt version
     must never be deserialized against the new RawClipCandidate shape --

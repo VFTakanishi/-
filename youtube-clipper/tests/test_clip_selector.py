@@ -3256,6 +3256,133 @@ def test_design_finalize_J_rejects_unsafe_junction(monkeypatch):
         clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
 
 
+# --- stage2 diagnostic: raw Stage2 output survives a failed run ----------
+# (real-machine incident: Stage2 designed only 2 candidates, one of which
+# was locally rejected for hook_strength_below_80 -- the resulting
+# RuntimeError meant stage2_result.json was never written, and until this,
+# NOTHING recorded what Stage2 had actually built, making the failure
+# undiagnosable without a fresh, API-calling re-analysis)
+
+
+def test_design_finalize_A_saves_diagnostic_when_too_few_candidates_designed(monkeypatch):
+    # A: Stage2 returns only 2 designs (< NUM_CANDIDATES=3) -- the
+    # RuntimeError this raises must not erase the record of what those 2
+    # designs actually were.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    materials = [_raw_material(0, 2), _raw_material(0, 2)]
+    two_designs = [
+        _raw_candidate(0, 2, opening_hook_strength=90),
+        _raw_candidate(0, 2, opening_hook_strength=78),  # will fail hook_strength_below_80
+    ]
+
+    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda m, t, title: two_designs)
+
+    with pytest.raises(RuntimeError, match="ローカル検証を通過したのは"):
+        clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+
+    # stage2_result.json (the production cache) must remain untouched.
+    assert cache.load_stage2(transcript.video_id) is None
+
+    # But the diagnostic snapshot must exist, with both of Stage2's raw
+    # designs and a per-candidate local-validation verdict.
+    diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
+    assert diagnostic is not None
+    assert len(diagnostic["candidates"]) == 2
+    assert len(diagnostic["evaluations"]) == 2
+    accepted_flags = [e["accepted"] for e in diagnostic["evaluations"]]
+    assert accepted_flags == [True, False]
+    assert diagnostic["evaluations"][1]["reason"] == "hook_strength_below_80"
+
+
+def test_design_finalize_B_diagnostic_records_all_three_designs_with_one_rejected(monkeypatch):
+    # B: Stage2 returns exactly NUM_CANDIDATES=3 designs, but one fails
+    # local validation (fabricated segment_id) -- only 2 remain accepted,
+    # so this still raises (never padded below NUM_CANDIDATES), but the
+    # diagnostic must show all 3 original designs plus each one's verdict,
+    # not just the 2 that would otherwise have succeeded.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    materials = [_raw_material(0, 2), _raw_material(0, 2), _raw_material(0, 2)]
+    three_designs = [
+        _raw_candidate(0, 2, opening_hook_strength=90),
+        _raw_candidate(0, 2, opening_hook_strength=90),
+        _raw_candidate(9999, 9999, opening_hook_strength=90),  # fabricated segment_id
+    ]
+
+    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda m, t, title: three_designs)
+
+    with pytest.raises(RuntimeError, match="ローカル検証を通過したのは"):
+        clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+
+    diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
+    assert len(diagnostic["candidates"]) == 3
+    assert len(diagnostic["evaluations"]) == 3
+    reasons = [e["reason"] for e in diagnostic["evaluations"]]
+    assert reasons.count("accepted") == 2
+    assert "invalid_segment_reference" in reasons
+
+
+def test_design_finalize_C_success_path_still_writes_diagnostic_separately(monkeypatch):
+    # C: on a fully successful run, stage2_result.json holds only the
+    # final accepted/finalized candidates (unchanged behavior); the
+    # diagnostic snapshot exists alongside it, not instead of it.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    materials = [_raw_material(0, 2) for _ in range(3)]
+    three_designs = [_raw_candidate(0, 2, opening_hook_strength=90) for _ in range(3)]
+
+    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda m, t, title: three_designs)
+
+    result = clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+    assert len(result) == 3
+
+    final_cache = cache.load_stage2(transcript.video_id)
+    assert final_cache is not None
+    assert len(final_cache) == 3
+
+    diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
+    assert diagnostic is not None
+    assert len(diagnostic["candidates"]) == 3
+    assert all(e["accepted"] for e in diagnostic["evaluations"])
+
+
+def test_design_final_candidates_saves_raw_diagnostic_before_dedup(monkeypatch):
+    # The first diagnostic write happens inside design_final_candidates
+    # itself, right after Stage2's Structured Output is parsed -- before
+    # dedup and before local validation even runs -- so a crash anywhere
+    # downstream still leaves this record behind.
+    transcript = _long_transcript(minutes=1)
+    materials = {"s1_m000": _raw_material(0, 2)}
+    same_segment = Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=2)
+    output = Stage2Output(
+        candidates=[
+            Stage2CandidateOutput(hook_type="story", segments=[same_segment], opening_hook_strength=85, score=85),
+            Stage2CandidateOutput(hook_type="story", segments=[same_segment], opening_hook_strength=85, score=85),
+        ]
+    )
+    monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
+
+    designed = clip_selector.design_final_candidates(materials, transcript, "タイトル")
+    assert len(designed) == 1  # deduped in the return value
+
+    # But the diagnostic snapshot, written before dedup, keeps both.
+    diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
+    assert len(diagnostic["candidates"]) == 2
+    assert "evaluations" not in diagnostic  # not yet evaluated at this point
+
+
+def test_stage2_diagnostic_is_never_read_by_the_production_selection_path(monkeypatch):
+    # D: load_stage2 (the only function the real candidate-selection path
+    # ever calls) must never be satisfied by a diagnostic-only file.
+    transcript = _long_transcript(minutes=1)
+    cache.save_stage2_diagnostic(transcript.video_id, [_raw_candidate(0, 2)])
+    assert cache.load_stage2(transcript.video_id) is None
+
+
 # --- select_candidates: no automatic retry (item H) ----------------------
 
 
