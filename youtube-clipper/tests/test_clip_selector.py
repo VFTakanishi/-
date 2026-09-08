@@ -292,9 +292,19 @@ def test_extract_candidates_prompt_does_not_force_duration_target():
     assert "尺の最終調整は後段のStage2の責務です" in text
 
 
-def test_rank_and_finalize_prompt_states_it_picks_the_final_best_three():
+def test_rank_and_finalize_prompt_encourages_designing_more_than_the_final_three():
+    """Real-machine incident fix: Stage2 previously designed only 2
+    candidates when 3 were required, despite ample unused material --
+    Stage2Output.candidates' ceiling was widened to STAGE2_MAX_DESIGNS(6),
+    and the prompt must actively encourage using that headroom (multiple
+    independent hooks each with their own reason/example) rather than
+    stopping at a small number, while still never lowering the
+    semantic-closure/junction/duration bar to hit a count.
+    """
     text = _rank_and_finalize_prompt_text()
-    assert "最終的に採用すべきベスト3" in text
+    assert "最大6件まで" in text
+    assert "できるだけ多く" in text
+    assert "それぞれを別々の完成candidateとして設計する" in text
 
 
 # --- prompt content: junction safety (cut-point naturalness) --------------
@@ -353,9 +363,10 @@ def test_rank_and_finalize_prompt_documents_end_anchor_text():
     assert "word境界に一致する必要がある" in text
 
 
-def test_rank_and_finalize_prompt_never_forces_three_designs():
+def test_rank_and_finalize_prompt_never_lowers_the_bar_to_hit_a_count():
     text = _rank_and_finalize_prompt_text()
-    assert "無理に3件埋めず" in text
+    assert "件数を埋めるために基準を下げないでください" in text
+    assert "0件なら0件を返してください" in text
 
 
 # --- prompt content: start_anchor_text trim + segment reordering ----------
@@ -1356,15 +1367,15 @@ def test_diagnose_local_filter_L_raises_clearly_without_cache():
         clip_selector.diagnose_local_filter(transcript)
 
 
-def test_candidate_schema_version_still_11():
-    # This round redesigns Stage1 from candidate-shaped output
-    # (Stage1CandidateOutput: hook_type/opening_hook_strength/score
-    # required on every item) into a genuine material contract
-    # (Stage1MaterialOutput: material_type/usefulness_score) -- a real
-    # Structured Outputs schema change on the Stage1 side, so the version
-    # was bumped once more (10->11); it must not drift further within
-    # this round.
-    assert config.CANDIDATE_SCHEMA_VERSION == 11
+def test_candidate_schema_version_still_12():
+    # This round decouples Stage2Output.candidates' ceiling from
+    # NUM_CANDIDATES(3) to STAGE2_MAX_DESIGNS(6) (a real-machine incident
+    # showed Stage2 stopping at 2 designs when 3 were required, despite
+    # ample unused material) and updates rank_and_finalize.md to encourage
+    # using that headroom -- a genuine Structured Outputs schema change
+    # plus a prompt change on the Stage2 side, so the version was bumped
+    # once more (11->12); it must not drift further within this round.
+    assert config.CANDIDATE_SCHEMA_VERSION == 12
 
 
 # --- repair-before-reject: real-machine incident (4/4 Stage1 candidates
@@ -3350,6 +3361,33 @@ def test_design_finalize_C_success_path_still_writes_diagnostic_separately(monke
     assert all(e["accepted"] for e in diagnostic["evaluations"])
 
 
+def test_design_finalize_takes_top_num_candidates_when_stage2_overproduces(monkeypatch):
+    # The actual fix under test: when Stage2 uses its widened headroom
+    # (STAGE2_MAX_DESIGNS=6) and designs more than NUM_CANDIDATES(3) valid
+    # candidates, the run must succeed (never fail just because there were
+    # "too many" good options) and return exactly NUM_CANDIDATES, taking
+    # them in Stage2's own strongest-first order -- never all of them,
+    # never a random subset.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    materials = [_raw_material(0, 2) for _ in range(5)]
+    five_designs = [_raw_candidate(0, 2, opening_hook_strength=90, score=s) for s in (95, 90, 85, 80, 75)]
+
+    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda m, t, title: five_designs)
+
+    result = clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+
+    assert len(result) == config.NUM_CANDIDATES == 3
+    assert [c.score for c in result] == [95, 90, 85]
+
+    diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
+    # The diagnostic still records all 5 of Stage2's designs, not just the
+    # 3 that were ultimately selected.
+    assert len(diagnostic["candidates"]) == 5
+    assert all(e["accepted"] for e in diagnostic["evaluations"])
+
+
 def test_design_final_candidates_saves_raw_diagnostic_before_dedup(monkeypatch):
     # The first diagnostic write happens inside design_final_candidates
     # itself, right after Stage2's Structured Output is parsed -- before
@@ -3543,6 +3581,73 @@ def test_stage2_candidate_output_field_set_is_the_only_place_finished_properties
         "role", "start_segment_id", "end_segment_id", "start_anchor_text", "end_anchor_text",
     }
     assert set(Stage2Output.model_fields) == {"candidates"}
+
+
+def _valid_stage2_candidate_kwargs():
+    return {
+        "hook_type": "story",
+        "segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}],
+        "opening_hook_strength": 80,
+        "score": 80,
+    }
+
+
+def test_stage2_output_accepts_up_to_stage2_max_designs_not_num_candidates():
+    """The real-machine fix: Stage2Output's ceiling is STAGE2_MAX_DESIGNS
+    (6), deliberately wider than NUM_CANDIDATES (3) -- Stage2 designed
+    only 2 candidates once when 3 were required despite ample unused
+    material, so the schema itself must not cap Stage2 at exactly
+    NUM_CANDIDATES and leave it no room to over-produce.
+    """
+    assert config.STAGE2_MAX_DESIGNS == 6
+    assert config.STAGE2_MAX_DESIGNS > config.NUM_CANDIDATES
+    for n in range(config.NUM_CANDIDATES + 1, config.STAGE2_MAX_DESIGNS + 1):
+        out = Stage2Output(candidates=[Stage2CandidateOutput(**_valid_stage2_candidate_kwargs()) for _ in range(n)])
+        assert len(out.candidates) == n
+    with pytest.raises(ValidationError):
+        Stage2Output(
+            candidates=[Stage2CandidateOutput(**_valid_stage2_candidate_kwargs()) for _ in range(config.STAGE2_MAX_DESIGNS + 1)]
+        )
+
+
+def test_stage2_output_max_json_size_is_well_under_max_tokens():
+    """Mirrors test_stage1_output_max_json_size_is_well_under_max_tokens:
+    guards against the worst-case Stage2Output JSON (STAGE2_MAX_DESIGNS
+    candidates, 3 segments each, long enum values, 3-digit segment ids, a
+    max-length anchor on both ends of every segment) approaching
+    STAGE2_MAX_OUTPUT_TOKENS closely enough to risk the same
+    stop_reason="max_tokens" truncation this codebase has hit before.
+    """
+    candidate = Stage2CandidateOutput(
+        hook_type="surprising_fact",
+        segments=[
+            Stage2SegmentOutput(
+                role="hook", start_segment_id=123, end_segment_id=124,
+                start_anchor_text="あ" * 60, end_anchor_text="い" * 60,
+            ),
+            Stage2SegmentOutput(
+                role="context", start_segment_id=125, end_segment_id=126,
+                start_anchor_text="う" * 60, end_anchor_text="え" * 60,
+            ),
+            Stage2SegmentOutput(
+                role="answer", start_segment_id=127, end_segment_id=128,
+                start_anchor_text="お" * 60, end_anchor_text="か" * 60,
+            ),
+        ],
+        opening_hook_strength=95,
+        score=92,
+    )
+    worst_case = Stage2Output(candidates=[candidate] * config.STAGE2_MAX_DESIGNS)
+    text = worst_case.model_dump_json()
+
+    char_count = len(text)
+    estimated_tokens = char_count / 3.5
+
+    assert estimated_tokens < config.STAGE2_MAX_OUTPUT_TOKENS / 2, (
+        f"worst-case Stage2Output JSON is {char_count} chars (~{estimated_tokens:.0f} "
+        f"estimated tokens) -- unexpectedly close to STAGE2_MAX_OUTPUT_TOKENS="
+        f"{config.STAGE2_MAX_OUTPUT_TOKENS}."
+    )
 
 
 def _valid_material_segment_kwargs():

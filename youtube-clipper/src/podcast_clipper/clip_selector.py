@@ -23,10 +23,13 @@ yet a claimed-finished candidate.
 
 Stage 2 (final edit design) sees a compact per-material summary (material_
 id/material_type/usefulness_score/segment ids+text+timing) -- never the
-full transcript -- and returns up to NUM_CANDIDATES fully-designed final
-RawClipCandidate structures, freely recombining segments across different
-materials (e.g. one material's hook + a different material's reason) into
-a single semantically-complete design. It self-scores hook_type/opening_
+full transcript -- and returns up to STAGE2_MAX_DESIGNS fully-designed
+final RawClipCandidate structures (deliberately more than the NUM_
+CANDIDATES that must actually survive local validation, so the gate has
+a real pool to pick the best NUM_CANDIDATES from -- see Stage2Output's
+docstring), freely recombining segments across different materials (e.g.
+one material's hook + a different material's reason) into a single
+semantically-complete design. It self-scores hook_type/opening_
 hook_strength/score for whatever it actually built; those are never
 carried forward from any source material (which has no such properties to
 carry).
@@ -162,14 +165,24 @@ class Stage2Output(BaseModel):
     """Replaces the old ranking-only Stage2RankingOutput. min_length=0 lets
     Stage2 return fewer than config.NUM_CANDIDATES designs when it can't
     construct that many that satisfy semantic closure -- the caller must
-    never pad this back up (see _design_finalize_and_cache). max_length
-    enforces "never more than NUM_CANDIDATES" at the schema level, so
-    Stage2 can't return an oversized list to begin with.
+    never pad this back up (see _design_finalize_and_cache).
+
+    max_length is config.STAGE2_MAX_DESIGNS, deliberately NOT config.
+    NUM_CANDIDATES -- a real-machine incident showed Stage2 designing only
+    2 candidates (both later passing local validation) when 3 were
+    required, despite Stage1 having supplied plenty of still-unused
+    material: capping Stage2's own output at exactly NUM_CANDIDATES gave
+    it no room to over-produce so the (unchanged) local validation gate
+    could pick the best NUM_CANDIDATES from a larger, pre-validation pool.
+    _design_finalize_and_cache still requires NUM_CANDIDATES to actually
+    pass local validation for the run to succeed -- this only widens how
+    many designs Stage2 may attempt before that gate runs, it never lowers
+    the bar a design must clear.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    candidates: list[Stage2CandidateOutput] = Field(min_length=0, max_length=config.NUM_CANDIDATES)
+    candidates: list[Stage2CandidateOutput] = Field(min_length=0, max_length=config.STAGE2_MAX_DESIGNS)
 
 
 # Weak "warm-up" openings explicitly called out as unacceptable: a mechanical
@@ -1957,14 +1970,16 @@ def design_final_candidates(
 ) -> list[RawClipCandidate]:
     """Stage2: final edit design (replaces the old ranking-only Stage2).
     Claude sees compact per-material summaries (never the full transcript)
-    and returns up to config.NUM_CANDIDATES fully-designed final
+    and returns up to config.STAGE2_MAX_DESIGNS fully-designed final
     candidates -- real segment references it may freely recombine across
-    different materials, never new/fabricated speech. Exactly one
-    Anthropic call, exactly like before; the only difference from the old
-    rank_candidates is what Claude is asked to produce (a designed
-    candidate list, not an id ranking) and what it's given to work with
-    (per-segment ids/text/timing, not one joined text block per
-    candidate).
+    different materials, never new/fabricated speech. STAGE2_MAX_DESIGNS
+    is deliberately wider than config.NUM_CANDIDATES (the number that must
+    actually survive local validation): see Stage2Output's docstring for
+    why over-producing here matters. Exactly one Anthropic call, exactly
+    like before; the only difference from the old rank_candidates is what
+    Claude is asked to produce (a designed candidate list, not an id
+    ranking) and what it's given to work with (per-segment ids/text/
+    timing, not one joined text block per candidate).
     """
     system_prompt = (_PROMPTS_DIR / "rank_and_finalize.md").read_text(encoding="utf-8")
     summaries = [_stage2_material_summary(mid, m, transcript) for mid, m in materials.items()]
@@ -2157,11 +2172,14 @@ def _design_finalize_and_cache(
         transcript.video_id, designed,
         evaluations=[_stage2_diagnostic_evaluation(e) for e in evaluations],
     )
-    # Stage2Output.candidates already caps at config.NUM_CANDIDATES for the
-    # real API path, but design_final_candidates is a normal function a
-    # caller/test can substitute directly (bypassing that schema) -- this
-    # truncation is the actual enforcement of "never more than
-    # NUM_CANDIDATES", not merely a mirror of the schema.
+    # Stage2Output.candidates may now hold up to config.STAGE2_MAX_DESIGNS
+    # (not config.NUM_CANDIDATES) designs -- see Stage2Output's docstring.
+    # This truncation is where "never surface more than NUM_CANDIDATES"
+    # actually happens: it takes the first NUM_CANDIDATES *accepted*
+    # designs, in the order Stage2 returned them (rank_and_finalize.md
+    # instructs it to return designs strongest-first), so an over-produced
+    # pool still yields the strongest surviving NUM_CANDIDATES, not merely
+    # whichever happened to be evaluated first.
     accepted = [e.candidate for e in evaluations if e.accepted][: config.NUM_CANDIDATES]
     if len(accepted) < config.NUM_CANDIDATES:
         # Stage2's prompt excludes a design entirely (rather than

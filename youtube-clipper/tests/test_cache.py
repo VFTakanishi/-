@@ -202,7 +202,7 @@ def test_schema_v3_is_miss_and_current_version_is_hit():
     stage1 and stage2, while a cache written under the current schema
     version must hit normally.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 11
+    assert config.CANDIDATE_SCHEMA_VERSION == 12
 
     v3_stage2_payload = {
         "schema_version": 3,
@@ -249,7 +249,7 @@ def test_schema_v4_is_miss_after_hook_scoring_prompt_bump():
     written under version 4 must still be treated as a miss under the
     current (later-bumped) schema version too.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 11
+    assert config.CANDIDATE_SCHEMA_VERSION == 12
 
     v4_stage2_payload = {
         "schema_version": 4,
@@ -292,7 +292,7 @@ def test_schema_v5_is_miss_after_stage1_recall_widening():
     missing viable candidates the wider search would have found). A cache
     written under version 5 must be treated as a miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 11
+    assert config.CANDIDATE_SCHEMA_VERSION == 12
 
     v5_stage1_payload = {
         "schema_version": 5,
@@ -340,7 +340,7 @@ def test_schema_v6_is_miss_after_anchor_trim_and_reorder_support():
     caches to be recomputed. A cache written under version 6 must be
     treated as a miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 11
+    assert config.CANDIDATE_SCHEMA_VERSION == 12
 
     v6_stage1_payload = {
         "schema_version": 6,
@@ -389,7 +389,7 @@ def test_schema_v7_is_miss_after_junction_safety_support():
     recomputed. A cache written under version 7 must be treated as a
     miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 11
+    assert config.CANDIDATE_SCHEMA_VERSION == 12
 
     v7_stage1_payload = {
         "schema_version": 7,
@@ -441,7 +441,7 @@ def test_schema_v8_is_miss_after_restart_and_closure_support():
     be recomputed. A cache written under version 8 must be treated as a
     miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 11
+    assert config.CANDIDATE_SCHEMA_VERSION == 12
 
     v8_stage1_payload = {
         "schema_version": 8,
@@ -487,7 +487,7 @@ def test_schema_v9_is_miss_after_stage2_final_design_support():
     treated as a miss -- it holds candidates Stage2 only ever ranked/
     excluded, never validated against the new final-design local gate.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 11
+    assert config.CANDIDATE_SCHEMA_VERSION == 12
 
     v9_stage1_payload = {
         "schema_version": 9,
@@ -542,7 +542,7 @@ def test_schema_v10_is_miss_after_stage1_material_contract_support():
     scheme (established since v3->v4) invalidates both stages together, so
     a v10 cache must be a miss on both Stage1 and Stage2.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 11
+    assert config.CANDIDATE_SCHEMA_VERSION == 12
 
     v10_stage1_payload = {
         "schema_version": 10,
@@ -577,6 +577,58 @@ def test_schema_v10_is_miss_after_stage1_material_contract_support():
     raw = _raw_candidate(hook_type="story")
     cache.save_stage2("vidV10", [raw, raw, raw])
     assert cache.load_stage2("vidV10") is not None
+
+
+def test_schema_v11_is_miss_after_stage2_overproduction_support():
+    """Real-machine incident: Stage2 designed only 2 final candidates when
+    NUM_CANDIDATES=3 were required, despite Stage1 having supplied plenty
+    of still-unused material -- both designs even passed local validation,
+    so the failure was purely "too few designs attempted," not over-strict
+    validation. Stage2Output.candidates' schema ceiling was decoupled from
+    NUM_CANDIDATES(3) to the new STAGE2_MAX_DESIGNS(6), and rank_and_
+    finalize.md now actively encourages designing as many independently
+    valid candidates as the material supports (never lowering the
+    semantic-closure/junction/duration bar to hit a count). This is a
+    genuine Structured Outputs schema change on the Stage2 side (Claude's
+    output contract allows more items now) plus a prompt change, so
+    CANDIDATE_SCHEMA_VERSION was bumped 11->12. A cache written under
+    version 11 must be treated as a miss on both stage1 and stage2.
+    """
+    assert config.CANDIDATE_SCHEMA_VERSION == 12
+
+    v11_stage1_payload = {
+        "schema_version": 11,
+        "chunks": {"0": {"materials": []}},
+    }
+    cache.stage1_path("vidV11").write_text(
+        json.dumps(v11_stage1_payload, ensure_ascii=False), encoding="utf-8"
+    )
+    assert cache.load_stage1_chunk("vidV11", 0) is None
+
+    v11_stage2_payload = {
+        "schema_version": 11,
+        "candidates": [
+            {
+                "hook_type": "story",
+                "segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}],
+                "hook_text": "h", "opening_hook_strength": 85,
+                "title": "t", "description": "d", "score": 85,
+                "reasoning": "r", "caveats": "",
+            }
+        ],
+    }
+    cache.stage2_path("vidV11").write_text(
+        json.dumps(v11_stage2_payload, ensure_ascii=False), encoding="utf-8"
+    )
+    assert cache.load_stage2("vidV11") is None
+
+    material = _raw_material(material_type="hook")
+    cache.save_stage1_chunk("vidV11", 0, [material])
+    assert cache.load_stage1_chunk("vidV11", 0) is not None
+
+    raw = _raw_candidate(hook_type="story")
+    cache.save_stage2("vidV11", [raw, raw, raw])
+    assert cache.load_stage2("vidV11") is not None
 
 
 def test_transcript_cache_is_unaffected_by_candidate_schema_versioning():

@@ -18,6 +18,24 @@ OUTPUT_DIR = Path(os.environ.get("PODCAST_CLIPPER_OUTPUT_DIR", BASE_DIR / "outpu
 # --- Candidate selection (absolute conditions #1, #4, #5, #12) --------
 NUM_CANDIDATES = 3
 
+# Real-machine incident: Stage2 designed only 2 final candidates (both of
+# which passed local validation) when NUM_CANDIDATES=3 were required, even
+# though Stage1 had supplied plenty of still-unused hook/reason/example
+# material across chunks -- Stage2 simply stopped at 2 designs instead of
+# exploring further combinations, so the whole run failed despite having
+# two perfectly good candidates. Stage2Output.candidates' schema ceiling
+# was previously tied directly to NUM_CANDIDATES (max 3), which meant
+# Stage2 could never even attempt to over-produce so the local gate (which
+# never rejected anything in that incident) could pick the best
+# NUM_CANDIDATES of a larger pool. STAGE2_MAX_DESIGNS decouples "how many
+# designs Stage2 may propose before validation" from NUM_CANDIDATES ("how
+# many finalized candidates must survive validation to succeed") --
+# _design_finalize_and_cache still requires the same NUM_CANDIDATES to
+# pass local validation to consider the run successful (never relaxed),
+# it just now has more candidates to validate against when Stage1 material
+# supports it.
+STAGE2_MAX_DESIGNS = 6
+
 # Stage1's per-chunk candidate (material) cap. This is *search breadth*,
 # not the final candidate count: raising MIN_OPENING_HOOK_STRENGTH to 80
 # means Stage1 capping itself at 3 candidates/chunk can leave too few
@@ -87,7 +105,7 @@ END_EXTENSION_CONTINUATION_MAX_GAP_SEC = 1.5
 # and treats a mismatch as a cache miss (falls back to a fresh Stage1/Stage2
 # run) rather than trying to deserialize old-shape data. The Whisper
 # transcript cache has no dependency on this and is unaffected.
-CANDIDATE_SCHEMA_VERSION = 11
+CANDIDATE_SCHEMA_VERSION = 12
 
 CHUNK_MINUTES = 10.0
 CHUNK_OVERLAP_MINUTES = 1.0
@@ -104,10 +122,17 @@ ANTHROPIC_MODEL = os.environ.get("PODCAST_CLIPPER_ANTHROPIC_MODEL", "claude-sonn
 # these ceilings are sized to match, not left at a large shared default.
 # Each is a ceiling, not a fixed cost: a response that finishes naturally
 # does not consume all of it. STAGE2_MAX_OUTPUT_TOKENS raised 512->1024 for
-# the Stage2 redesign: its output now includes a full segments array (with
-# anchors) per candidate instead of a bare id list.
+# the Stage2 redesign (its output now includes a full segments array with
+# anchors per candidate instead of a bare id list), then 1024->4096 when
+# Stage2Output.candidates' ceiling was decoupled from NUM_CANDIDATES(3) to
+# STAGE2_MAX_DESIGNS(6) -- see STAGE2_MAX_DESIGNS's docstring. Not a plain
+# doubling: each Stage2 segment carries *two* anchors (start_anchor_text
+# AND end_anchor_text, unlike Stage1's material segments which only ever
+# have one), so the worst case (6 candidates x 3 max-length-anchor
+# segments) came out to ~1307 estimated tokens -- see test_stage2_output_
+# max_json_size_is_well_under_max_tokens -- comfortably under half of 4096.
 STAGE1_MAX_OUTPUT_TOKENS = 2048
-STAGE2_MAX_OUTPUT_TOKENS = 1024
+STAGE2_MAX_OUTPUT_TOKENS = 4096
 
 # hook_text is the candidate's real opening transcript text (never
 # AI-authored -- see clip_selector.py's _deterministic_hook_text), truncated
