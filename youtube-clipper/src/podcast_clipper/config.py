@@ -16,24 +16,34 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 OUTPUT_DIR = Path(os.environ.get("PODCAST_CLIPPER_OUTPUT_DIR", BASE_DIR / "output"))
 
 # --- Candidate selection (absolute conditions #1, #4, #5, #12) --------
+# The target/ceiling for how many final candidates to show the user --
+# NOT a required minimum. Real-machine incident: a run that produced 1-2
+# genuinely good, locally-accepted candidates used to be thrown away as a
+# total failure (RuntimeError, nothing shown to the user) just because a
+# 3rd didn't also survive every gate -- aiming for 100 points and shipping
+# 0 is worse than shipping the 1-2 solid candidates that do exist.
+# _design_finalize_and_cache/finalize_candidates now only raise when
+# ZERO candidates survive; 1 or more always succeeds and returns exactly
+# that many (never padded up to NUM_CANDIDATES, never rejected merely for
+# being fewer). Quality bars themselves (hook strength, duration, semantic
+# closure, disfluency/restart, junction safety, ending completeness,
+# overlap, segment validity) are never relaxed to reach a higher count.
 NUM_CANDIDATES = 3
 
 # Real-machine incident: Stage2 designed only 2 final candidates (both of
 # which passed local validation) when NUM_CANDIDATES=3 were required, even
 # though Stage1 had supplied plenty of still-unused hook/reason/example
 # material across chunks -- Stage2 simply stopped at 2 designs instead of
-# exploring further combinations, so the whole run failed despite having
-# two perfectly good candidates. Stage2Output.candidates' schema ceiling
-# was previously tied directly to NUM_CANDIDATES (max 3), which meant
-# Stage2 could never even attempt to over-produce so the local gate (which
-# never rejected anything in that incident) could pick the best
+# exploring further combinations. (This predates the NUM_CANDIDATES
+# minimum being dropped above -- at the time, that shortfall alone failed
+# the whole run.) Stage2Output.candidates' schema ceiling was previously
+# tied directly to NUM_CANDIDATES (max 3), which meant Stage2 could never
+# even attempt to over-produce so the local gate could pick the best
 # NUM_CANDIDATES of a larger pool. STAGE2_MAX_DESIGNS decouples "how many
 # designs Stage2 may propose before validation" from NUM_CANDIDATES ("how
-# many finalized candidates must survive validation to succeed") --
-# _design_finalize_and_cache still requires the same NUM_CANDIDATES to
-# pass local validation to consider the run successful (never relaxed),
-# it just now has more candidates to validate against when Stage1 material
-# supports it.
+# many finalized candidates to aim for") -- Stage2 still has more
+# candidates to design against when Stage1 material supports it, even
+# though a shortfall below NUM_CANDIDATES is no longer itself a failure.
 STAGE2_MAX_DESIGNS = 6
 
 # Stage1's per-chunk candidate (material) cap. This is *search breadth*,

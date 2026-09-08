@@ -2872,11 +2872,12 @@ def test_select_candidates_raises_when_all_cached_candidates_exceed_hard_max_aft
         clip_selector.select_candidates(transcript, "タイトル")
 
 
-def test_select_candidates_raises_when_only_some_cached_candidates_remain_eligible(monkeypatch):
-    """F: 2 of 3 cached candidates stay within hard bounds after
-    extension, 1 doesn't -- the absolute condition is exactly 3
-    candidates, so select_candidates must not silently return the 2
-    still-valid ones; it must raise instead of shortchanging the UI.
+def test_select_candidates_returns_partial_when_only_some_cached_candidates_remain_eligible(monkeypatch):
+    """F (revised): NUM_CANDIDATES is a target/ceiling, not a required
+    minimum -- 2 of 3 cached candidates staying within hard bounds after
+    extension must be returned as a 2-candidate result, never discarded
+    just because a 3rd didn't also survive (real-machine incident: doing
+    so threw away genuinely good candidates as a total failure).
     """
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 5.0)
@@ -2887,8 +2888,11 @@ def test_select_candidates_raises_when_only_some_cached_candidates_remain_eligib
     bad = _raw_candidate(0, 1, opening_hook_strength=90)  # extends past segment 2 -> exceeds hard max
     cache.save_stage2(transcript.video_id, [good, good, bad])
 
-    with pytest.raises(RuntimeError, match="有効な"):
-        clip_selector.select_candidates(transcript, "タイトル")
+    result = clip_selector.select_candidates(transcript, "タイトル")
+
+    assert len(result) == 2
+    reloaded = cache.load_stage2(transcript.video_id)
+    assert len(reloaded) == 2
 
 
 def test_select_candidates_applies_the_same_duration_rule_on_fresh_and_cached_paths(monkeypatch):
@@ -3226,7 +3230,7 @@ def test_design_finalize_G_rejects_fabricated_segment_id(monkeypatch):
 
     monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
 
-    with pytest.raises(RuntimeError, match="ローカル検証を通過したのは"):
+    with pytest.raises(RuntimeError, match="ローカル検証を通過したものが0件"):
         clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
 
 
@@ -3245,25 +3249,42 @@ def test_design_finalize_I_rejects_out_of_bounds_duration(monkeypatch):
 
     monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
 
-    with pytest.raises(RuntimeError, match="ローカル検証を通過したのは"):
+    with pytest.raises(RuntimeError, match="ローカル検証を通過したものが0件"):
         clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
 
 
 def test_design_finalize_J_rejects_unsafe_junction(monkeypatch):
     # J: a Stage2 design whose segments cut together unsafely (an
     # unfinished clause hard-cut into an unrelated topic) is rejected by
-    # the unchanged evaluate_candidate_junctions check.
+    # the unchanged evaluate_candidate_junctions check. Uses
+    # _unfixable_bad_junction_transcript (not _junction_transcript): the
+    # gap to the chronologically-next segment there is deliberately too
+    # large for _extend_internal_junctions to bridge, so the hook's
+    # unfinished "...のであれば" ending truly can't be fixed by extension
+    # first -- with a close-by next segment, extension alone resolves the
+    # incompleteness before the junction check ever runs, which would
+    # make this scenario safe (and accepted) instead of unsafe.
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    transcript = _junction_transcript()
-    materials = [_raw_material(0, 1)]
+    transcript = _unfixable_bad_junction_transcript()
+    materials = [_raw_material(0, 0)]
 
     def _fake_design(m, t, title):
-        return [_junction_candidate(3, 3)]  # segment 1 -> unrelated distant segment 3
+        return [
+            RawClipCandidate(
+                hook_type="strong_take",
+                segments=[
+                    RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+                    RawUsedSegment(role="context", start_segment_id=2, end_segment_id=2),
+                ],
+                hook_text="h", opening_hook_strength=90, title="", description="",
+                score=90, reasoning="", caveats="",
+            )
+        ]  # segment 0 (unfinished) -> unrelated distant segment 2, skipping segment 1
 
     monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
 
-    with pytest.raises(RuntimeError, match="ローカル検証を通過したのは"):
+    with pytest.raises(RuntimeError, match="ローカル検証を通過したものが0件"):
         clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
 
 
@@ -3275,10 +3296,12 @@ def test_design_finalize_J_rejects_unsafe_junction(monkeypatch):
 # undiagnosable without a fresh, API-calling re-analysis)
 
 
-def test_design_finalize_A_saves_diagnostic_when_too_few_candidates_designed(monkeypatch):
-    # A: Stage2 returns only 2 designs (< NUM_CANDIDATES=3) -- the
-    # RuntimeError this raises must not erase the record of what those 2
-    # designs actually were.
+def test_design_finalize_A_succeeds_with_one_candidate_and_still_saves_diagnostic(monkeypatch):
+    # A (revised): Stage2 returns only 2 designs and one is locally
+    # rejected -- since NUM_CANDIDATES is now a target/ceiling, not a
+    # required minimum, the surviving 1 candidate is a success, not a
+    # RuntimeError. The diagnostic snapshot must still record both of
+    # Stage2's raw designs and each one's verdict either way.
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
@@ -3290,14 +3313,17 @@ def test_design_finalize_A_saves_diagnostic_when_too_few_candidates_designed(mon
 
     monkeypatch.setattr(clip_selector, "design_final_candidates", lambda m, t, title: two_designs)
 
-    with pytest.raises(RuntimeError, match="ローカル検証を通過したのは"):
-        clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+    result = clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+    assert len(result) == 1
 
-    # stage2_result.json (the production cache) must remain untouched.
-    assert cache.load_stage2(transcript.video_id) is None
+    # stage2_result.json (the production cache) now holds the 1 successful
+    # candidate -- partial success is real success, not withheld.
+    saved = cache.load_stage2(transcript.video_id)
+    assert saved is not None
+    assert len(saved) == 1
 
-    # But the diagnostic snapshot must exist, with both of Stage2's raw
-    # designs and a per-candidate local-validation verdict.
+    # The diagnostic snapshot records both of Stage2's raw designs and a
+    # per-candidate local-validation verdict, regardless of the outcome.
     diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
     assert diagnostic is not None
     assert len(diagnostic["candidates"]) == 2
@@ -3307,12 +3333,13 @@ def test_design_finalize_A_saves_diagnostic_when_too_few_candidates_designed(mon
     assert diagnostic["evaluations"][1]["reason"] == "hook_strength_below_80"
 
 
-def test_design_finalize_B_diagnostic_records_all_three_designs_with_one_rejected(monkeypatch):
-    # B: Stage2 returns exactly NUM_CANDIDATES=3 designs, but one fails
-    # local validation (fabricated segment_id) -- only 2 remain accepted,
-    # so this still raises (never padded below NUM_CANDIDATES), but the
-    # diagnostic must show all 3 original designs plus each one's verdict,
-    # not just the 2 that would otherwise have succeeded.
+def test_design_finalize_B_succeeds_with_two_candidates_and_records_all_three_in_diagnostic(monkeypatch):
+    # B (revised): Stage2 returns 3 designs but one fails local validation
+    # (fabricated segment_id) -- the surviving 2 are returned as a
+    # 2-candidate success (never padded, never rejected merely for being
+    # fewer than NUM_CANDIDATES). The diagnostic still shows all 3
+    # original designs plus each one's verdict, not just the 2 that
+    # succeeded.
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
@@ -3325,8 +3352,12 @@ def test_design_finalize_B_diagnostic_records_all_three_designs_with_one_rejecte
 
     monkeypatch.setattr(clip_selector, "design_final_candidates", lambda m, t, title: three_designs)
 
-    with pytest.raises(RuntimeError, match="ローカル検証を通過したのは"):
-        clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+    result = clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+    assert len(result) == 2
+
+    saved = cache.load_stage2(transcript.video_id)
+    assert saved is not None
+    assert len(saved) == 2
 
     diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
     assert len(diagnostic["candidates"]) == 3
@@ -3388,6 +3419,61 @@ def test_design_finalize_takes_top_num_candidates_when_stage2_overproduces(monke
     assert all(e["accepted"] for e in diagnostic["evaluations"])
 
 
+def test_design_finalize_D_takes_top_three_when_five_designed_four_accepted(monkeypatch):
+    # D: Stage2 over-produces 5 designs, 1 of which fails local validation
+    # -- the remaining 4 accepted still only yield the top NUM_CANDIDATES
+    # (3), by score, never all 4.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    materials = [_raw_material(0, 2) for _ in range(5)]
+    five_designs = [
+        _raw_candidate(0, 2, opening_hook_strength=90, score=95),
+        _raw_candidate(0, 2, opening_hook_strength=90, score=90),
+        _raw_candidate(9999, 9999, opening_hook_strength=90, score=88),  # fabricated -> rejected
+        _raw_candidate(0, 2, opening_hook_strength=90, score=85),
+        _raw_candidate(0, 2, opening_hook_strength=90, score=80),
+    ]
+
+    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda m, t, title: five_designs)
+
+    result = clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+
+    assert len(result) == config.NUM_CANDIDATES == 3
+    assert [c.score for c in result] == [95, 90, 85]
+
+    diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
+    assert len(diagnostic["candidates"]) == 5
+    reasons = [e["reason"] for e in diagnostic["evaluations"]]
+    assert reasons.count("accepted") == 4
+    assert "invalid_segment_reference" in reasons
+
+
+def test_design_finalize_F_raises_when_two_designed_zero_accepted(monkeypatch):
+    # F: the one remaining failure case -- Stage2 designs 2 candidates,
+    # but ZERO survive local validation (both fabricated). Unlike a
+    # shortfall below NUM_CANDIDATES (no longer a failure), zero
+    # candidates is still a hard failure with no substitute available.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    materials = [_raw_material(0, 2), _raw_material(0, 2)]
+    two_bad_designs = [
+        _raw_candidate(9999, 9999, opening_hook_strength=90),
+        _raw_candidate(8888, 8888, opening_hook_strength=90),
+    ]
+
+    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda m, t, title: two_bad_designs)
+
+    with pytest.raises(RuntimeError, match="ローカル検証を通過したものが0件"):
+        clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+
+    assert cache.load_stage2(transcript.video_id) is None
+    diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
+    assert len(diagnostic["candidates"]) == 2
+    assert all(not e["accepted"] for e in diagnostic["evaluations"])
+
+
 def test_design_final_candidates_saves_raw_diagnostic_before_dedup(monkeypatch):
     # The first diagnostic write happens inside design_final_candidates
     # itself, right after Stage2's Structured Output is parsed -- before
@@ -3445,7 +3531,11 @@ def test_select_candidates_raises_without_calling_stage2_when_no_usable_material
         clip_selector.select_candidates(transcript, "タイトル")
 
 
-def test_select_candidates_raises_when_stage2_returns_too_few_ids(monkeypatch):
+def test_select_candidates_succeeds_with_one_candidate_when_stage2_designs_only_one(monkeypatch):
+    # B: Stage2 designing (and locally passing) only 1 candidate is a
+    # success returning that 1 candidate -- NUM_CANDIDATES is a target,
+    # not a required minimum (real-machine incident: 1-2 good candidates
+    # used to be discarded entirely as a failure).
     transcript = _long_transcript(minutes=1)
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
@@ -3456,15 +3546,18 @@ def test_select_candidates_raises_when_stage2_returns_too_few_ids(monkeypatch):
         lambda materials, t, title: [_raw_candidate(0, 2) for _ in range(1)],
     )
 
-    with pytest.raises(RuntimeError, match="ローカル検証を通過したのは"):
-        clip_selector.select_candidates(transcript, "タイトル")
+    result = clip_selector.select_candidates(transcript, "タイトル")
+    assert len(result) == 1
+
+    saved = cache.load_stage2(transcript.video_id)
+    assert saved is not None
+    assert len(saved) == 1
 
 
-def test_select_candidates_raises_when_only_two_candidates_pass_semantic_closure(monkeypatch):
-    # J: exactly the "only 2 pass semantic closure" shape -- Stage2 must
-    # not pad ranked_candidate_ids back up to config.NUM_CANDIDATES, and
-    # the existing no-auto-retry RuntimeError must fire exactly as it does
-    # for any other id shortfall (referential-integrity or closure alike).
+def test_select_candidates_succeeds_with_two_candidates_when_only_two_pass_semantic_closure(monkeypatch):
+    # A: exactly the "only 2 pass semantic closure" shape -- this is now a
+    # 2-candidate success, never padded up to config.NUM_CANDIDATES and
+    # never rejected merely for being fewer.
     transcript = _long_transcript(minutes=1)
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
@@ -3475,8 +3568,12 @@ def test_select_candidates_raises_when_only_two_candidates_pass_semantic_closure
         lambda materials, t, title: [_raw_candidate(0, 2) for _ in range(2)],
     )
 
-    with pytest.raises(RuntimeError, match="ローカル検証を通過したのは"):
-        clip_selector.select_candidates(transcript, "タイトル")
+    result = clip_selector.select_candidates(transcript, "タイトル")
+    assert len(result) == 2
+
+    saved = cache.load_stage2(transcript.video_id)
+    assert saved is not None
+    assert len(saved) == 2
 
 
 def test_select_candidates_happy_path(monkeypatch):
@@ -4261,27 +4358,55 @@ def test_refresh_stage1_and_candidates_raises_without_stage2_call_when_no_usable
         clip_selector.refresh_stage1_and_candidates(transcript, "タイトル")
 
 
-def test_refresh_stage1_and_candidates_does_not_overwrite_stage2_cache_when_finalize_fails(monkeypatch):
+def test_refresh_stage1_and_candidates_overwrites_stage2_cache_with_partial_success(monkeypatch):
+    # Revised: 2 valid designs is a real success (NUM_CANDIDATES is a
+    # target, not a required minimum), so it DOES overwrite the old
+    # Stage2 cache with the new, smaller-but-valid result -- a refresh
+    # that finds fewer-but-still-good candidates must not keep serving a
+    # stale 3-candidate result instead.
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
 
-    # Existing Stage2 cache from a prior successful run -- must survive
-    # completely untouched if this refresh's final gate fails.
     old_stage2 = [_raw_candidate(0, 2, opening_hook_strength=90)] * 3
     cache.save_stage2(transcript.video_id, old_stage2)
 
     fresh_materials = [_raw_material(0, 2, usefulness_score=90) for _ in range(3)]
     monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", lambda *a, **k: fresh_materials)
-    # Stage2 design runs (costs 1 API call) but returns only 2 valid
-    # designs -- _design_finalize_and_cache must raise before ever calling
-    # cache.save_stage2, leaving the old cache exactly as it was.
     monkeypatch.setattr(
         clip_selector, "design_final_candidates",
         lambda materials, t, title: [_raw_candidate(0, 2, opening_hook_strength=90) for _ in range(2)],
     )
 
-    with pytest.raises(RuntimeError, match="ローカル検証を通過したのは"):
+    result = clip_selector.refresh_stage1_and_candidates(transcript, "タイトル")
+    assert len(result) == 2
+
+    reloaded = cache.load_stage2(transcript.video_id)
+    assert len(reloaded) == 2
+
+
+def test_refresh_stage1_and_candidates_does_not_overwrite_stage2_cache_when_nothing_accepted(monkeypatch):
+    # The still-valid safety net: when truly ZERO designs survive local
+    # validation, the old Stage2 cache must survive completely untouched
+    # -- this is the only case _design_finalize_and_cache still raises for.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+
+    old_stage2 = [_raw_candidate(0, 2, opening_hook_strength=90)] * 3
+    cache.save_stage2(transcript.video_id, old_stage2)
+
+    fresh_materials = [_raw_material(0, 2, usefulness_score=90) for _ in range(3)]
+    monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", lambda *a, **k: fresh_materials)
+    # Every design Stage2 returns is fabricated (invalid_segment_reference)
+    # -- zero survive local validation, so this must still raise before
+    # ever calling cache.save_stage2, leaving the old cache exactly as it was.
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda materials, t, title: [_raw_candidate(9999, 9999, opening_hook_strength=90) for _ in range(2)],
+    )
+
+    with pytest.raises(RuntimeError, match="ローカル検証を通過したものが0件"):
         clip_selector.refresh_stage1_and_candidates(transcript, "タイトル")
 
     reloaded = cache.load_stage2(transcript.video_id)

@@ -129,6 +129,28 @@ def test_stage2_round_trip():
     assert loaded[0].caveats == "注意"
 
 
+def test_stage2_round_trip_with_one_candidate():
+    # G: NUM_CANDIDATES is a target/ceiling, not a required minimum -- a
+    # successful run may legitimately produce just 1 candidate, and the
+    # cache must store/load that as-is, never assuming exactly 3.
+    raw = _raw_candidate(hook_type="strong_take")
+    cache.save_stage2("vidOne", [raw])
+    loaded = cache.load_stage2("vidOne")
+
+    assert loaded is not None
+    assert len(loaded) == 1
+
+
+def test_stage2_round_trip_with_two_candidates():
+    # H: same for 2 candidates.
+    raw = _raw_candidate(hook_type="strong_take")
+    cache.save_stage2("vidTwo", [raw, raw])
+    loaded = cache.load_stage2("vidTwo")
+
+    assert loaded is not None
+    assert len(loaded) == 2
+
+
 # --- Stage2 diagnostic: raw Stage2 output survives a failed run ---------
 # (separate from stage2_result.json, which only ever holds a fully
 # successful run's finalized, accepted candidates)

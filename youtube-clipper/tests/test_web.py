@@ -167,6 +167,77 @@ def test_analyze_then_render_then_download_flow(monkeypatch, tmp_path):
     assert dl.headers["content-type"] == "video/mp4"
 
 
+def test_analyze_then_render_then_download_flow_with_only_one_candidate(monkeypatch, tmp_path):
+    # J: NUM_CANDIDATES is a target/ceiling, not a required minimum -- a
+    # successful analysis may legitimately surface just 1 candidate (see
+    # clip_selector.NUM_CANDIDATES), and render/download must work
+    # identically to the 3-candidate case: no code path here may assume
+    # candidates has exactly 3 entries.
+    monkeypatch.setattr(ingest, "_probe_duration", lambda path: 6.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+
+    def fake_transcribe(path, vid, force_refresh=False):
+        t = _fake_transcript(vid)
+        cache.save_transcript(t)
+        return t
+
+    def fake_select_candidates(transcript, title, force_refresh=False):
+        candidates = [_fake_raw_candidate()]
+        cache.save_stage2(transcript.video_id, candidates)
+        return candidates
+
+    monkeypatch.setattr(transcribe, "transcribe_video", fake_transcribe)
+    monkeypatch.setattr(
+        "podcast_clipper.web.clip_selector.select_candidates", fake_select_candidates
+    )
+
+    client = TestClient(web.app)
+
+    resp = client.post(
+        "/api/analyze",
+        files={"file": ("テスト番組.mp4", io.BytesIO(_FAKE_VIDEO_BYTES), "video/mp4")},
+    )
+    assert resp.status_code == 200
+    analyze_job_id = resp.json()["job_id"]
+
+    job = _wait_for_status(client, f"/api/jobs/{analyze_job_id}", {"completed", "failed"})
+    assert job["status"] == "completed", job.get("error")
+    candidates = job["result"]["candidates"]
+    assert len(candidates) == 1
+
+    fake_final = tmp_path / "final.mp4"
+    fake_final.write_bytes(b"fake mp4 bytes")
+
+    def fake_render_candidate(source_path, candidate, video_id_):
+        return RenderManifest(
+            video_id=video_id_, candidate_id=candidate.id, segments=candidate.segments,
+            hook_text=candidate.hook_text, watermark_text=config.WATERMARK_TEXT,
+            total_duration=candidate.total_duration,
+            intermediate_video_path=str(tmp_path / "mid.mp4"),
+            final_video_path=str(fake_final),
+        )
+
+    monkeypatch.setattr("podcast_clipper.web.render.render_candidate", fake_render_candidate)
+    monkeypatch.setattr(
+        "podcast_clipper.web.qa.run_full_qa",
+        lambda raw, transcript, manifest, source_path: qa.QAReport(checks=[], thumbnails=[]),
+    )
+
+    resp = client.post(f"/api/jobs/{analyze_job_id}/render", json={"candidate_id": "c1"})
+    assert resp.status_code == 200
+    render_id = resp.json()["render_id"]
+
+    render_job = _wait_for_status(
+        client, f"/api/jobs/{analyze_job_id}/render/{render_id}", {"completed", "failed"}
+    )
+    assert render_job["status"] == "completed", render_job.get("error")
+
+    dl = client.get(f"/api/jobs/{analyze_job_id}/render/{render_id}/download")
+    assert dl.status_code == 200
+    assert dl.content == b"fake mp4 bytes"
+
+
 def test_download_blocked_when_qa_has_critical_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(ingest, "_probe_duration", lambda path: 6.0)
     # See the comment in test_analyze_then_render_then_download_flow above:

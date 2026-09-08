@@ -166,7 +166,15 @@ function pollAnalyze() {
         statusEl.textContent = `解析中… (状態: ${job.status})`;
         analyzePollTimer = setTimeout(pollAnalyze, 3000);
       } else if (job.status === "completed") {
-        statusEl.textContent = `解析完了: ${job.result.video_title}`;
+        const n = job.result.candidates.length;
+        // Fewer than the ideal 3 is not an error -- the backend already
+        // only fails when zero candidates clear the quality bar (see
+        // clip_selector.NUM_CANDIDATES). A quiet note, not red/error
+        // styling, is enough to explain a shorter list.
+        statusEl.textContent =
+          n < 3
+            ? `解析完了: ${job.result.video_title}（今回は品質基準を満たした候補が${n}件でした）`
+            : `解析完了: ${job.result.video_title}`;
         renderCandidates(job.result.candidates);
       } else if (job.status === "interrupted") {
         statusEl.textContent = job.resumable
@@ -237,7 +245,14 @@ document.getElementById("refresh-stage1-btn").addEventListener("click", async ()
 function renderCandidates(candidates) {
   const section = document.getElementById("candidates-section");
   const container = document.getElementById("candidates");
+  const heading = document.getElementById("candidates-heading");
   container.innerHTML = "";
+
+  // The backend no longer requires exactly 3 candidates to succeed -- 1
+  // or 2 solid candidates are shown as-is rather than treated as a
+  // failure (see clip_selector.NUM_CANDIDATES), so the heading must
+  // reflect however many actually came back, never a hardcoded "3件".
+  heading.textContent = `2. 候補（${candidates.length}件）から1件を選択`;
 
   candidates.forEach((c) => {
     const card = document.createElement("div");

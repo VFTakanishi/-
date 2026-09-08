@@ -2047,12 +2047,18 @@ def finalize_candidates(
     cached or in-flight raw candidate can never reach render/QA without
     going through the identical correction the UI already showed.
 
-    If fewer than config.NUM_CANDIDATES remain eligible after this,
-    raises immediately -- there is no substitute available without
-    re-running Stage1/Stage2 against the Claude API, which this function
-    must never do. The caller (re-analyzing an already-cached video)
-    needs an explicit signal that a fresh analysis is required, not a
-    silently short candidate list. Callers must not call
+    If NO candidates remain eligible after this, raises immediately --
+    there is no substitute available without re-running Stage1/Stage2
+    against the Claude API, which this function must never do. config.
+    NUM_CANDIDATES is a target/ceiling here, not a minimum: real-machine
+    feedback showed that treating it as a hard minimum turned a run that
+    had produced 1-2 genuinely good candidates into a total failure the
+    user never saw at all, just because a 3rd didn't also clear every
+    gate. Whatever subset (1 up to NUM_CANDIDATES) survives is returned
+    as-is -- never padded, never rejected merely for being fewer than
+    NUM_CANDIDATES. The caller (re-analyzing an already-cached video)
+    still gets an explicit signal (this raise) when literally nothing
+    survives, not a silently empty candidate list. Callers must not call
     cache.save_stage2 until *after* this returns successfully: a raise
     here must never leave a partially-corrected or unresolvable result
     written to disk, so an already-cached-but-now-insufficient candidate
@@ -2081,14 +2087,14 @@ def finalize_candidates(
         if config.DURATION_HARD_MIN_SEC <= dur <= config.DURATION_HARD_MAX_SEC:
             finalized.append(extended)
 
-    if len(finalized) < config.NUM_CANDIDATES:
+    if not finalized:
         raise RuntimeError(
             "保存済み候補のうち、自然な発話終端を確保できない候補（例: 「〜ので」等の"
             "継続表現で終わっており、これ以上延長できないもの）、発話の流暢性チェックに"
             "失敗した候補（言い淀み・自己修正・言い直し(restart)・未完のhook）、または延長後の尺が"
             f"目標範囲（{config.DURATION_HARD_MIN_SEC:.0f}〜{config.DURATION_HARD_MAX_SEC:.0f}秒）"
-            f"を外れる候補があり、有効な{config.NUM_CANDIDATES}候補を確保できませんでした"
-            f"（有効{len(finalized)}件）。再解析が必要です。APIへの自動再要求は行いません。"
+            "を外れる候補しかなく、有効な候補を1件も確保できませんでした。"
+            "再解析が必要です。APIへの自動再要求は行いません。"
         )
     return finalized
 
@@ -2098,10 +2104,13 @@ def select_candidates(
 ) -> list[RawClipCandidate]:
     """Runs Stage1 (per-chunk cached, recall-priority materials) -> a
     lightweight material prefilter -> Stage2 (final edit design) and
-    returns exactly config.NUM_CANDIDATES candidates. Neither stage
-    retries automatically: if no usable material survives the prefilter,
-    or too few of Stage2's designed candidates survive local validation,
-    this raises immediately rather than requesting more from the API.
+    returns 1 to config.NUM_CANDIDATES candidates -- NUM_CANDIDATES is a
+    target/ceiling, not a required minimum (see finalize_candidates'
+    docstring): a run that produces fewer good candidates than the
+    ceiling still succeeds and returns exactly what it has. Neither stage
+    retries automatically: only when literally no usable material
+    survives the prefilter, or NOTHING Stage2 designed survives local
+    validation, does this raise instead of requesting more from the API.
     Every return path calls finalize_candidates *before*
     cache.save_stage2 (never after), so the Stage2 cache on disk always
     holds the finalized (ending-corrected, duration-validated) result --
@@ -2154,10 +2163,22 @@ def _design_finalize_and_cache(
     reject methods still apply as a safety net, matching item 7's "don't
     delete existing gates yet."
 
-    If finalize_candidates raises (too few candidates remain eligible
-    after ending-completeness/duration re-validation), the Stage2 cache
-    is never touched -- callers only ever see either a full, cached,
-    finalized result or an exception, never a partially-written cache.
+    config.NUM_CANDIDATES is a target/ceiling, never a required minimum:
+    a real-machine incident showed 2 genuinely good, locally-accepted
+    candidates being thrown away as a total failure just because a 3rd
+    didn't also survive -- "aim for 100 points and ship nothing" is worse
+    than shipping the 1-2 solid candidates that do exist. So this returns
+    whatever subset (1 up to NUM_CANDIDATES) actually passes; only zero
+    surviving candidates raises. Quality bars themselves (hook strength,
+    duration, semantic closure, disfluency/restart, junction safety,
+    ending completeness, overlap, segment validity) are never relaxed to
+    reach a higher count -- see finalize_candidates and evaluate_local_
+    candidate, both unchanged.
+
+    If finalize_candidates raises (nothing remains eligible after ending-
+    completeness/duration re-validation), the Stage2 cache is never
+    touched -- callers only ever see either a full, cached, finalized
+    result or an exception, never a partially-written cache.
     """
     material_map = {f"s1_m{i:03d}": m for i, m in enumerate(materials)}
     designed = design_final_candidates(material_map, transcript, video_title)
@@ -2165,7 +2186,7 @@ def _design_finalize_and_cache(
     evaluations = _evaluate_all_local_candidates(designed, transcript)
     # Re-saves the same diagnostic snapshot design_final_candidates already
     # wrote, now with each candidate's local-validation verdict attached --
-    # this runs regardless of whether enough candidates end up accepted
+    # this runs regardless of whether any candidates end up accepted
     # below, so a failed run still leaves a full "what did Stage2 design,
     # and why did each one pass/fail" record on disk.
     cache.save_stage2_diagnostic(
@@ -2178,23 +2199,22 @@ def _design_finalize_and_cache(
     # actually happens: it takes the first NUM_CANDIDATES *accepted*
     # designs, in the order Stage2 returned them (rank_and_finalize.md
     # instructs it to return designs strongest-first), so an over-produced
-    # pool still yields the strongest surviving NUM_CANDIDATES, not merely
-    # whichever happened to be evaluated first.
+    # pool still yields the strongest surviving up-to-NUM_CANDIDATES, not
+    # merely whichever happened to be evaluated first.
     accepted = [e.candidate for e in evaluations if e.accepted][: config.NUM_CANDIDATES]
-    if len(accepted) < config.NUM_CANDIDATES:
+    if not accepted:
         # Stage2's prompt excludes a design entirely (rather than
         # returning a broken one) when it can't satisfy semantic closure
-        # or duration bounds -- see rank_and_finalize.md. So "too few"
-        # here can mean Stage2 itself returned fewer than NUM_CANDIDATES
-        # designs, or it returned enough but one failed local validation
-        # (an invented segment_id, an unsafe junction, ...) -- either way,
-        # never padded to reach config.NUM_CANDIDATES, and never
-        # auto-retried.
+        # or duration bounds -- see rank_and_finalize.md. So "nothing
+        # accepted" here can mean Stage2 itself returned zero designs, or
+        # every design it returned failed local validation (an invented
+        # segment_id, an unsafe junction, ...) -- either way, this is the
+        # only case that raises; 1 or more accepted always succeeds with
+        # exactly that many candidates, never auto-retried.
         raise RuntimeError(
-            f"Stage2が設計した完成candidateのうち、ローカル検証を通過したのは{len(accepted)}件です"
-            f"（{config.NUM_CANDIDATES}件必要）。フックが提示した問い・主張を本文で"
-            "回収できていない設計、または実在しないsegment参照・尺・接続の不備がある設計は"
-            "除外される仕様です。APIへの自動再要求は行いません。"
+            "Stage2が設計した完成candidateのうち、ローカル検証を通過したものが0件でした。"
+            "フックが提示した問い・主張を本文で回収できていない設計、または実在しないsegment"
+            "参照・尺・接続の不備がある設計は除外される仕様です。APIへの自動再要求は行いません。"
             + _format_diagnostic_summary(evaluations)
         )
 
