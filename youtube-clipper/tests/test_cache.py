@@ -6,6 +6,8 @@ from podcast_clipper import cache, config
 from podcast_clipper.models import (
     MalformedCandidateError,
     RawClipCandidate,
+    RawMaterial,
+    RawMaterialSegment,
     RawUsedSegment,
     Transcript,
     TranscriptSegment,
@@ -35,6 +37,14 @@ def _raw_candidate(hook_type="open_loop", caveats=""):
     )
 
 
+def _raw_material(material_type="hook", usefulness_score=80):
+    return RawMaterial(
+        material_type=material_type,
+        segments=[RawMaterialSegment(start_segment_id=0, end_segment_id=0)],
+        usefulness_score=usefulness_score,
+    )
+
+
 def test_transcript_round_trip():
     original = _transcript()
     cache.save_transcript(original)
@@ -54,12 +64,12 @@ def test_transcript_missing_returns_none():
 
 
 def test_stage1_chunk_round_trip():
-    raw = _raw_candidate(hook_type="open_loop")
-    cache.save_stage1_chunk("vidA", 0, [raw])
+    material = _raw_material(material_type="hook")
+    cache.save_stage1_chunk("vidA", 0, [material])
     loaded = cache.load_stage1_chunk("vidA", 0)
 
     assert loaded is not None
-    assert loaded[0].hook_type == "open_loop"
+    assert loaded[0].material_type == "hook"
 
 
 def test_stage1_missing_chunk_returns_none():
@@ -72,23 +82,23 @@ def test_stage1_chunk_partial_failure_keeps_earlier_successful_chunks():
     on disk, and the still-missing chunk2 must read back as a plain miss,
     not raise or corrupt the file.
     """
-    cache.save_stage1_chunk("vidChunks", 0, [_raw_candidate(hook_type="open_loop")])
-    cache.save_stage1_chunk("vidChunks", 1, [_raw_candidate(hook_type="strong_take")])
+    cache.save_stage1_chunk("vidChunks", 0, [_raw_material(material_type="hook")])
+    cache.save_stage1_chunk("vidChunks", 1, [_raw_material(material_type="reason")])
     # chunk 2's API call "failed" -- save_stage1_chunk is simply never called for it.
 
-    assert cache.load_stage1_chunk("vidChunks", 0)[0].hook_type == "open_loop"
-    assert cache.load_stage1_chunk("vidChunks", 1)[0].hook_type == "strong_take"
+    assert cache.load_stage1_chunk("vidChunks", 0)[0].material_type == "hook"
+    assert cache.load_stage1_chunk("vidChunks", 1)[0].material_type == "reason"
     assert cache.load_stage1_chunk("vidChunks", 2) is None
 
 
 def test_stage1_chunk_save_does_not_overwrite_other_chunks():
-    cache.save_stage1_chunk("vidG", 0, [_raw_candidate(hook_type="open_loop")])
-    cache.save_stage1_chunk("vidG", 1, [_raw_candidate(hook_type="strong_take")])
+    cache.save_stage1_chunk("vidG", 0, [_raw_material(material_type="hook")])
+    cache.save_stage1_chunk("vidG", 1, [_raw_material(material_type="reason")])
     # re-saving chunk 0 (e.g. force_refresh) must not disturb chunk 1
-    cache.save_stage1_chunk("vidG", 0, [_raw_candidate(hook_type="surprising_fact")])
+    cache.save_stage1_chunk("vidG", 0, [_raw_material(material_type="example")])
 
-    assert cache.load_stage1_chunk("vidG", 0)[0].hook_type == "surprising_fact"
-    assert cache.load_stage1_chunk("vidG", 1)[0].hook_type == "strong_take"
+    assert cache.load_stage1_chunk("vidG", 0)[0].material_type == "example"
+    assert cache.load_stage1_chunk("vidG", 1)[0].material_type == "reason"
 
 
 def test_stage1_with_unversioned_legacy_shape_is_treated_as_cache_miss():
@@ -152,7 +162,7 @@ def test_schema_v3_is_miss_and_current_version_is_hit():
     stage1 and stage2, while a cache written under the current schema
     version must hit normally.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 10
+    assert config.CANDIDATE_SCHEMA_VERSION == 11
 
     v3_stage2_payload = {
         "schema_version": 3,
@@ -186,7 +196,7 @@ def test_schema_v3_is_miss_and_current_version_is_hit():
     assert loaded is not None
     assert len(loaded) == 3
 
-    cache.save_stage1_chunk("vidH", 0, [raw])
+    cache.save_stage1_chunk("vidH", 0, [_raw_material(material_type="hook")])
     assert cache.load_stage1_chunk("vidH", 0) is not None
 
 
@@ -199,7 +209,7 @@ def test_schema_v4_is_miss_after_hook_scoring_prompt_bump():
     written under version 4 must still be treated as a miss under the
     current (later-bumped) schema version too.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 10
+    assert config.CANDIDATE_SCHEMA_VERSION == 11
 
     v4_stage2_payload = {
         "schema_version": 4,
@@ -242,7 +252,7 @@ def test_schema_v5_is_miss_after_stage1_recall_widening():
     missing viable candidates the wider search would have found). A cache
     written under version 5 must be treated as a miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 10
+    assert config.CANDIDATE_SCHEMA_VERSION == 11
 
     v5_stage1_payload = {
         "schema_version": 5,
@@ -271,7 +281,7 @@ def test_schema_v5_is_miss_after_stage1_recall_widening():
     assert cache.load_stage2("vidV5") is None
 
     raw = _raw_candidate(hook_type="story")
-    cache.save_stage1_chunk("vidV5", 0, [raw])
+    cache.save_stage1_chunk("vidV5", 0, [_raw_material(material_type="hook")])
     assert cache.load_stage1_chunk("vidV5", 0) is not None
     cache.save_stage2("vidV5", [raw, raw, raw])
     assert cache.load_stage2("vidV5") is not None
@@ -290,7 +300,7 @@ def test_schema_v6_is_miss_after_anchor_trim_and_reorder_support():
     caches to be recomputed. A cache written under version 6 must be
     treated as a miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 10
+    assert config.CANDIDATE_SCHEMA_VERSION == 11
 
     v6_stage1_payload = {
         "schema_version": 6,
@@ -319,7 +329,7 @@ def test_schema_v6_is_miss_after_anchor_trim_and_reorder_support():
     assert cache.load_stage2("vidV6") is None
 
     raw = _raw_candidate(hook_type="story")
-    cache.save_stage1_chunk("vidV6", 0, [raw])
+    cache.save_stage1_chunk("vidV6", 0, [_raw_material(material_type="hook")])
     assert cache.load_stage1_chunk("vidV6", 0) is not None
     cache.save_stage2("vidV6", [raw, raw, raw])
     assert cache.load_stage2("vidV6") is not None
@@ -339,7 +349,7 @@ def test_schema_v7_is_miss_after_junction_safety_support():
     recomputed. A cache written under version 7 must be treated as a
     miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 10
+    assert config.CANDIDATE_SCHEMA_VERSION == 11
 
     v7_stage1_payload = {
         "schema_version": 7,
@@ -368,7 +378,7 @@ def test_schema_v7_is_miss_after_junction_safety_support():
     assert cache.load_stage2("vidV7") is None
 
     raw = _raw_candidate(hook_type="story")
-    cache.save_stage1_chunk("vidV7", 0, [raw])
+    cache.save_stage1_chunk("vidV7", 0, [_raw_material(material_type="hook")])
     assert cache.load_stage1_chunk("vidV7", 0) is not None
     cache.save_stage2("vidV7", [raw, raw, raw])
     assert cache.load_stage2("vidV7") is not None
@@ -391,7 +401,7 @@ def test_schema_v8_is_miss_after_restart_and_closure_support():
     be recomputed. A cache written under version 8 must be treated as a
     miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 10
+    assert config.CANDIDATE_SCHEMA_VERSION == 11
 
     v8_stage1_payload = {
         "schema_version": 8,
@@ -437,7 +447,7 @@ def test_schema_v9_is_miss_after_stage2_final_design_support():
     treated as a miss -- it holds candidates Stage2 only ever ranked/
     excluded, never validated against the new final-design local gate.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 10
+    assert config.CANDIDATE_SCHEMA_VERSION == 11
 
     v9_stage1_payload = {
         "schema_version": 9,
@@ -466,16 +476,67 @@ def test_schema_v9_is_miss_after_stage2_final_design_support():
     assert cache.load_stage2("vidV9") is None
 
     raw = _raw_candidate(hook_type="story")
-    cache.save_stage1_chunk("vidV9", 0, [raw])
+    cache.save_stage1_chunk("vidV9", 0, [_raw_material(material_type="hook")])
     assert cache.load_stage1_chunk("vidV9", 0) is not None
     cache.save_stage2("vidV9", [raw, raw, raw])
     assert cache.load_stage2("vidV9") is not None
 
     raw = _raw_candidate(hook_type="story")
-    cache.save_stage1_chunk("vidV8", 0, [raw])
+    cache.save_stage1_chunk("vidV8", 0, [_raw_material(material_type="hook")])
     assert cache.load_stage1_chunk("vidV8", 0) is not None
     cache.save_stage2("vidV8", [raw, raw, raw])
     assert cache.load_stage2("vidV8") is not None
+
+
+def test_schema_v10_is_miss_after_stage1_material_contract_support():
+    """The Stage1/Stage2 material-contract fix: Stage1's Structured Outputs
+    contract changed from candidate-shaped (Stage1CandidateOutput --
+    hook_type/opening_hook_strength/score required on every item, forcing
+    even a non-hook-shaped reason/example material to carry hook-strength
+    properties it was never meant to be judged by) to a genuine material
+    contract (Stage1MaterialOutput -- material_type/segments/
+    usefulness_score). The Stage1 chunk cache's own JSON shape changed
+    (`materials` key instead of `candidates`, no `role` per segment), so
+    CANDIDATE_SCHEMA_VERSION was bumped 10->11. Stage2's schema/prompt/
+    cache shape did not change this round, but the shared single-version
+    scheme (established since v3->v4) invalidates both stages together, so
+    a v10 cache must be a miss on both Stage1 and Stage2.
+    """
+    assert config.CANDIDATE_SCHEMA_VERSION == 11
+
+    v10_stage1_payload = {
+        "schema_version": 10,
+        "chunks": {"0": {"candidates": []}},
+    }
+    cache.stage1_path("vidV10").write_text(
+        json.dumps(v10_stage1_payload, ensure_ascii=False), encoding="utf-8"
+    )
+    assert cache.load_stage1_chunk("vidV10", 0) is None
+
+    v10_stage2_payload = {
+        "schema_version": 10,
+        "candidates": [
+            {
+                "hook_type": "story",
+                "segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}],
+                "hook_text": "h", "opening_hook_strength": 85,
+                "title": "t", "description": "d", "score": 85,
+                "reasoning": "r", "caveats": "",
+            }
+        ],
+    }
+    cache.stage2_path("vidV10").write_text(
+        json.dumps(v10_stage2_payload, ensure_ascii=False), encoding="utf-8"
+    )
+    assert cache.load_stage2("vidV10") is None
+
+    material = _raw_material(material_type="hook")
+    cache.save_stage1_chunk("vidV10", 0, [material])
+    assert cache.load_stage1_chunk("vidV10", 0) is not None
+
+    raw = _raw_candidate(hook_type="story")
+    cache.save_stage2("vidV10", [raw, raw, raw])
+    assert cache.load_stage2("vidV10") is not None
 
 
 def test_transcript_cache_is_unaffected_by_candidate_schema_versioning():
@@ -519,13 +580,11 @@ def test_load_stage1_chunk_raises_diagnosable_error_for_malformed_cached_segment
         "schema_version": config.CANDIDATE_SCHEMA_VERSION,
         "chunks": {
             "0": {
-                "candidates": [
+                "materials": [
                     {
-                        "hook_type": "story",
+                        "material_type": "hook",
                         "segments": ["not a segment dict"],
-                        "hook_text": "h", "opening_hook_strength": 80,
-                        "title": "t", "description": "d", "score": 80,
-                        "reasoning": "r", "caveats": "",
+                        "usefulness_score": 80,
                     }
                 ],
             }
@@ -538,5 +597,5 @@ def test_load_stage1_chunk_raises_diagnosable_error_for_malformed_cached_segment
     message = str(exc_info.value)
     assert "stage1" in message
     assert "vidE" in message
-    assert "candidates[0].segments[0]" in message
+    assert "materials[0].segments[0]" in message
     assert "str" in message

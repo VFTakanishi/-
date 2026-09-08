@@ -57,14 +57,14 @@ class _FakeClient:
 
 
 def test_call_returns_parsed_model_on_end_turn(monkeypatch):
-    valid_json = Stage1Output(candidates=[]).model_dump_json()
+    valid_json = Stage1Output(materials=[]).model_dump_json()
     response = _FakeResponse(stop_reason="end_turn", content=[_FakeTextBlock(valid_json)])
     monkeypatch.setattr(structured_output, "_client", lambda: _FakeClient(response))
 
     result = structured_output.call(
         Stage1Output, stage="Stage1", system_prompt="sys", user_content="user", max_tokens=100
     )
-    assert result.candidates == []
+    assert result.materials == []
 
 
 def test_call_raises_without_parsing_on_max_tokens(monkeypatch):
@@ -223,7 +223,7 @@ def test_stage1_request_body_has_no_unsupported_constraint_keys():
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         captured["request"] = request
-        return _message_response(text=json.dumps({"candidates": []}))
+        return _message_response(text=json.dumps({"materials": []}))
 
     client = _client_with_mock_transport(handler)
     real_client = structured_output._client
@@ -236,7 +236,7 @@ def test_stage1_request_body_has_no_unsupported_constraint_keys():
     finally:
         structured_output._client = real_client
 
-    assert result.candidates == []
+    assert result.materials == []
 
     body = json.loads(captured["request"].content)
     assert body["model"]
@@ -310,7 +310,7 @@ def test_thinking_is_disabled_for_sonnet_5():
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         captured["request"] = request
-        return _message_response(text=json.dumps({"candidates": []}))
+        return _message_response(text=json.dumps({"materials": []}))
 
     client = _client_with_mock_transport(handler)
     real_client = structured_output._client
@@ -330,7 +330,7 @@ def test_thinking_is_disabled_for_sonnet_5():
 def test_stage1_output_max_json_size_is_well_under_max_tokens():
     """Documents and guards the audit finding that motivated disabling
     thinking: the worst-case Stage1Output JSON (config.STAGE1_MAX_
-    CANDIDATES_PER_CHUNK candidates, 3 segments each, long enum values,
+    CANDIDATES_PER_CHUNK materials, 3 segments each, long enum values,
     3-digit segment ids, a max-length start_anchor_text on every segment)
     is far smaller than STAGE1_MAX_OUTPUT_TOKENS, so a
     stop_reason="max_tokens" truncation is not explained by the final JSON
@@ -345,32 +345,36 @@ def test_stage1_output_max_json_size_is_well_under_max_tokens():
     ~3118 chars (~891 estimated tokens) with every segment carrying a
     max-length anchor -- still comfortably under half of
     STAGE1_MAX_OUTPUT_TOKENS=2048, so the ceiling was left unchanged both
-    times.
+    times. Re-audited again for the Stage1 material-contract fix (Stage1
+    now emits Stage1MaterialOutput -- material_type/segments/
+    usefulness_score -- instead of Stage1CandidateOutput): the per-item
+    payload is strictly smaller (no hook_type/opening_hook_strength/score),
+    so this only shrinks further; still guarded here to catch a future
+    regression.
     """
     from podcast_clipper import config
-    from podcast_clipper.clip_selector import Stage1CandidateOutput, Stage1SegmentOutput
+    from podcast_clipper.clip_selector import Stage1MaterialOutput, Stage1MaterialSegmentOutput
 
-    candidate = Stage1CandidateOutput(
-        hook_type="surprising_fact",
+    material = Stage1MaterialOutput(
+        material_type="hook",
         segments=[
-            Stage1SegmentOutput(
-                role="hook", start_segment_id=123, end_segment_id=124,
+            Stage1MaterialSegmentOutput(
+                start_segment_id=123, end_segment_id=124,
                 start_anchor_text="あ" * 60,
             ),
-            Stage1SegmentOutput(
-                role="context", start_segment_id=125, end_segment_id=126,
+            Stage1MaterialSegmentOutput(
+                start_segment_id=125, end_segment_id=126,
                 start_anchor_text="い" * 60,
             ),
-            Stage1SegmentOutput(
-                role="answer", start_segment_id=127, end_segment_id=128,
+            Stage1MaterialSegmentOutput(
+                start_segment_id=127, end_segment_id=128,
                 start_anchor_text="う" * 60,
             ),
         ],
-        opening_hook_strength=95,
-        score=92,
+        usefulness_score=95,
     )
     worst_case = Stage1Output(
-        candidates=[candidate] * config.STAGE1_MAX_CANDIDATES_PER_CHUNK
+        materials=[material] * config.STAGE1_MAX_CANDIDATES_PER_CHUNK
     )
     text = worst_case.model_dump_json()
 
@@ -443,12 +447,11 @@ def test_pseudo_api_boundary_e2e_reaches_three_final_candidates(monkeypatch):
     monkeypatch.setattr(config, "CHUNK_OVERLAP_MINUTES", 0.0)
 
     stage1_payload = json.dumps({
-        "candidates": [
+        "materials": [
             {
-                "hook_type": "story",
-                "segments": [{"role": "hook", "start_segment_id": i, "end_segment_id": i}],
-                "opening_hook_strength": 90,
-                "score": 80,
+                "material_type": "hook",
+                "segments": [{"start_segment_id": i, "end_segment_id": i}],
+                "usefulness_score": 90,
             }
             for i in range(3)
         ]

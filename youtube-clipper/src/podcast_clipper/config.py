@@ -87,25 +87,25 @@ END_EXTENSION_CONTINUATION_MAX_GAP_SEC = 1.5
 # and treats a mismatch as a cache miss (falls back to a fresh Stage1/Stage2
 # run) rather than trying to deserialize old-shape data. The Whisper
 # transcript cache has no dependency on this and is unaffected.
-CANDIDATE_SCHEMA_VERSION = 10
+CANDIDATE_SCHEMA_VERSION = 11
 
 CHUNK_MINUTES = 10.0
 CHUNK_OVERLAP_MINUTES = 1.0
 
 ANTHROPIC_MODEL = os.environ.get("PODCAST_CLIPPER_ANTHROPIC_MODEL", "claude-sonnet-5")
 
-# Ceilings for Stage1/Stage2 Structured Outputs responses. Claude only ever
-# generates hook_type/segments/opening_hook_strength/score per candidate
-# for both stages now (Stage2 designs full final candidates, the same
-# shape as Stage1's, plus end_anchor_text -- it no longer returns a plain
-# id list) -- everything else (hook_text/title/description/reasoning/
-# caveats) is filled in deterministically by the program, so the schemas
-# are small and these ceilings are sized to match, not left at a large
-# shared default. Each is a ceiling, not a fixed cost: a response that
-# finishes naturally does not consume all of it. STAGE2_MAX_OUTPUT_TOKENS
-# raised 512->1024 for the Stage2 redesign: its output now includes a
-# full segments array (with anchors) per candidate instead of a bare id
-# list.
+# Ceilings for Stage1/Stage2 Structured Outputs responses. Stage1 now
+# generates material_type/segments/usefulness_score per material (a raw
+# ingredient, not a finished candidate); Stage2 generates hook_type/
+# segments/opening_hook_strength/score per finished candidate design (the
+# only place those finished-candidate properties are ever produced) --
+# everything else (hook_text/title/description/reasoning/caveats) is
+# filled in deterministically by the program, so the schemas are small and
+# these ceilings are sized to match, not left at a large shared default.
+# Each is a ceiling, not a fixed cost: a response that finishes naturally
+# does not consume all of it. STAGE2_MAX_OUTPUT_TOKENS raised 512->1024 for
+# the Stage2 redesign: its output now includes a full segments array (with
+# anchors) per candidate instead of a bare id list.
 STAGE1_MAX_OUTPUT_TOKENS = 2048
 STAGE2_MAX_OUTPUT_TOKENS = 1024
 

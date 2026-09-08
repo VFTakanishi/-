@@ -10,10 +10,9 @@
 
 素材ごとに以下が渡されます:
 - `material_id`: この素材を指す識別子（あなた自身の出力では使いません — 参考情報です）
-- `hook_type`: `open_loop` / `strong_take` / `surprising_fact` / `story`（Stage1が付けた分類、参考情報）
-- `opening_hook_strength`: Stage1が付けた、実際の冒頭発話の強さスコア（0〜100、参考情報）
-- `score`: Stage1が付けた総合スコア（0〜100、参考情報）
-- `segments`: この素材が実際に含む発言のリスト。各要素は`role`（`hook`/`context`/`answer`/`payoff`。Stage1がこの素材の中でどう位置づけたかの参考情報で、あなたの設計での最終的な`role`と一致している必要はありません）、`start_segment_id`/`end_segment_id`（実在する文字起こしsegment ID）、`text`（実際に流れる発言テキスト）、`start_sec`/`end_sec`（実秒数）
+- `material_type`: `hook` / `reason` / `example` / `context` / `payoff`（Stage1が付けた分類、参考情報。この素材が単一目的でどんな役割の実発話かを示す）
+- `usefulness_score`: Stage1が付けた、その素材自身の目的における有用性スコア（0〜100、参考情報。hook強度でも総合スコアでもない — 素材がhook_typeでなければ、開始1〜3秒の強さとは無関係の基準で採点されています）
+- `segments`: この素材が実際に含む発言のリスト。各要素は`start_segment_id`/`end_segment_id`（実在する文字起こしsegment ID）、`text`（実際に流れる発言テキスト）、`start_sec`/`end_sec`（実秒数）。`role`は含まれません — 素材は単一目的であり、候補内の構造上の位置（hook/context/answer/payoff）はあなたが完成candidateを設計する際に初めて決まります
 
 ## あなたが行うこと: 完成candidateの設計
 
@@ -32,14 +31,14 @@
 
 ## 最優先事項: 冒頭の「実際の発話」が強いこと
 
-**これは`score`より優先される、独立した最重要評価軸です。** 渡される`opening_hook_strength`はStage1（別の抽出処理）が付けたスコアですが、**これを鵜呑みにしないでください。** Stage1の自己採点は甘くなりがちです。あなた自身が、自分が設計した完成candidateの最初のsegment（`role: hook`）の実テキストを改めて読み、その発言自体が開始1〜3秒以内に以下のいずれかを明確に満たしているかを厳密に評価し直してください:
+**これは`score`より優先される、独立した最重要評価軸です。** 渡される`usefulness_score`（`material_type: hook`の素材についているもの）はStage1（別の抽出処理）が付けたスコアですが、**これを鵜呑みにしないでください。** Stage1の自己採点は甘くなりがちです。あなた自身が、自分が設計した完成candidateの最初のsegment（`role: hook`）の実テキストを改めて読み、その発言自体が開始1〜3秒以内に以下のいずれかを明確に満たしているかを厳密に評価し直してください:
 - 強い主張・明確な断言、常識と逆の結論
 - 意外な事実、具体的な数字、明確な比較
 - 故障・失敗・損失など強い結果
 - 明確な疑問、視聴者への直接的な問い
 - 結論先出し、聞いた瞬間に問題や結論がわかる一言
 
-以下に該当する冒頭は、`opening_hook_strength`の数値がどうであれ、**その構成でのhook採用を避けてください**（別のsegmentをhookにするか、そもそも完成candidateとして設計しない）:
+以下に該当する冒頭は、`usefulness_score`の数値がどうであれ、**その構成でのhook採用を避けてください**（別のsegmentをhookにするか、そもそも完成candidateとして設計しない）:
 - 抽象的な説明、一般論
 - 穏やかな前提説明・穏やかな解説
 - 「〜と思います」「〜だと思っています」中心の発話

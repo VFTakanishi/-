@@ -16,6 +16,8 @@ from pathlib import Path
 from . import config
 from .models import (
     RawClipCandidate,
+    RawMaterial,
+    RawMaterialSegment,
     RawUsedSegment,
     Transcript,
     TranscriptSegment,
@@ -84,8 +86,8 @@ def load_transcript(video_id: str) -> Transcript | None:
     return Transcript(video_id=raw["video_id"], language=raw["language"], segments=segments)
 
 
-# --- Stage1 (per-chunk raw candidates, cached incrementally) ------------
-# File shape: {"schema_version": int, "chunks": {"<chunk_index>": {"candidates": [...]}}}
+# --- Stage1 (per-chunk raw materials, cached incrementally) -------------
+# File shape: {"schema_version": int, "chunks": {"<chunk_index>": {"materials": [...]}}}
 # Each chunk is written the moment it succeeds (save_stage1_chunk), via a
 # read-modify-write of the whole file -- still one atomic write per call,
 # so a crash mid-write never corrupts previously-saved chunks, it just
@@ -108,7 +110,7 @@ def _load_stage1_payload(video_id: str) -> dict | None:
     return raw
 
 
-def load_stage1_chunk(video_id: str, chunk_index: int) -> list[RawClipCandidate] | None:
+def load_stage1_chunk(video_id: str, chunk_index: int) -> list[RawMaterial] | None:
     payload = _load_stage1_payload(video_id)
     if payload is None:
         return None
@@ -116,19 +118,19 @@ def load_stage1_chunk(video_id: str, chunk_index: int) -> list[RawClipCandidate]
     if chunk is None:
         return None
     return [
-        _raw_candidate_from_dict(
-            c, context=f"cache stage1 video_id={video_id} chunk[{chunk_index}].candidates[{i}]"
+        _raw_material_from_dict(
+            m, context=f"cache stage1 video_id={video_id} chunk[{chunk_index}].materials[{i}]"
         )
-        for i, c in enumerate(chunk["candidates"])
+        for i, m in enumerate(chunk["materials"])
     ]
 
 
-def save_stage1_chunk(video_id: str, chunk_index: int, candidates: list[RawClipCandidate]) -> None:
+def save_stage1_chunk(video_id: str, chunk_index: int, materials: list[RawMaterial]) -> None:
     payload = _load_stage1_payload(video_id) or {
         "schema_version": config.CANDIDATE_SCHEMA_VERSION,
         "chunks": {},
     }
-    payload["chunks"][str(chunk_index)] = {"candidates": [asdict(c) for c in candidates]}
+    payload["chunks"][str(chunk_index)] = {"materials": [asdict(m) for m in materials]}
     _atomic_write_text(stage1_path(video_id), json.dumps(payload, ensure_ascii=False, indent=2))
 
 
@@ -179,4 +181,23 @@ def _raw_candidate_from_dict(d: dict, *, context: str) -> RawClipCandidate:
         score=d["score"],
         reasoning=d["reasoning"],
         caveats=d["caveats"],
+    )
+
+
+def _raw_material_from_dict(d: dict, *, context: str) -> RawMaterial:
+    """The Stage1 (RawMaterial) mirror of _raw_candidate_from_dict --
+    identical diagnostic-shape-validation approach, but for the material
+    schema (material_type/usefulness_score, no hook_type/opening_hook_
+    strength/score/hook_text/title/description/reasoning/caveats, no
+    per-segment role/end_anchor_text).
+    """
+    require_dict(d, context=context)
+    segments = []
+    for i, s in enumerate(d["segments"]):
+        require_dict(s, context=f"{context}.segments[{i}]")
+        segments.append(RawMaterialSegment(**s))
+    return RawMaterial(
+        material_type=d["material_type"],
+        segments=segments,
+        usefulness_score=d["usefulness_score"],
     )

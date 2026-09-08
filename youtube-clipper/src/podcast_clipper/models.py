@@ -19,6 +19,15 @@ from typing import Literal
 HookType = Literal["open_loop", "strong_take", "surprising_fact", "story"]
 SegmentRole = Literal["hook", "context", "answer", "payoff"]
 
+# Stage1's own output shape (see RawMaterial below): a material is a single-
+# purpose raw ingredient, not a structural position within a finished
+# candidate (that's SegmentRole, assigned only once Stage2 designs a final
+# candidate). "conclusion" folds into "hook" and "evidence" folds into
+# "reason" -- five values, not the seven a first pass might suggest, to
+# avoid over-splitting a schema that downstream code only ever branches on
+# for "is this hook material or not" (see prompts/extract_candidates.md).
+MaterialType = Literal["hook", "reason", "example", "context", "payoff"]
+
 _MAX_VALUE_REPR_LEN = 200
 
 
@@ -701,8 +710,8 @@ class RawUsedSegment:
     through a natural, confidently-complete internal clause boundary,
     models.find_natural_end_trim_points), and -- since the Stage2
     final-edit-design redesign -- Stage2 itself (Stage2SegmentOutput has
-    an end_anchor_text field Stage1SegmentOutput does not), when it needs
-    to end a segment it designed at an earlier natural point than the
+    an end_anchor_text field Stage1MaterialSegmentOutput does not), when it
+    needs to end a segment it designed at an earlier natural point than the
     segment's own real end. Either way it is verified identically at
     resolve time (models.find_anchor_end_word) and falls back to "no
     trim" (the segment's own natural end) if it doesn't match real
@@ -718,7 +727,14 @@ class RawUsedSegment:
 
 @dataclass
 class RawClipCandidate:
-    """Claude's Stage2 output for one candidate: semantic selection only."""
+    """Claude's Stage2 output for one *finished* candidate design: a
+    complete, self-contained Shorts edit -- hook_type/opening_hook_strength/
+    score all describe this specific finished design, self-scored by Stage2
+    after assembling it (never copied forward from any Stage1 material it
+    drew segments from). Stage1 no longer produces this type -- it produces
+    RawMaterial (below), a single-purpose raw ingredient that Stage2 freely
+    recombines into candidates like this one.
+    """
 
     hook_type: HookType
     segments: list[RawUsedSegment]
@@ -740,6 +756,50 @@ class RawClipCandidate:
         if not (0 <= self.opening_hook_strength <= 100):
             raise ValueError(
                 f"opening_hook_strength must be within 0-100 (got {self.opening_hook_strength})"
+            )
+
+
+@dataclass
+class RawMaterialSegment:
+    """A segment reference within a RawMaterial. Deliberately has no `role`
+    (materials are single-purpose -- they don't have an internal structural
+    position like hook/context/answer/payoff, that's decided only when
+    Stage2 designs a finished RawClipCandidate) and no end_anchor_text
+    (Stage1 never had that capability even for RawUsedSegment; keeping this
+    type minimal rather than speculatively adding it)."""
+
+    start_segment_id: int
+    end_segment_id: int  # inclusive
+    start_anchor_text: str | None = None
+
+
+@dataclass
+class RawMaterial:
+    """Stage1's output: one single-purpose raw ingredient (hook, reason,
+    example, context, or payoff material), not a finished Shorts candidate.
+    Unlike RawClipCandidate, this deliberately has no hook_type/
+    opening_hook_strength/score/hook_text/title/description/reasoning/
+    caveats -- those all describe a *finished* candidate design, which only
+    Stage2 produces (see design_final_candidates in clip_selector.py).
+    Forcing a non-hook material (e.g. a calm reason explanation) to carry a
+    hook_type/opening_hook_strength would either be meaningless or bias
+    Stage1 into judging it by hook-strength standards it was never meant to
+    meet -- see prompts/extract_candidates.md's material-type-specific
+    quality bar.
+    """
+
+    material_type: MaterialType
+    segments: list[RawMaterialSegment]
+    usefulness_score: int  # 0-100: how useful this material is for its own material_type, not a hook-strength or overall-candidate score
+
+    def __post_init__(self) -> None:
+        if not (1 <= len(self.segments) <= 3):
+            raise ValueError(
+                f"segments must contain 1-3 entries (got {len(self.segments)})"
+            )
+        if not (0 <= self.usefulness_score <= 100):
+            raise ValueError(
+                f"usefulness_score must be within 0-100 (got {self.usefulness_score})"
             )
 
 

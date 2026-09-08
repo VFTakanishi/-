@@ -3,14 +3,22 @@ from pydantic import ValidationError
 
 from podcast_clipper import boundary, cache, clip_selector, config
 from podcast_clipper.clip_selector import (
-    Stage1CandidateOutput,
+    Stage1MaterialOutput,
+    Stage1MaterialSegmentOutput,
     Stage1Output,
-    Stage1SegmentOutput,
     Stage2CandidateOutput,
     Stage2Output,
     Stage2SegmentOutput,
 )
-from podcast_clipper.models import RawClipCandidate, RawUsedSegment, Transcript, TranscriptSegment, TranscriptWord
+from podcast_clipper.models import (
+    RawClipCandidate,
+    RawMaterial,
+    RawMaterialSegment,
+    RawUsedSegment,
+    Transcript,
+    TranscriptSegment,
+    TranscriptWord,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +84,14 @@ def _raw_candidate(start_id, end_id, role="hook", opening_hook_strength=80, scor
         segments=[RawUsedSegment(role=role, start_segment_id=start_id, end_segment_id=end_id)],
         hook_text="h", opening_hook_strength=opening_hook_strength, title="", description="",
         score=score, reasoning="", caveats="",
+    )
+
+
+def _raw_material(start_id, end_id, material_type="hook", usefulness_score=80):
+    return RawMaterial(
+        material_type=material_type,
+        segments=[RawMaterialSegment(start_segment_id=start_id, end_segment_id=end_id)],
+        usefulness_score=usefulness_score,
     )
 
 
@@ -237,7 +253,7 @@ def test_extract_candidates_prompt_requires_scanning_whole_chunk():
 
 def test_extract_candidates_prompt_forbids_using_up_slots_on_the_first_half():
     text = _extract_candidates_prompt_text()
-    assert "前半で見つかった強そうな発話だけで候補枠を使い切り" in text
+    assert "前半で見つかった素材だけで枠を使い切り" in text
     assert "後半" in text
 
 
@@ -252,11 +268,11 @@ def test_extract_candidates_prompt_forbids_near_duplicate_candidates():
 
 
 def test_extract_candidates_prompt_states_stage1_is_recall_not_final_selection():
-    """Documents the Stage1/Stage2 role split: Stage1 casts a wide net,
-    Stage2 (seeing the pooled candidates from every chunk) picks the final
-    best-3."""
+    """Documents the Stage1/Stage2 role split: Stage1 casts a wide net of
+    single-purpose materials, Stage2 (seeing the pooled materials from
+    every chunk) assembles and picks the final best-3."""
     text = _extract_candidates_prompt_text()
-    assert "最終ベスト3を決める係ではありません" in text or "最終的に使う3本を選び切る係ではありません" in text
+    assert "完成したShorts候補を組み立てる係ではありません" in text
 
 
 def test_extract_candidates_prompt_allows_single_purpose_material():
@@ -264,7 +280,7 @@ def test_extract_candidates_prompt_allows_single_purpose_material():
     hook+reason+example into one candidate to be useful -- a standalone
     hook-only material (segments of length 1) is explicitly allowed."""
     text = _extract_candidates_prompt_text()
-    assert "候補は完成したShorts構成である必要はありません" in text
+    assert "素材は完成したShorts構成である必要はありません" in text
     assert "hookになり得る発話" in text
 
 
@@ -274,13 +290,6 @@ def test_extract_candidates_prompt_does_not_force_duration_target():
     text = _extract_candidates_prompt_text()
     assert "無理に収めようとしないでください" in text
     assert "尺の最終調整は後段のStage2の責務です" in text
-
-
-def test_extract_candidates_prompt_reordering_stays_within_the_chunk():
-    """Stage1 may still reorder segments within its own chunk, but
-    combining material across chunks is explicitly reserved for Stage2."""
-    text = _extract_candidates_prompt_text()
-    assert "このチャンク内での並び替えに留めてください" in text
 
 
 def test_rank_and_finalize_prompt_states_it_picks_the_final_best_three():
@@ -306,12 +315,6 @@ def test_extract_candidates_prompt_includes_bad_junction_example():
 def test_extract_candidates_prompt_requires_extending_before_non_chronological_jump():
     text = _extract_candidates_prompt_text()
     assert "いきなり別のsegmentへ飛ばないこと" in text
-
-
-def test_extract_candidates_prompt_documents_limited_exact_repeat():
-    text = _extract_candidates_prompt_text()
-    assert "最大2回まで" in text
-    assert "3回以上は禁止" in text
 
 
 def test_rank_and_finalize_prompt_documents_junction_safety():
@@ -370,26 +373,42 @@ def test_extract_candidates_prompt_forbids_mid_word_anchor_starts():
     assert "word境界に一致する必要がある" in text
 
 
-def test_extract_candidates_prompt_allows_reordering_segments():
-    """The most important change this round: segments no longer need to
-    be in transcript-chronological order."""
+def test_extract_candidates_prompt_no_longer_reorders_within_stage1():
+    """Stage1/Stage2 material-contract fix: materials are single-purpose
+    (no internal role structure), so the old "reorder segments across
+    roles within one Stage1 candidate" mechanism no longer applies --
+    that responsibility now belongs entirely to Stage2 (which recombines
+    segments across *different* materials, see rank_and_finalize.md)."""
     text = _extract_candidates_prompt_text()
-    assert "時系列順である必要はありません" in text or "時系列順である必要はない" in text
+    assert "候補内の並び替え" not in text
+    assert "候補内でのsegmentの再利用" not in text
 
 
-def test_extract_candidates_prompt_reorder_forbids_fabrication():
-    text = _extract_candidates_prompt_text()
-    assert "発話を作文しない" in text
-    assert "因果関係を逆転させない" in text
-
-
-def test_extract_candidates_prompt_scores_hook_strength_post_trim_and_reorder():
-    """opening_hook_strength must be scored against what actually plays
-    first after anchor trim / reordering, not the raw untrimmed segment or
-    the pre-reorder chronological first segment (item 16)."""
+def test_extract_candidates_prompt_scores_hook_usefulness_post_trim():
+    """usefulness_score for a hook material must be scored against what
+    actually plays first after anchor trim, not the raw untrimmed
+    segment text."""
     text = _extract_candidates_prompt_text()
     assert "トリム後のテキスト" in text
-    assert "並び替え後に実際に最初に来るsegment" in text
+
+
+def test_extract_candidates_prompt_scopes_hook_criteria_to_hook_material_type():
+    """The root-cause fix: the strong-opening criteria/reject list must be
+    explicitly scoped to material_type: hook only, and reason/example/
+    context/payoff materials must have their own, lighter quality bar --
+    otherwise a reason material like the fuel-cut example would be
+    rejected by hook-strength rules before ever reaching Stage2."""
+    text = _extract_candidates_prompt_text()
+    assert "この基準は`material_type: hook`の素材にのみ適用されます" in text
+    assert "reason/example/context/payoff素材の基準" in text
+    assert "穏やかな説明調であること自体、あるいはhookとしては弱いことは、これらのmaterial_typeでは不合格理由にしないでください" in text
+
+
+def test_extract_candidates_prompt_documents_material_type_enum():
+    text = _extract_candidates_prompt_text()
+    for material_type in ("hook", "reason", "example", "context", "payoff"):
+        assert f"`{material_type}`" in text
+    assert "material_type" in text
 
 
 def test_extract_candidates_prompt_includes_real_machine_examples():
@@ -1292,10 +1311,11 @@ def test_refresh_stage1_and_candidates_J_error_includes_diagnostic_summary(monke
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
-    candidates = [_raw_candidate(0, 0, opening_hook_strength=50)]
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: candidates)
+    materials = [_raw_material(0, 0)]
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: materials)
     monkeypatch.setattr(
-        clip_selector, "design_final_candidates", lambda materials, t, title: list(materials.values())
+        clip_selector, "design_final_candidates",
+        lambda materials, t, title: [_raw_candidate(0, 0, opening_hook_strength=50)],
     )
 
     with pytest.raises(RuntimeError) as exc_info:
@@ -1313,7 +1333,7 @@ def test_diagnose_local_filter_K_makes_zero_api_calls(monkeypatch):
     # run_stage1/extract_candidates_for_chunk -- diagnose_local_filter
     # must never reach either.
     transcript = _long_transcript(minutes=1)
-    cache.save_stage1_chunk(transcript.video_id, 0, [_raw_candidate(0, 0, opening_hook_strength=90)])
+    cache.save_stage1_chunk(transcript.video_id, 0, [_raw_material(0, 0, usefulness_score=90)])
 
     def _forbidden(*a, **k):
         raise AssertionError("diagnose_local_filter must never call the Stage1 API")
@@ -1323,24 +1343,28 @@ def test_diagnose_local_filter_K_makes_zero_api_calls(monkeypatch):
 
     evaluations = clip_selector.diagnose_local_filter(transcript)
     assert len(evaluations) >= 1
+    assert all(isinstance(e, clip_selector.MaterialUsabilityResult) for e in evaluations)
+    assert evaluations[0].usable is True
+    assert evaluations[0].reason is None
 
 
 def test_diagnose_local_filter_L_raises_clearly_without_cache():
     transcript = _long_transcript(minutes=1)
     transcript.video_id = "vid-never-cached-for-diagnosis"
 
-    with pytest.raises(RuntimeError, match="Stage1候補キャッシュ"):
+    with pytest.raises(RuntimeError, match="Stage1素材キャッシュ"):
         clip_selector.diagnose_local_filter(transcript)
 
 
-def test_candidate_schema_version_still_10():
-    # This round redesigns Stage2 from ranking-only (Stage2RankingOutput,
-    # a bare id list) into final-edit-design (Stage2Output/
-    # Stage2CandidateOutput/Stage2SegmentOutput, the same shape as
-    # Stage1's own schema plus end_anchor_text) -- a genuine Structured
-    # Outputs schema change on the Stage2 side, so the version was bumped
-    # once (9->10); it must not drift further within this round.
-    assert config.CANDIDATE_SCHEMA_VERSION == 10
+def test_candidate_schema_version_still_11():
+    # This round redesigns Stage1 from candidate-shaped output
+    # (Stage1CandidateOutput: hook_type/opening_hook_strength/score
+    # required on every item) into a genuine material contract
+    # (Stage1MaterialOutput: material_type/usefulness_score) -- a real
+    # Structured Outputs schema change on the Stage1 side, so the version
+    # was bumped once more (10->11); it must not drift further within
+    # this round.
+    assert config.CANDIDATE_SCHEMA_VERSION == 11
 
 
 # --- repair-before-reject: real-machine incident (4/4 Stage1 candidates
@@ -2802,9 +2826,13 @@ def test_select_candidates_fresh_path_saves_finalized_candidates_to_cache(monkey
     transcript = _transcript_with_gap(
         0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
     )
+    material = _raw_material(0, 1)
     candidate = _raw_candidate(0, 1, opening_hook_strength=90)
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: [candidate] * 4)
-    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda materials, t, title: list(materials.values()))
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: [material] * 4)
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda materials, t, title: [candidate for _ in materials],
+    )
 
     result = clip_selector.select_candidates(transcript, "タイトル")
     assert all(c.segments[-1].end_segment_id == 2 for c in result)
@@ -2864,10 +2892,14 @@ def test_select_candidates_applies_the_same_duration_rule_on_fresh_and_cached_pa
     transcript = _transcript_with_gap(
         0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
     )
+    material = _raw_material(0, 1)
     candidate = _raw_candidate(0, 1, opening_hook_strength=90)
 
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: [candidate] * 4)
-    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda materials, t, title: list(materials.values()))
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: [material] * 4)
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda materials, t, title: [candidate for _ in materials],
+    )
     fresh_result = clip_selector.select_candidates(transcript, "タイトル")
 
     cache_transcript = Transcript(
@@ -2897,7 +2929,7 @@ def test_material_is_usable_accepts_a_short_incomplete_fragment(monkeypatch):
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
     transcript = _long_transcript(minutes=1)
-    material = _raw_candidate(0, 0)  # a single 2-second segment
+    material = _raw_material(0, 0)  # a single 2-second segment
     assert clip_selector._material_is_usable(material, transcript) is True
 
 
@@ -2908,7 +2940,7 @@ def test_material_is_usable_rejects_disfluent_material():
         video_id="vidMaterialDisfluent", language="ja",
         segments=[_segment(0, start=0.0, text="ちょっと表現が難しいんですけども、要するにこうです。")],
     )
-    material = _raw_candidate(0, 0)
+    material = _raw_material(0, 0)
     assert clip_selector._material_is_usable(material, transcript) is False
 
 
@@ -2926,14 +2958,155 @@ def test_material_is_usable_rejects_speech_restart_material():
         video_id="vidMaterialRestart", language="ja",
         segments=[TranscriptSegment(id=0, start=0.0, end=3.0, text="".join(w.text for w in words), words=words)],
     )
-    material = _raw_candidate(0, 0)
+    material = _raw_material(0, 0)
     assert clip_selector._material_is_usable(material, transcript) is False
 
 
 def test_material_is_usable_rejects_invalid_segment_reference():
     transcript = _long_transcript(minutes=1)
-    material = _raw_candidate(999, 999)  # segment_id doesn't exist
+    material = _raw_material(999, 999)  # segment_id doesn't exist
     assert clip_selector._material_is_usable(material, transcript) is False
+
+
+def test_material_rejection_reason_names_the_reason():
+    # diagnose_local_filter's MaterialUsabilityResult surfaces this reason
+    # string directly -- confirm the raw helper names each rejection case,
+    # not just a boolean.
+    transcript = _long_transcript(minutes=1)
+    assert clip_selector._material_rejection_reason(_raw_material(999, 999), transcript) == "invalid_segment_reference"
+    disfluent_transcript = Transcript(
+        video_id="vidMaterialRejectionReason", language="ja",
+        segments=[_segment(0, start=0.0, text="ちょっと表現が難しいんですけども、要するにこうです。")],
+    )
+    assert clip_selector._material_rejection_reason(_raw_material(0, 0), disfluent_transcript) == "speech_disfluency"
+    assert clip_selector._material_rejection_reason(_raw_material(0, 0), transcript) is None
+
+
+def test_material_is_usable_accepts_reason_material_with_low_usefulness_score():
+    # B: a calm, low-scoring-as-a-hook reason material must still be
+    # usable -- the prefilter never looks at usefulness_score, only
+    # referential integrity/disfluency/restart. This is the exact property
+    # the old design broke: a reason material scored low would previously
+    # have been judged against hook-strength standards and discarded.
+    transcript = _long_transcript(minutes=1)
+    material = _raw_material(0, 0, material_type="reason", usefulness_score=40)
+    assert clip_selector._material_is_usable(material, transcript) is True
+
+
+def test_material_is_usable_rejects_disfluent_reason_material():
+    # D: material_type has no bearing on the disfluency check -- a reason
+    # material with a word-search/self-correction marker is rejected
+    # exactly like a hook material would be.
+    transcript = Transcript(
+        video_id="vidReasonDisfluent", language="ja",
+        segments=[_segment(0, start=0.0, text="ちょっと表現が難しいんですけども、要するにこうです。")],
+    )
+    material = _raw_material(0, 0, material_type="reason", usefulness_score=70)
+    assert clip_selector._material_is_usable(material, transcript) is False
+
+
+def test_material_is_usable_rejects_speech_restart_reason_material():
+    # E: same for the speech-restart check.
+    words = [
+        TranscriptWord(start=0.0, end=0.5, text="ホンダも取扱説明書の中に、"),
+        TranscriptWord(start=0.5, end=1.0, text="走行中にNレンジで下るというのは、"),
+        TranscriptWord(start=1.0, end=1.5, text="Nレンジにすると、"),
+        TranscriptWord(start=1.5, end=2.0, text="エンジンブレーキが効かなくなって、"),
+        TranscriptWord(start=2.0, end=2.5, text="思わぬ事故の原因になるので、"),
+        TranscriptWord(start=2.5, end=3.0, text="急な坂道では注意が必要です。"),
+    ]
+    transcript = Transcript(
+        video_id="vidReasonRestart", language="ja",
+        segments=[TranscriptSegment(id=0, start=0.0, end=3.0, text="".join(w.text for w in words), words=words)],
+    )
+    material = _raw_material(0, 0, material_type="reason", usefulness_score=70)
+    assert clip_selector._material_is_usable(material, transcript) is False
+
+
+def test_stage1_stage2_recombine_hook_material_with_weak_hook_reason_material(monkeypatch):
+    # Item 7 -- the single most important test for this round's fix
+    # ("これが通らなければ今回の再設計は成立していない"): chunk A has only a hook
+    # material ("Xの方がYより燃費が良い"); chunk B has a material that would be
+    # weak as a Shorts hook but is an important reason explanation
+    # ("減速時には一定条件で燃料噴射が止まるためです"). Both must survive Stage1's
+    # material prefilter regardless of the reason material's weak-hook
+    # shape, and Stage2 must be able to combine them into one
+    # semantically-complete finished candidate that clears the unchanged
+    # local hard gates.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    monkeypatch.setattr(config, "NUM_CANDIDATES", 1)
+    transcript = Transcript(
+        video_id="vidCrossChunkRecombine", language="ja",
+        segments=[
+            _segment(0, start=0.0, text="ギアを入れてアクセルオフの方がニュートラルより燃費が良いです。"),
+            _segment(1, start=100.0, text="減速時には一定条件で燃料噴射が止まるためです。"),
+        ],
+    )
+    # chunk A: a hook material only (no reason material in this chunk).
+    hook_material = _raw_material(0, 0, material_type="hook", usefulness_score=90)
+    # chunk B: weak as a Shorts hook (calm technical explanation, no
+    # strong opening) but a real, important reason -- must still be
+    # fetched by Stage1, since the material prefilter never judges hook
+    # strength.
+    reason_material = _raw_material(1, 1, material_type="reason", usefulness_score=55)
+
+    # Both survive the lightweight material prefilter -- confirms the
+    # weak-as-hook material is never rejected before ever reaching Stage2,
+    # which is exactly the bug this round fixes.
+    assert clip_selector._material_is_usable(hook_material, transcript) is True
+    assert clip_selector._material_is_usable(reason_material, transcript) is True
+
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: [hook_material, reason_material])
+
+    def _fake_design(materials, t, title):
+        # Stage2 combines the hook material's segment with the reason
+        # material's segment -- drawn from two different materials --
+        # into one semantically-complete finished candidate.
+        assert len(materials) == 2
+        return [
+            RawClipCandidate(
+                hook_type="strong_take",
+                segments=[
+                    RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+                    RawUsedSegment(role="answer", start_segment_id=1, end_segment_id=1),
+                ],
+                hook_text="h", opening_hook_strength=90, title="", description="",
+                score=90, reasoning="", caveats="",
+            )
+        ]
+
+    monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
+
+    result = clip_selector.select_candidates(transcript, "タイトル")
+
+    assert len(result) == 1
+    assert [s.start_segment_id for s in result[0].segments] == [0, 1]
+
+
+def test_design_final_candidates_reassigns_reason_material_segment_to_hook_role(monkeypatch):
+    # H: a reason material's segment doesn't need to become the finished
+    # candidate's hook, but it CAN be -- Stage2, not the material's own
+    # material_type, decides the final role. Confirms the conversion
+    # doesn't carry any material-side "role" forward (RawMaterial has
+    # none), it only uses whatever role Stage2's own output specifies.
+    transcript = _long_transcript(minutes=1)
+    materials = {"s1_m000": _raw_material(0, 0, material_type="reason", usefulness_score=40)}
+    output = Stage2Output(
+        candidates=[
+            Stage2CandidateOutput(
+                hook_type="strong_take",
+                segments=[Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=0)],
+                opening_hook_strength=85,
+                score=85,
+            )
+        ]
+    )
+    monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
+
+    designed = clip_selector.design_final_candidates(materials, transcript, "タイトル")
+
+    assert designed[0].segments[0].role == "hook"
 
 
 # --- Stage2 final-edit-design: end-to-end through the unchanged local ----
@@ -2958,7 +3131,7 @@ def test_design_finalize_A_recombines_three_materials_into_one_complete_candidat
             _segment(2, start=10.0, text="実際に試した人の例でも燃費が改善しています。"),
         ],
     )
-    materials = [_raw_candidate(0, 0), _raw_candidate(1, 1), _raw_candidate(2, 2)]
+    materials = [_raw_material(0, 0), _raw_material(1, 1), _raw_material(2, 2)]
 
     def _fake_design(m, t, title):
         return [
@@ -3008,7 +3181,7 @@ def test_design_finalize_C_accepts_stage2_shortened_selection_from_long_material
             ),
         ],
     )
-    long_material = _raw_candidate(1, 1)
+    long_material = _raw_material(1, 1)
 
     def _fake_design(m, t, title):
         return [
@@ -3035,7 +3208,7 @@ def test_design_finalize_G_rejects_fabricated_segment_id(monkeypatch):
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
-    materials = [_raw_candidate(0, 0)]
+    materials = [_raw_material(0, 0)]
 
     def _fake_design(m, t, title):
         return [_raw_candidate(9999, 9999)]  # fabricated segment_id
@@ -3054,7 +3227,7 @@ def test_design_finalize_I_rejects_out_of_bounds_duration(monkeypatch):
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
     transcript = _long_transcript(minutes=1)
-    materials = [_raw_candidate(0, 0)]
+    materials = [_raw_material(0, 0)]
 
     def _fake_design(m, t, title):
         return [_raw_candidate(0, 0)]  # a single 2-second segment -- far under 20s
@@ -3072,7 +3245,7 @@ def test_design_finalize_J_rejects_unsafe_junction(monkeypatch):
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _junction_transcript()
-    materials = [_raw_candidate(0, 1)]
+    materials = [_raw_material(0, 1)]
 
     def _fake_design(m, t, title):
         return [_junction_candidate(3, 3)]  # segment 1 -> unrelated distant segment 3
@@ -3097,7 +3270,7 @@ def test_select_candidates_raises_without_calling_stage2_when_no_usable_material
         video_id="vidNoUsableMaterial", language="ja",
         segments=[_segment(0, start=0.0, text="ちょっと表現が難しいんですけども、要するにこうです。")],
     )
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: [_raw_candidate(0, 0)])
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: [_raw_material(0, 0)])
     monkeypatch.setattr(
         clip_selector, "design_final_candidates",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("Stage2 must not be called")),
@@ -3111,9 +3284,12 @@ def test_select_candidates_raises_when_stage2_returns_too_few_ids(monkeypatch):
     transcript = _long_transcript(minutes=1)
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    candidates = [_raw_candidate(0, 2), _raw_candidate(0, 2), _raw_candidate(0, 2)]
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: candidates)
-    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda materials, t, title: list(materials.values())[:1])
+    materials = [_raw_material(0, 2), _raw_material(0, 2), _raw_material(0, 2)]
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: materials)
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda materials, t, title: [_raw_candidate(0, 2) for _ in range(1)],
+    )
 
     with pytest.raises(RuntimeError, match="ローカル検証を通過したのは"):
         clip_selector.select_candidates(transcript, "タイトル")
@@ -3127,9 +3303,12 @@ def test_select_candidates_raises_when_only_two_candidates_pass_semantic_closure
     transcript = _long_transcript(minutes=1)
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    candidates = [_raw_candidate(0, 2), _raw_candidate(0, 2), _raw_candidate(0, 2)]
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: candidates)
-    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda materials, t, title: list(materials.values())[:2])
+    materials = [_raw_material(0, 2), _raw_material(0, 2), _raw_material(0, 2)]
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: materials)
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda materials, t, title: [_raw_candidate(0, 2) for _ in range(2)],
+    )
 
     with pytest.raises(RuntimeError, match="ローカル検証を通過したのは"):
         clip_selector.select_candidates(transcript, "タイトル")
@@ -3139,9 +3318,12 @@ def test_select_candidates_happy_path(monkeypatch):
     transcript = _long_transcript(minutes=1)
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    candidates = [_raw_candidate(0, 2, score=s) for s in (10, 20, 30, 40)]
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: candidates)
-    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda materials, t, title: list(materials.values()))
+    materials = [_raw_material(0, 2, usefulness_score=s) for s in (10, 20, 30, 40)]
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: materials)
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda materials, t, title: [_raw_candidate(0, 2) for _ in range(len(materials))],
+    )
 
     result = clip_selector.select_candidates(transcript, "タイトル")
     assert len(result) == config.NUM_CANDIDATES
@@ -3157,8 +3339,8 @@ def test_select_candidates_accepts_when_stage2_excludes_one_closure_failing_cand
     transcript = _long_transcript(minutes=1)
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    candidates = [_raw_candidate(0, 2, score=s) for s in (10, 20, 30, 40)]
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: candidates)
+    materials = [_raw_material(0, 2, usefulness_score=s) for s in (10, 20, 30, 40)]
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: materials)
 
     call_count = {"n": 0}
 
@@ -3167,7 +3349,7 @@ def test_select_candidates_accepts_when_stage2_excludes_one_closure_failing_cand
         # Simulate Stage2 omitting one design entirely for failing semantic
         # closure -- the remaining 3 of 4 are returned, never padded back.
         assert len(materials) == 4
-        return list(materials.values())[:3]
+        return [_raw_candidate(0, 2) for _ in range(3)]
 
     monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
 
@@ -3195,11 +3377,17 @@ def test_select_candidates_caches_and_skips_recompute(monkeypatch):
 # --- segment_id ranges + a few scores, never display text) --------------
 
 
-def test_stage1_candidate_output_field_set_excludes_ai_authored_text():
-    # N: Claude structurally cannot produce hook_text/title/description/
-    # reasoning/caveats any more -- they're not even fields on the model.
-    fields = set(Stage1CandidateOutput.model_fields)
-    assert fields == {"hook_type", "segments", "opening_hook_strength", "score"}
+def test_stage1_material_output_field_set_excludes_finished_candidate_properties():
+    # Stage1 structurally cannot produce hook_type/opening_hook_strength/
+    # score/hook_text/title/description/reasoning/caveats any more -- those
+    # all describe a *finished* candidate design, which only Stage2
+    # produces (see Stage2CandidateOutput). A material's own fields are
+    # material_type/segments/usefulness_score only.
+    fields = set(Stage1MaterialOutput.model_fields)
+    assert fields == {"material_type", "segments", "usefulness_score"}
+    assert "hook_type" not in fields
+    assert "opening_hook_strength" not in fields
+    assert "score" not in fields
     assert "hook_text" not in fields
     assert "title" not in fields
     assert "description" not in fields
@@ -3207,10 +3395,20 @@ def test_stage1_candidate_output_field_set_excludes_ai_authored_text():
     assert "caveats" not in fields
 
 
-def test_stage2_candidate_output_field_set_matches_stage1_plus_end_anchor():
-    # Stage2's candidate/segment schemas are deliberately identical to
-    # Stage1's, plus exactly one new field (end_anchor_text) -- no
-    # display-text fields, no new concepts invented.
+def test_stage1_material_segment_output_has_no_role():
+    # A material is single-purpose -- it has no internal structural
+    # position (hook/context/answer/payoff) the way a finished candidate's
+    # segments do. That's only ever decided by Stage2 (Stage2SegmentOutput
+    # still has `role`).
+    assert set(Stage1MaterialSegmentOutput.model_fields) == {
+        "start_segment_id", "end_segment_id", "start_anchor_text",
+    }
+
+
+def test_stage2_candidate_output_field_set_is_the_only_place_finished_properties_exist():
+    # Stage2's candidate/segment schemas are the only place hook_type/
+    # opening_hook_strength/score/role/end_anchor_text exist -- Stage1's
+    # material schema deliberately has none of these.
     assert set(Stage2CandidateOutput.model_fields) == {
         "hook_type", "segments", "opening_hook_strength", "score",
     }
@@ -3220,82 +3418,83 @@ def test_stage2_candidate_output_field_set_matches_stage1_plus_end_anchor():
     assert set(Stage2Output.model_fields) == {"candidates"}
 
 
-def _valid_segment_kwargs():
-    return {"role": "hook", "start_segment_id": 0, "end_segment_id": 0}
+def _valid_material_segment_kwargs():
+    return {"start_segment_id": 0, "end_segment_id": 0}
 
 
-def _valid_candidate_kwargs():
+def _valid_material_kwargs():
     return {
-        "hook_type": "story", "segments": [_valid_segment_kwargs()],
-        "opening_hook_strength": 80, "score": 80,
+        "material_type": "hook", "segments": [_valid_material_segment_kwargs()],
+        "usefulness_score": 80,
     }
 
 
-def test_stage1_output_accepts_zero_to_six_candidates():
+def test_stage1_output_accepts_zero_to_six_materials():
     """Stage1's per-chunk cap was widened 3 -> config.STAGE1_MAX_CANDIDATES_
-    PER_CHUNK (6): Stage1's job is recall (cast a wide net of candidates
-    that could plausibly clear MIN_OPENING_HOOK_STRENGTH), not picking the
-    final best-3 -- that narrowing still happens via the local quality
-    filter + Stage2 ranking, not by capping Stage1's search breadth.
+    PER_CHUNK (6): Stage1's job is recall (cast a wide net of materials
+    across every material_type), not picking the final best-3 -- that
+    narrowing still happens via the material prefilter + Stage2's final
+    edit design, not by capping Stage1's search breadth.
     """
     assert config.STAGE1_MAX_CANDIDATES_PER_CHUNK == 6
-    assert Stage1Output(candidates=[]).candidates == []
+    assert Stage1Output(materials=[]).materials == []
     for n in range(1, 7):
-        out = Stage1Output(candidates=[Stage1CandidateOutput(**_valid_candidate_kwargs()) for _ in range(n)])
-        assert len(out.candidates) == n
+        out = Stage1Output(materials=[Stage1MaterialOutput(**_valid_material_kwargs()) for _ in range(n)])
+        assert len(out.materials) == n
     with pytest.raises(ValidationError):
-        Stage1Output(candidates=[Stage1CandidateOutput(**_valid_candidate_kwargs()) for _ in range(7)])
+        Stage1Output(materials=[Stage1MaterialOutput(**_valid_material_kwargs()) for _ in range(7)])
 
 
-def test_stage1_candidate_output_segments_length_bounds():
+def test_stage1_material_output_segments_length_bounds():
     for n in (1, 2, 3):
-        kwargs = _valid_candidate_kwargs()
-        kwargs["segments"] = [_valid_segment_kwargs() for _ in range(n)]
-        Stage1CandidateOutput(**kwargs)
+        kwargs = _valid_material_kwargs()
+        kwargs["segments"] = [_valid_material_segment_kwargs() for _ in range(n)]
+        Stage1MaterialOutput(**kwargs)
     for n in (0, 4):
-        kwargs = _valid_candidate_kwargs()
-        kwargs["segments"] = [_valid_segment_kwargs() for _ in range(n)]
+        kwargs = _valid_material_kwargs()
+        kwargs["segments"] = [_valid_material_segment_kwargs() for _ in range(n)]
         with pytest.raises(ValidationError):
-            Stage1CandidateOutput(**kwargs)
+            Stage1MaterialOutput(**kwargs)
 
 
-def test_stage1_candidate_output_opening_hook_strength_and_score_bounds():
-    for field in ("opening_hook_strength", "score"):
-        for value in (0, 100):
-            kwargs = _valid_candidate_kwargs()
-            kwargs[field] = value
-            Stage1CandidateOutput(**kwargs)
-        for value in (-1, 101):
-            kwargs = _valid_candidate_kwargs()
-            kwargs[field] = value
-            with pytest.raises(ValidationError):
-                Stage1CandidateOutput(**kwargs)
+def test_stage1_material_output_usefulness_score_bounds():
+    for value in (0, 100):
+        kwargs = _valid_material_kwargs()
+        kwargs["usefulness_score"] = value
+        Stage1MaterialOutput(**kwargs)
+    for value in (-1, 101):
+        kwargs = _valid_material_kwargs()
+        kwargs["usefulness_score"] = value
+        with pytest.raises(ValidationError):
+            Stage1MaterialOutput(**kwargs)
 
 
-def test_stage1_candidate_output_rejects_invalid_hook_type():
-    kwargs = _valid_candidate_kwargs()
-    kwargs["hook_type"] = "not_a_real_hook_type"
+def test_stage1_material_output_rejects_invalid_material_type():
+    kwargs = _valid_material_kwargs()
+    kwargs["material_type"] = "not_a_real_material_type"
     with pytest.raises(ValidationError):
-        Stage1CandidateOutput(**kwargs)
+        Stage1MaterialOutput(**kwargs)
 
 
-def test_stage1_segment_output_rejects_invalid_role():
+@pytest.mark.parametrize("material_type", ["hook", "reason", "example", "context", "payoff"])
+def test_stage1_material_output_accepts_every_material_type(material_type):
+    kwargs = _valid_material_kwargs()
+    kwargs["material_type"] = material_type
+    Stage1MaterialOutput(**kwargs)
+
+
+def test_stage1_material_segment_output_rejects_wrongly_typed_segment_id():
     with pytest.raises(ValidationError):
-        Stage1SegmentOutput(role="not_a_real_role", start_segment_id=0, end_segment_id=0)
+        Stage1MaterialSegmentOutput(start_segment_id=["not", "an", "int"], end_segment_id=0)
 
 
-def test_stage1_segment_output_rejects_wrongly_typed_segment_id():
-    with pytest.raises(ValidationError):
-        Stage1SegmentOutput(role="hook", start_segment_id=["not", "an", "int"], end_segment_id=0)
-
-
-def test_stage1_candidate_output_rejects_unknown_fields():
+def test_stage1_material_output_rejects_unknown_fields():
     # extra="forbid" -> additionalProperties: false in the schema sent to
     # Claude, and the same strictness applies locally.
-    kwargs = _valid_candidate_kwargs()
-    kwargs["hook_text"] = "should not be accepted"
+    kwargs = _valid_material_kwargs()
+    kwargs["hook_type"] = "should not be accepted"
     with pytest.raises(ValidationError):
-        Stage1CandidateOutput(**kwargs)
+        Stage1MaterialOutput(**kwargs)
 
 
 # --- _deterministic_hook_text (item M) ------------------------------------
@@ -3346,7 +3545,7 @@ def test_deterministic_hook_text_reflects_anchor_trim():
 
 
 def test_extract_candidates_for_chunk_converts_structured_output(monkeypatch):
-    output = Stage1Output(candidates=[Stage1CandidateOutput(**_valid_candidate_kwargs())])
+    output = Stage1Output(materials=[Stage1MaterialOutput(**_valid_material_kwargs())])
     monkeypatch.setattr(
         clip_selector.structured_output, "call",
         lambda schema_model, **kwargs: output,
@@ -3356,24 +3555,25 @@ def test_extract_candidates_for_chunk_converts_structured_output(monkeypatch):
     result = clip_selector.extract_candidates_for_chunk(segments, "タイトル")
 
     assert len(result) == 1
-    assert isinstance(result[0], RawClipCandidate)
-    assert result[0].hook_type == "story"
-    assert result[0].hook_text == "強い発言です"
-    assert result[0].title == ""
-    assert result[0].description == ""
-    assert result[0].reasoning == ""
-    assert result[0].caveats == ""
+    assert isinstance(result[0], RawMaterial)
+    assert result[0].material_type == "hook"
+    assert result[0].usefulness_score == 80
+    # A material has none of the finished-candidate display/scoring
+    # properties -- those only ever exist on RawClipCandidate, produced
+    # solely by Stage2's conversion (_raw_candidate_from_stage2_output).
+    assert not hasattr(result[0], "hook_text")
+    assert not hasattr(result[0], "title")
 
 
-def test_extract_candidates_for_chunk_carries_anchor_through_to_hook_text(monkeypatch):
-    # E: the UI's "冒頭の実音声" (hook_text) must reflect the same anchor
-    # trim boundary.py applies when resolving the real edit points -- both
-    # must show "86は..." and never the raw untrimmed "これも私の愛車である...".
-    kwargs = _valid_candidate_kwargs()
+def test_extract_candidates_for_chunk_carries_anchor_text_through(monkeypatch):
+    # The material conversion must preserve start_anchor_text verbatim --
+    # boundary.py verifies/applies it later, at Stage2-design-conversion
+    # and resolve time, exactly as it always has for Stage1 output.
+    kwargs = _valid_material_kwargs()
     kwargs["segments"] = [
-        {"role": "hook", "start_segment_id": 0, "end_segment_id": 0, "start_anchor_text": "86は"}
+        {"start_segment_id": 0, "end_segment_id": 0, "start_anchor_text": "86は"}
     ]
-    output = Stage1Output(candidates=[Stage1CandidateOutput(**kwargs)])
+    output = Stage1Output(materials=[Stage1MaterialOutput(**kwargs)])
     monkeypatch.setattr(
         clip_selector.structured_output, "call",
         lambda schema_model, **kwargs: output,
@@ -3394,15 +3594,8 @@ def test_extract_candidates_for_chunk_carries_anchor_through_to_hook_text(monkey
     ]
     result = clip_selector.extract_candidates_for_chunk(chunk_segments, "タイトル")
 
-    raw = result[0]
-    assert raw.segments[0].start_anchor_text == "86は"
-    assert raw.hook_text.startswith("86は")
-    assert "これも私の愛車である" not in raw.hook_text
-
-    # UI (hook_text) and render (boundary-resolved opening) must agree.
-    transcript = Transcript(video_id="vidE", language="ja", segments=chunk_segments)
-    resolved = boundary.resolve_candidate(raw, transcript, candidate_id="c1")
-    assert resolved.segments[0].text.startswith(raw.hook_text.rstrip("…"))
+    material = result[0]
+    assert material.segments[0].start_anchor_text == "86は"
 
 
 def test_design_final_candidates_converts_stage2_output_to_raw_candidates(monkeypatch):
@@ -3411,7 +3604,7 @@ def test_design_final_candidates_converts_stage2_output_to_raw_candidates(monkey
     # conversion mirrors _raw_candidate_from_stage1_output exactly, plus
     # end_anchor_text.
     transcript = _long_transcript(minutes=1)
-    materials = {"s1_m000": _raw_candidate(0, 2)}
+    materials = {"s1_m000": _raw_material(0, 2)}
     output = Stage2Output(
         candidates=[
             Stage2CandidateOutput(
@@ -3447,8 +3640,8 @@ def test_design_final_candidates_can_recombine_segments_across_materials(monkeyp
     # material B) round-trips correctly.
     transcript = _long_transcript(minutes=1)
     materials = {
-        "s1_m000": _raw_candidate(0, 0),  # a strong standalone conclusion
-        "s1_m001": _raw_candidate(2, 2),  # a separate reason material
+        "s1_m000": _raw_material(0, 0, material_type="hook"),  # a strong standalone conclusion
+        "s1_m001": _raw_material(2, 2, material_type="reason"),  # a separate reason material
     }
     output = Stage2Output(
         candidates=[
@@ -3478,7 +3671,7 @@ def test_design_final_candidates_carries_end_anchor_text_through(monkeypatch):
     # into RawUsedSegment (boundary.py already knows how to verify/apply
     # it, unchanged since the duration-repair round).
     transcript = _long_transcript(minutes=1)
-    materials = {"s1_m000": _raw_candidate(0, 2)}
+    materials = {"s1_m000": _raw_material(0, 2)}
     output = Stage2Output(
         candidates=[
             Stage2CandidateOutput(
@@ -3508,7 +3701,7 @@ def test_design_final_candidates_does_not_send_full_transcript(monkeypatch):
     # appear in what gets sent to the API.
     transcript = _long_transcript(minutes=5)
     transcript.segments[-1].text = "この文言はどの候補にも含まれない特徴的な発言マーカーXYZ123"
-    materials = {"s1_m000": _raw_candidate(0, 2)}
+    materials = {"s1_m000": _raw_material(0, 2)}
 
     captured = {}
 
@@ -3527,7 +3720,7 @@ def test_design_final_candidates_deduplicates_exact_repeat_designs(monkeypatch):
     # byte-identical final designs collapse to one, even if Stage2's own
     # prompt-level dedup instruction fails to catch it.
     transcript = _long_transcript(minutes=1)
-    materials = {"s1_m000": _raw_candidate(0, 2)}
+    materials = {"s1_m000": _raw_material(0, 2)}
     same_segment = Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=2)
     output = Stage2Output(
         candidates=[
@@ -3555,8 +3748,8 @@ def test_design_final_candidates_supports_omitting_a_closure_failing_design(monk
     # further changes.
     transcript = _long_transcript(minutes=1)
     materials = {
-        "s1_m000": _raw_candidate(0, 2),  # hook + real reason: passes closure
-        "s1_m001": _raw_candidate(0, 2),  # hook only, no reason: Stage2 omits this design
+        "s1_m000": _raw_material(0, 2),  # hook + real reason: passes closure
+        "s1_m001": _raw_material(0, 2),  # hook only, no reason: Stage2 omits this design
     }
     output = Stage2Output(
         candidates=[
@@ -3651,14 +3844,14 @@ def test_select_candidates_calls_stage2_at_most_once(monkeypatch):
     transcript = _long_transcript(minutes=1)
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    candidates = [_raw_candidate(0, 2) for _ in range(3)]
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: candidates)
+    materials = [_raw_material(0, 2) for _ in range(3)]
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: materials)
 
     call_count = {"n": 0}
 
     def _fake_design(materials, t, title):
         call_count["n"] += 1
-        return list(materials.values())
+        return [_raw_candidate(0, 2) for _ in materials]
 
     monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
     clip_selector.select_candidates(transcript, "タイトル")
@@ -3675,14 +3868,14 @@ def test_refresh_candidates_only_calls_stage2_exactly_once_with_enough_stage1_ca
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
-    candidates = [_raw_candidate(0, 2, opening_hook_strength=90) for _ in range(3)]
-    cache.save_stage1_chunk(transcript.video_id, 0, candidates)
+    materials = [_raw_material(0, 2, usefulness_score=90) for _ in range(3)]
+    cache.save_stage1_chunk(transcript.video_id, 0, materials)
 
     call_count = {"n": 0}
 
     def _fake_design(materials, t, title):
         call_count["n"] += 1
-        return list(materials.values())
+        return [_raw_candidate(0, 2, opening_hook_strength=90) for _ in materials]
 
     monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
     monkeypatch.setattr(
@@ -3710,7 +3903,7 @@ def test_refresh_candidates_only_raises_without_stage2_call_when_stage1_cache_in
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("Stage2 must not be called")),
     )
 
-    with pytest.raises(RuntimeError, match="Stage1候補キャッシュ"):
+    with pytest.raises(RuntimeError, match="Stage1素材キャッシュ"):
         clip_selector.refresh_candidates_only(transcript, "タイトル")
 
 
@@ -3724,8 +3917,8 @@ def test_refresh_candidates_only_raises_without_stage2_call_when_no_usable_mater
         video_id="vidRefreshNoUsableMaterial", language="ja",
         segments=[_segment(0, start=0.0, text="ちょっと表現が難しいんですけども、要するにこうです。")],
     )
-    candidates = [_raw_candidate(0, 0, opening_hook_strength=90) for _ in range(3)]
-    cache.save_stage1_chunk(transcript.video_id, 0, candidates)
+    materials = [_raw_material(0, 0, usefulness_score=90) for _ in range(3)]
+    cache.save_stage1_chunk(transcript.video_id, 0, materials)
 
     monkeypatch.setattr(
         clip_selector, "design_final_candidates",
@@ -3747,13 +3940,12 @@ def test_refresh_stage1_and_candidates_ignores_existing_stage1_cache(monkeypatch
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
-    # A stale cached chunk result that would fail the current quality
-    # filter (weak opening_hook_strength) -- refresh_stage1_and_candidates
-    # must never reuse this, only what a fresh Stage1 call returns.
-    stale_bad = [_raw_candidate(0, 0, opening_hook_strength=10)]
+    # A stale cached chunk result -- refresh_stage1_and_candidates must
+    # never reuse this, only what a fresh Stage1 call returns.
+    stale_bad = [_raw_material(0, 0, usefulness_score=10)]
     cache.save_stage1_chunk(transcript.video_id, 0, stale_bad)
 
-    fresh_good = [_raw_candidate(0, 2, opening_hook_strength=90) for _ in range(3)]
+    fresh_good = [_raw_material(0, 2, usefulness_score=90) for _ in range(3)]
     call_count = {"n": 0}
 
     def _fake_extract(chunk_segments, video_title):
@@ -3761,17 +3953,20 @@ def test_refresh_stage1_and_candidates_ignores_existing_stage1_cache(monkeypatch
         return fresh_good
 
     monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", _fake_extract)
-    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda materials, t, title: list(materials.values()))
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda materials, t, title: [_raw_candidate(0, 2, opening_hook_strength=90) for _ in materials],
+    )
 
     result = clip_selector.refresh_stage1_and_candidates(transcript, "タイトル")
 
     assert len(result) == 3
     assert call_count["n"] == 1  # exactly one chunk for a 1-minute transcript
-    # The stale, weak-opening candidate must be gone: Stage1 was fully
+    # The stale cached material must be gone: Stage1 was fully
     # regenerated, not reused from the existing (now-outdated) cache --
     # and the chunk cache on disk is overwritten with the new result.
     reloaded_chunk = cache.load_stage1_chunk(transcript.video_id, 0)
-    assert all(c.opening_hook_strength == 90 for c in reloaded_chunk)
+    assert all(m.usefulness_score == 90 for m in reloaded_chunk)
     # The finalized Stage2 result is saved too.
     reloaded_stage2 = cache.load_stage2(transcript.video_id)
     assert len(reloaded_stage2) == 3
@@ -3784,7 +3979,7 @@ def test_refresh_stage1_and_candidates_keeps_earlier_chunk_success_on_later_fail
     chunks = clip_selector._build_chunks(clip_selector._usable_segments(transcript))
     assert len(chunks) >= 2  # sanity: this test needs at least 2 chunks
 
-    good = [_raw_candidate(0, 2, opening_hook_strength=90)]
+    good = [_raw_material(0, 2, usefulness_score=90)]
     call_count = {"n": 0}
 
     def _fake_extract(chunk_segments, video_title):
@@ -3818,8 +4013,7 @@ def test_refresh_stage1_and_candidates_raises_without_stage2_call_when_no_usable
     # speech -- the only thing the material prefilter still screens for --
     # so Stage2 must never be reached (Anthropic API calls = 0 for this
     # failure).
-    bad_material = _raw_candidate(0, 0, opening_hook_strength=90)
-    bad_material.hook_text = "ちょっと表現が難しいんですけども、要するにこうです。"
+    bad_material = _raw_material(0, 0, usefulness_score=90)
     transcript.segments[0].text = "ちょっと表現が難しいんですけども、要するにこうです。"
     transcript.segments[0].words = [
         TranscriptWord(start=0.0, end=2.0, text="ちょっと表現が難しいんですけども、要するにこうです。")
@@ -3845,12 +4039,15 @@ def test_refresh_stage1_and_candidates_does_not_overwrite_stage2_cache_when_fina
     old_stage2 = [_raw_candidate(0, 2, opening_hook_strength=90)] * 3
     cache.save_stage2(transcript.video_id, old_stage2)
 
-    fresh_candidates = [_raw_candidate(0, 2, opening_hook_strength=90) for _ in range(3)]
-    monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", lambda *a, **k: fresh_candidates)
-    # Stage2 ranking runs (costs 1 API call) but returns only 2 valid ids --
-    # _rank_finalize_and_cache must raise before ever calling
+    fresh_materials = [_raw_material(0, 2, usefulness_score=90) for _ in range(3)]
+    monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", lambda *a, **k: fresh_materials)
+    # Stage2 design runs (costs 1 API call) but returns only 2 valid
+    # designs -- _design_finalize_and_cache must raise before ever calling
     # cache.save_stage2, leaving the old cache exactly as it was.
-    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda materials, t, title: list(materials.values())[:2])
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda materials, t, title: [_raw_candidate(0, 2, opening_hook_strength=90) for _ in range(2)],
+    )
 
     with pytest.raises(RuntimeError, match="ローカル検証を通過したのは"):
         clip_selector.refresh_stage1_and_candidates(transcript, "タイトル")

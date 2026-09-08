@@ -2,25 +2,34 @@
 
 Basic philosophy: Claude's *only* job is deciding which real spoken words
 to use ("which segment_ids make a good Shorts clip"). Everything else --
-candidate IDs, hook_text, title/description/reasoning/caveats, duration
-math, quality filtering, caching, UI/render/QA -- is the program's job.
-Claude is never asked to author display text, so there is nothing for it
-to invent or get factually wrong, and its structured-output schemas stay
-small and cheap.
+material/candidate IDs, hook_text, title/description/reasoning/caveats,
+duration math, quality filtering, caching, UI/render/QA -- is the
+program's job. Claude is never asked to author display text, so there is
+nothing for it to invent or get factually wrong, and its structured-output
+schemas stay small and cheap.
 
-Stage 1 (per-chunk extraction) proposes candidates as segment_id ranges
-only (absolute condition #11) -- never raw seconds, never prose.
-boundary.py later turns those IDs into actual edit points. A local quality
-filter (duration bounds, spoken-opening strength, and ending completeness
--- see extend_to_natural_ending) runs before Stage 2, so weak candidates
-never reach Claude a second time.
+Stage 1 (per-chunk extraction) is a recall-priority *material* gatherer,
+not a finished-candidate picker: it proposes RawMaterial objects (a single
+material_type -- hook/reason/example/context/payoff -- plus segment_id
+ranges, absolute condition #11: segment_ids only, never raw seconds or
+prose) as broadly as it plausibly can within a chunk, without needing to
+assemble a complete, self-contained 20-50s Shorts structure on its own. A
+lightweight material prefilter (referential integrity + speech
+disfluency/restart only -- see _material_is_usable) runs before Stage 2,
+rejecting only material that would be unusable in *any* role; duration,
+ending completeness, hook strength, and junction safety are Stage2/the
+local candidate gate's job, not this filter's, since a material is not
+yet a claimed-finished candidate.
 
-Stage 2 (ranking) sees only a compact summary of the Stage1 survivors
-(candidate_id/hook_type/opening_hook_strength/score/duration/segment
-text) -- never the full transcript, since Stage 1 already narrowed the
-search space and Stage 2 only has to compare a handful of candidates
-against each other. It returns nothing but an ordered list of candidate
-ids; the program takes the top NUM_CANDIDATES.
+Stage 2 (final edit design) sees a compact per-material summary (material_
+id/material_type/usefulness_score/segment ids+text+timing) -- never the
+full transcript -- and returns up to NUM_CANDIDATES fully-designed final
+RawClipCandidate structures, freely recombining segments across different
+materials (e.g. one material's hook + a different material's reason) into
+a single semantically-complete design. It self-scores hook_type/opening_
+hook_strength/score for whatever it actually built; those are never
+carried forward from any source material (which has no such properties to
+carry).
 
 Neither stage retries automatically on a Structured Outputs failure or on
 insufficient candidates -- see StructuredOutputError and
@@ -47,7 +56,14 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import boundary, cache, config, models, structured_output
-from .models import RawClipCandidate, RawUsedSegment, Transcript, TranscriptSegment
+from .models import (
+    RawClipCandidate,
+    RawMaterial,
+    RawMaterialSegment,
+    RawUsedSegment,
+    Transcript,
+    TranscriptSegment,
+)
 
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
 
@@ -59,51 +75,60 @@ _PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
 # Structured Outputs requires.
 
 
-class Stage1SegmentOutput(BaseModel):
+class Stage1MaterialSegmentOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    role: Literal["hook", "context", "answer", "payoff"]
     start_segment_id: int
     end_segment_id: int
     # Optional: a short substring that exists verbatim, contiguously, at a
     # real word boundary near the start of the start_segment_id transcript
     # segment (e.g. "86は" within "これも私の愛車である86はスープラを...").
-    # Lets a candidate start mid-segment at a natural phrase boundary
+    # Lets a material start mid-segment at a natural phrase boundary
     # instead of always using the segment's literal first word. Never
     # AI-authored replacement text -- boundary.py verifies it against the
     # real transcript (models.find_anchor_start_word) and falls back to no
     # trim if it doesn't match exactly. Length-bounded since it's meant to
     # be a short phrase/clause, not a rewritten sentence.
+    # No `role` field: a material is single-purpose (see material_type on
+    # Stage1MaterialOutput below), not a structural position within a
+    # finished candidate -- that's only decided when Stage2 designs one.
     start_anchor_text: str | None = Field(default=None, min_length=1, max_length=60)
 
 
-class Stage1CandidateOutput(BaseModel):
+class Stage1MaterialOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    hook_type: Literal["open_loop", "strong_take", "surprising_fact", "story"]
-    segments: list[Stage1SegmentOutput] = Field(min_length=1, max_length=3)
-    opening_hook_strength: int = Field(ge=0, le=100)
-    score: int = Field(ge=0, le=100)
+    material_type: Literal["hook", "reason", "example", "context", "payoff"]
+    segments: list[Stage1MaterialSegmentOutput] = Field(min_length=1, max_length=3)
+    # A single, generic usefulness rating -- never a hook-strength or
+    # overall-candidate score. Only material_type="hook" material is
+    # expected to be judged by hook-opening standards (see prompts/
+    # extract_candidates.md); reason/example/context/payoff material is
+    # rated on how useful/clear/self-contained it is for its own purpose.
+    usefulness_score: int = Field(ge=0, le=100)
 
 
 class Stage1Output(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    candidates: list[Stage1CandidateOutput] = Field(
+    materials: list[Stage1MaterialOutput] = Field(
         min_length=0, max_length=config.STAGE1_MAX_CANDIDATES_PER_CHUNK
     )
 
 
 class Stage2SegmentOutput(BaseModel):
-    """Identical shape to Stage1SegmentOutput, plus one addition:
-    end_anchor_text. Unlike start_anchor_text (which Stage1 can also set),
-    end_anchor_text is a genuinely new capability -- Stage2 designs the
-    final candidate, so it needs the same word-boundary-verified control
-    over where a segment *ends* that Stage1 already had over where it
-    *starts*. Both anchors are verified the identical way at resolve
-    time (models.find_anchor_start_word / find_anchor_end_word) and
-    silently fall back to "no trim" if they don't match real transcript
-    text exactly -- never AI-authored replacement text.
+    """A segment within one of Stage2's finished candidate designs. Unlike
+    Stage1MaterialSegmentOutput (which has no `role`, since a material is
+    single-purpose), this has both `role` -- Stage2 is the only place a
+    segment's structural position within a finished candidate is ever
+    decided -- and `end_anchor_text`, a genuinely new capability versus
+    Stage1: Stage2 designs the final candidate, so it needs the same
+    word-boundary-verified control over where a segment *ends* that
+    start_anchor_text already gives it over where it *starts*. Both
+    anchors are verified the identical way at resolve time
+    (models.find_anchor_start_word / find_anchor_end_word) and silently
+    fall back to "no trim" if they don't match real transcript text
+    exactly -- never AI-authored replacement text.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -116,12 +141,13 @@ class Stage2SegmentOutput(BaseModel):
 
 
 class Stage2CandidateOutput(BaseModel):
-    """Identical shape to Stage1CandidateOutput. Stage2 now designs
-    complete final candidates (not just a ranking of Stage1's own), so it
-    re-scores opening_hook_strength/score itself for whatever it actually
-    constructed -- these are never copied forward from a source material,
-    since a recombined candidate's real opening/overall quality can differ
-    from any single material it drew from.
+    """A finished candidate design: hook_type/opening_hook_strength/score
+    all describe this specific design, self-scored by Stage2 for whatever
+    it actually constructed -- never copied forward from a source
+    material, since a material has no such properties (RawMaterial has no
+    hook_type/opening_hook_strength/score at all) and a recombined
+    candidate's real opening/overall quality can differ from any single
+    material it drew from.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -279,47 +305,40 @@ def _deterministic_hook_text(
     return text
 
 
-def _raw_candidate_from_stage1_output(
-    c: Stage1CandidateOutput, chunk_segments: list[TranscriptSegment]
-) -> RawClipCandidate:
-    """Converts Claude's minimal Stage1 output into the internal
-    RawClipCandidate pipeline dataclass. title/description/reasoning/
-    caveats are always empty -- the program never asks Claude to generate
-    display copy, so there's nothing to carry over for those fields.
+def _raw_material_from_stage1_output(m: Stage1MaterialOutput) -> RawMaterial:
+    """Converts Claude's minimal Stage1 output into the internal RawMaterial
+    pipeline dataclass. No chunk_segments/hook_text needed here, unlike the
+    old candidate conversion -- a material has no hook_text (that's a
+    finished-candidate display concept only Stage2's conversion computes,
+    see _raw_candidate_from_stage2_output/_deterministic_hook_text below).
     """
     segments = [
-        RawUsedSegment(
-            role=s.role,
+        RawMaterialSegment(
             start_segment_id=s.start_segment_id,
             end_segment_id=s.end_segment_id,
             start_anchor_text=s.start_anchor_text,
         )
-        for s in c.segments
+        for s in m.segments
     ]
-    return RawClipCandidate(
-        hook_type=c.hook_type,
+    return RawMaterial(
+        material_type=m.material_type,
         segments=segments,
-        hook_text=_deterministic_hook_text(
-            segments[0].start_segment_id, segments[0].start_anchor_text, chunk_segments
-        ),
-        opening_hook_strength=c.opening_hook_strength,
-        title="",
-        description="",
-        score=c.score,
-        reasoning="",
-        caveats="",
+        usefulness_score=m.usefulness_score,
     )
 
 
 def _raw_candidate_from_stage2_output(
     c: Stage2CandidateOutput, all_segments: list[TranscriptSegment]
 ) -> RawClipCandidate:
-    """The Stage2 mirror of _raw_candidate_from_stage1_output -- identical
-    conversion, plus copying end_anchor_text. Takes the transcript's full
-    segment list (not one chunk's) since Stage2 designs a final candidate
-    by freely referencing segment_ids from *any* Stage1 material, not
-    just ones that happened to share a chunk; _deterministic_hook_text's
-    linear id lookup works identically either way.
+    """Converts Claude's Stage2 output into the internal RawClipCandidate
+    pipeline dataclass. title/description/reasoning/caveats are always
+    empty -- the program never asks Claude to generate display copy, so
+    there's nothing to carry over for those fields. Takes the transcript's
+    full segment list (not one chunk's) since Stage2 designs a final
+    candidate by freely referencing segment_ids from *any* Stage1
+    material, not just ones that happened to share a chunk;
+    _deterministic_hook_text's linear id lookup works identically either
+    way.
     """
     segments = [
         RawUsedSegment(
@@ -381,7 +400,7 @@ def _build_chunks(
 
 def extract_candidates_for_chunk(
     chunk_segments: list[TranscriptSegment], video_title: str
-) -> list[RawClipCandidate]:
+) -> list[RawMaterial]:
     system_prompt = (_PROMPTS_DIR / "extract_candidates.md").read_text(encoding="utf-8")
     user_content = (
         f"# 番組タイトル\n{video_title}\n\n"
@@ -395,18 +414,18 @@ def extract_candidates_for_chunk(
         user_content=user_content,
         max_tokens=config.STAGE1_MAX_OUTPUT_TOKENS,
     )
-    return [_raw_candidate_from_stage1_output(c, chunk_segments) for c in parsed.candidates]
+    return [_raw_material_from_stage1_output(m) for m in parsed.materials]
 
 
 def run_stage1(
     transcript: Transcript, video_title: str, force_refresh: bool = False
-) -> list[RawClipCandidate]:
+) -> list[RawMaterial]:
     """Runs Stage1 chunk by chunk, caching each chunk's result the moment
     it succeeds (cache.save_stage1_chunk) -- so if a later chunk's API
     call fails, the already-paid-for results from earlier chunks are not
     discarded, and a subsequent run only re-requests the missing chunk(s).
     """
-    all_candidates: list[RawClipCandidate] = []
+    all_candidates: list[RawMaterial] = []
     for chunk_index, chunk_segments in _build_chunks(_usable_segments(transcript)):
         if not force_refresh:
             cached = cache.load_stage1_chunk(transcript.video_id, chunk_index)
@@ -1729,13 +1748,35 @@ def _format_diagnostic_summary(evaluations: list[LocalCandidateEvaluation]) -> s
     return "\n".join(lines)
 
 
-def diagnose_local_filter(transcript: Transcript) -> list[LocalCandidateEvaluation]:
+@dataclass
+class MaterialUsabilityResult:
+    """Diagnostic-friendly result of _material_rejection_reason -- the
+    lightweight prefilter a Stage1 *material* actually goes through (see
+    diagnose_local_filter). Deliberately not LocalCandidateEvaluation: a
+    RawMaterial has no hook_type/opening_hook_strength/score for
+    evaluate_local_candidate's full gate to inspect, so running that gate
+    directly against materials would be a type mismatch, not merely a
+    stricter check -- materials are diagnosed by the same lightweight
+    rule Stage2 actually receives them under.
+    """
+
+    material: RawMaterial
+    usable: bool
+    reason: str | None
+
+
+def diagnose_local_filter(transcript: Transcript) -> list[MaterialUsabilityResult]:
     """API 0: reuses only the already-cached Stage1 chunk results for this
     transcript (_load_stage1_from_cache_only -- never run_stage1 with
     force_refresh=True, never the Stage1 or Stage2 Anthropic API) and
-    returns the per-candidate evaluate_local_candidate verdict for every
-    one of them. Lets "why did the local filter leave too few
-    candidates" be re-answered against an already-populated cache (e.g.
+    returns the per-material usability verdict (_material_rejection_
+    reason) for every one of them -- the same lightweight prefilter
+    select_candidates/refresh_candidates_only/refresh_stage1_and_
+    candidates actually run materials through before Stage2, not the full
+    evaluate_local_candidate_with_repair gate (that gate only ever runs
+    against Stage2's *designed* candidates -- see _design_finalize_and_
+    cache). Lets "why did the material prefilter leave too few usable
+    materials" be re-answered against an already-populated cache (e.g.
     after pulling a prompt/threshold change) at zero additional API cost.
 
     Raises RuntimeError (no evaluations computed) if the Stage1 chunk
@@ -1744,17 +1785,57 @@ def diagnose_local_filter(transcript: Transcript) -> list[LocalCandidateEvaluati
     run a real analysis (or refresh_stage1_and_candidates) first to
     populate the cache.
     """
-    stage1_candidates = _load_stage1_from_cache_only(transcript)
-    if stage1_candidates is None:
+    stage1_materials = _load_stage1_from_cache_only(transcript)
+    if stage1_materials is None:
         raise RuntimeError(
-            "診断用のStage1候補キャッシュが見つからないか不完全です。"
+            "診断用のStage1素材キャッシュが見つからないか不完全です。"
             "先に解析（またはStage1からの再解析）を一度実行してキャッシュを作成してから、"
             "この診断を実行してください。（この診断自体はAPIを呼び出しません）"
         )
-    return _evaluate_all_local_candidates(stage1_candidates, transcript)
+    results = []
+    for m in stage1_materials:
+        reason = _material_rejection_reason(m, transcript)
+        results.append(MaterialUsabilityResult(material=m, usable=reason is None, reason=reason))
+    return results
 
 
-def _material_is_usable(raw: RawClipCandidate, transcript: Transcript) -> bool:
+def _material_as_pseudo_candidate(material: RawMaterial) -> RawClipCandidate:
+    """A private, throwaway adapter -- never persisted or exposed outside a
+    single call within this module -- that lets a RawMaterial reuse the
+    existing RawClipCandidate/RawUsedSegment-typed generic utilities
+    (boundary.resolve_candidate, _candidate_speech_restart_marker) without
+    duplicating their logic or touching boundary.py. The placeholder
+    role="context"/hook_type="story"/hook_text=""/title/description/
+    reasoning/caveats values carry no meaning and are discarded the
+    instant the caller is done with the adapter's return value;
+    opening_hook_strength/score are set to the material's own
+    usefulness_score purely so RawClipCandidate.__post_init__'s existing
+    0-100 validation has something consistent to check (usefulness_score
+    is already validated 0-100 by RawMaterial itself).
+    """
+    segments = [
+        RawUsedSegment(
+            role="context",
+            start_segment_id=s.start_segment_id,
+            end_segment_id=s.end_segment_id,
+            start_anchor_text=s.start_anchor_text,
+        )
+        for s in material.segments
+    ]
+    return RawClipCandidate(
+        hook_type="story",
+        segments=segments,
+        hook_text="",
+        opening_hook_strength=material.usefulness_score,
+        title="",
+        description="",
+        score=material.usefulness_score,
+        reasoning="",
+        caveats="",
+    )
+
+
+def _material_rejection_reason(material: RawMaterial, transcript: Transcript) -> str | None:
     """The only filter a Stage1 *material* goes through before being shown
     to Stage2 -- deliberately much lighter than evaluate_local_candidate.
     A material is recall-priority raw ingredient, not a final candidate:
@@ -1772,47 +1853,62 @@ def _material_is_usable(raw: RawClipCandidate, transcript: Transcript) -> bool:
     unchanged evaluate_local_candidate_with_repair) against whatever
     Stage2 actually designs, since only *that* is a claimed-final
     candidate.
+
+    Returns None when usable, otherwise a short reason code
+    ("invalid_segment_reference" / "speech_disfluency" / "speech_restart")
+    for diagnostics (see MaterialUsabilityResult / diagnose_local_filter).
     """
     try:
-        for s in raw.segments:
+        for s in material.segments:
             transcript.segment_by_id(s.start_segment_id)
             transcript.segment_by_id(s.end_segment_id)
     except KeyError:
-        return False
-    resolved = boundary.resolve_candidate(raw, transcript, candidate_id="_material_check")
+        return "invalid_segment_reference"
+    pseudo = _material_as_pseudo_candidate(material)
+    resolved = boundary.resolve_candidate(pseudo, transcript, candidate_id="_material_check")
     for seg in resolved.segments:
         if models.has_speech_disfluency(seg.text) is not None:
-            return False
-    if _candidate_speech_restart_marker(raw, transcript) is not None:
-        return False
-    return True
+            return "speech_disfluency"
+    if _candidate_speech_restart_marker(pseudo, transcript) is not None:
+        return "speech_restart"
+    return None
 
 
-def _stage2_material_summary(material_id: str, raw: RawClipCandidate, transcript: Transcript) -> dict:
+def _material_is_usable(material: RawMaterial, transcript: Transcript) -> bool:
+    """Thin boolean wrapper over _material_rejection_reason -- see there
+    for exactly what is (and deliberately is not) checked.
+    """
+    return _material_rejection_reason(material, transcript) is None
+
+
+def _stage2_material_summary(material_id: str, material: RawMaterial, transcript: Transcript) -> dict:
     """Builds the compact per-material summary Stage2 sees -- never the
     full transcript. Unlike the old ranking-only _stage2_summary (one
     joined segments_text string per candidate), this exposes each
     segment's own start_segment_id/end_segment_id and real timing/text
     individually, since Stage2 now needs to reference (and recombine)
     real segment ids across *different* materials to design a final
-    candidate, not just judge a pre-joined block of text.
+    candidate, not just judge a pre-joined block of text. Sends
+    material_type/usefulness_score (never hook_type/opening_hook_strength/
+    score, and never per-segment role) -- those finished-candidate
+    properties don't exist on a RawMaterial; Stage2 assigns them itself,
+    once, to whatever it actually designs (see Stage2CandidateOutput).
     """
-    resolved = boundary.resolve_candidate(raw, transcript, candidate_id=material_id)
+    pseudo = _material_as_pseudo_candidate(material)
+    resolved = boundary.resolve_candidate(pseudo, transcript, candidate_id=material_id)
     return {
         "material_id": material_id,
-        "hook_type": raw.hook_type,
-        "opening_hook_strength": raw.opening_hook_strength,
-        "score": raw.score,
+        "material_type": material.material_type,
+        "usefulness_score": material.usefulness_score,
         "segments": [
             {
-                "role": seg.role,
                 "start_segment_id": raw_seg.start_segment_id,
                 "end_segment_id": raw_seg.end_segment_id,
                 "text": seg.text,
                 "start_sec": round(seg.start, 1),
                 "end_sec": round(seg.end, 1),
             }
-            for seg, raw_seg in zip(resolved.segments, raw.segments)
+            for seg, raw_seg in zip(resolved.segments, material.segments)
         ],
     }
 
@@ -1842,7 +1938,7 @@ def _dedupe_by_segment_sequence(candidates: list[RawClipCandidate]) -> list[RawC
 
 
 def design_final_candidates(
-    materials: dict[str, RawClipCandidate], transcript: Transcript, video_title: str
+    materials: dict[str, RawMaterial], transcript: Transcript, video_title: str
 ) -> list[RawClipCandidate]:
     """Stage2: final edit design (replaces the old ranking-only Stage2).
     Claude sees compact per-material summaries (never the full transcript)
@@ -1996,7 +2092,7 @@ def select_candidates(
 
 
 def _design_finalize_and_cache(
-    materials: list[RawClipCandidate], transcript: Transcript, video_title: str
+    materials: list[RawMaterial], transcript: Transcript, video_title: str
 ) -> list[RawClipCandidate]:
     """Stage2 final-edit-design (at most once) -> the unchanged local
     quality gate (evaluate_local_candidate_with_repair) -> the unchanged
@@ -2055,7 +2151,7 @@ def _design_finalize_and_cache(
     return finalized
 
 
-def _load_stage1_from_cache_only(transcript: Transcript) -> list[RawClipCandidate] | None:
+def _load_stage1_from_cache_only(transcript: Transcript) -> list[RawMaterial] | None:
     """Like run_stage1, but never calls the Stage1 API under any
     circumstance -- used by refresh_candidates_only, which must reuse
     only what's already on disk. Returns None the moment any chunk's
@@ -2067,7 +2163,7 @@ def _load_stage1_from_cache_only(transcript: Transcript) -> list[RawClipCandidat
     chunks = _build_chunks(_usable_segments(transcript))
     if not chunks:
         return None
-    all_candidates: list[RawClipCandidate] = []
+    all_candidates: list[RawMaterial] = []
     for chunk_index, _ in chunks:
         cached = cache.load_stage1_chunk(transcript.video_id, chunk_index)
         if cached is None:
@@ -2100,7 +2196,7 @@ def refresh_candidates_only(
     stage1_materials = _load_stage1_from_cache_only(transcript)
     if stage1_materials is None:
         raise RuntimeError(
-            "保存済みのStage1候補キャッシュが見つからないか不完全です。"
+            "保存済みのStage1素材キャッシュが見つからないか不完全です。"
             "完全な再解析（Stage1からのやり直し）が必要です。"
         )
 
