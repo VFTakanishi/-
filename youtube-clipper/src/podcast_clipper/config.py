@@ -109,13 +109,27 @@ END_EXTENSION_MAX_GAP_SEC = 0.8
 # loosely (e.g. not several seconds).
 END_EXTENSION_CONTINUATION_MAX_GAP_SEC = 1.5
 
+# Real-machine incident: a candidate ended at ~23s mid-explanation -- the
+# duration and hook/junction checks all passed, but the speech content was
+# clearly not finished. Root cause: Stage2 never saw any transcript content
+# past a material's own chosen segments, so it had no way to judge whether a
+# more complete, still-natural ending existed just beyond its current
+# choice. STAGE2_LOOKAHEAD_MAX_SEGMENTS/_SEC bound a small, reference-only
+# window of real transcript segments immediately following each material's
+# last segment, shown to Stage2 so it can check "is there a cleaner, still-
+# natural stopping point a bit further on" -- not a mandate to always use
+# this much extra footage, and deliberately not the full remaining
+# transcript (API input size).
+STAGE2_LOOKAHEAD_MAX_SEGMENTS = 4
+STAGE2_LOOKAHEAD_MAX_SEC = 20.0
+
 # Bump this whenever clip_selector.py's Claude prompt text or Structured
 # Outputs schema changes in a way that makes previously-cached Stage1/Stage2
 # JSON stale/incompatible. cache.py stores this alongside the cached data
 # and treats a mismatch as a cache miss (falls back to a fresh Stage1/Stage2
 # run) rather than trying to deserialize old-shape data. The Whisper
 # transcript cache has no dependency on this and is unaffected.
-CANDIDATE_SCHEMA_VERSION = 12
+CANDIDATE_SCHEMA_VERSION = 13
 
 CHUNK_MINUTES = 10.0
 CHUNK_OVERLAP_MINUTES = 1.0

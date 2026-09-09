@@ -151,6 +151,19 @@ class Stage2CandidateOutput(BaseModel):
     hook_type/opening_hook_strength/score at all) and a recombined
     candidate's real opening/overall quality can differ from any single
     material it drew from.
+
+    semantic_ending_complete/ending_rationale_code/recomposed_for_duration
+    make Stage2's ending-point judgment an explicit, required part of its
+    output (see prompts/rank_and_finalize.md's ending-design section) --
+    Stage2 must commit to a real value for each, not leave ending
+    completeness as something only Python's mechanical safety net (gap
+    size, terminal punctuation) infers after the fact. These are a small
+    closed vocabulary / booleans, not free-text reasoning, so Structured
+    Output stays small; they flow into stage2_diagnostic.json for
+    debuggability but are never the sole gate Python relies on to accept a
+    candidate -- the existing deterministic checks in
+    evaluate_local_candidate are unchanged and still run regardless of what
+    Stage2 self-reports here.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -159,6 +172,11 @@ class Stage2CandidateOutput(BaseModel):
     segments: list[Stage2SegmentOutput] = Field(min_length=1, max_length=3)
     opening_hook_strength: int = Field(ge=0, le=100)
     score: int = Field(ge=0, le=100)
+    semantic_ending_complete: bool
+    ending_rationale_code: Literal[
+        "natural_conclusion", "hook_resolved", "padding_excluded", "recomposed_for_duration"
+    ]
+    recomposed_for_duration: bool
 
 
 class Stage2Output(BaseModel):
@@ -375,6 +393,9 @@ def _raw_candidate_from_stage2_output(
         score=c.score,
         reasoning="",
         caveats="",
+        semantic_ending_complete=c.semantic_ending_complete,
+        ending_rationale_code=c.ending_rationale_code,
+        recomposed_for_duration=c.recomposed_for_duration,
     )
 
 
@@ -655,6 +676,22 @@ def extend_to_natural_ending(
     identical regardless of whether an alternative candidate happens to
     be available. Used identically by qa.utterance_completeness_qa as a
     safety net, so the primary fix and the QA backstop can never disagree.
+
+    Role (semantic-ending redesign): Stage2 is now the one that decides
+    *where* a candidate should semantically end -- it has visibility into
+    a bounded lookahead past each material's chosen segments (see
+    _material_lookahead_segments/_stage2_material_summary) and is
+    instructed to pick the natural, meaning-complete stopping point
+    itself, not "the earliest point that happens to end on a period." This
+    function is deliberately NOT rewritten to make that semantic judgment
+    -- it has no access to meaning, only to punctuation and inter-segment
+    gaps. Its job is narrower and mechanical: catch a segment that plainly
+    dangles mid-utterance (no terminal punctuation reached, or a confirmed
+    grammatical continuation marker) and pull in a couple more real
+    transcript segments so the cut lands on an actual sentence boundary.
+    When Stage2 has already chosen a clean ending, this is a no-op. It
+    must never be treated as proof that the chosen ending is semantically
+    complete -- only that it isn't an obviously unpunctuated mid-cutoff.
     """
     last = raw.segments[-1]
     other_index_ranges = [
@@ -748,6 +785,15 @@ def has_confident_natural_ending(raw: RawClipCandidate, transcript: Transcript) 
     extend_to_natural_ending and drop/fail the candidate if it returns
     False, rather than accepting whatever ending extension happened to
     stop at.
+
+    Role (semantic-ending redesign): this is a mechanical safety net, not
+    the semantic-completeness judge -- Stage2 owns that judgment (see
+    semantic_ending_complete on RawClipCandidate, informed by the
+    lookahead it's shown). This function only catches an obvious,
+    grammar-level unfinished ending (no punctuation reached, still
+    grammatically dangling); returning True here is never a claim that
+    the underlying explanation is actually finished, only that it isn't
+    an obviously dangling one.
     """
     text = transcript.segment_by_id(raw.segments[-1].end_segment_id).text
     return _segment_ending_is_confident(text)
@@ -1687,12 +1733,25 @@ def _stage2_diagnostic_evaluation(e: LocalCandidateEvaluation) -> dict:
     duration/opening text, the same fields _format_diagnostic_summary
     renders into a RuntimeError message, but kept here as structured JSON
     so a diagnostic tool can read it back without re-parsing prose.
+
+    selected_end_segment_id/selected_end_anchor_text/
+    semantic_ending_complete/ending_rationale_code/recomposed_for_duration
+    make Stage2's own ending-point decision (and its self-reported
+    rationale) visible alongside the local-validation verdict, so a future
+    mid-cutoff incident can be diagnosed by reading this file instead of
+    needing a fresh, API-calling re-analysis.
     """
+    last_segment = e.candidate.segments[-1]
     return {
         "accepted": e.accepted,
         "reason": e.reason,
         "duration_sec": e.duration_sec,
         "opening_text": e.opening_text,
+        "selected_end_segment_id": last_segment.end_segment_id,
+        "selected_end_anchor_text": last_segment.end_anchor_text,
+        "semantic_ending_complete": e.candidate.semantic_ending_complete,
+        "ending_rationale_code": e.candidate.ending_rationale_code,
+        "recomposed_for_duration": e.candidate.recomposed_for_duration,
     }
 
 
@@ -1909,6 +1968,45 @@ def _material_is_usable(material: RawMaterial, transcript: Transcript) -> bool:
     return _material_rejection_reason(material, transcript) is None
 
 
+def _material_lookahead_segments(material: RawMaterial, transcript: Transcript) -> list[dict]:
+    """Real transcript segments immediately following material's own last
+    segment, shown to Stage2 as reference-only "is there a more natural
+    ending a bit further on" material (see prompts/rank_and_finalize.md's
+    ending-design section). This is the concrete fix for the root cause
+    behind the ~23s mid-cutoff incident: Stage2 previously had zero
+    visibility past a material's own chosen segments, so it had no way to
+    even consider a cleaner stopping point that existed just beyond them.
+
+    Bounded by both config.STAGE2_LOOKAHEAD_MAX_SEGMENTS and
+    config.STAGE2_LOOKAHEAD_MAX_SEC (whichever is hit first) to keep API
+    input size in check -- this is explicitly NOT a full-transcript resend
+    and NOT a mandate that Stage2 must use this much extra footage, only
+    material it may look at. At least one lookahead segment is always
+    included when one exists, even if its own duration alone exceeds the
+    seconds budget, so Stage2 is never left with an empty, uninformative
+    lookahead solely because the very next segment happens to be long.
+    Returns an empty list when material's last segment is already at (or
+    past) the end of the transcript.
+    """
+    last_segment_id = material.segments[-1].end_segment_id
+    start_index = transcript.segment_index(last_segment_id) + 1
+    lookahead: list[dict] = []
+    cumulative_sec = 0.0
+    for segment in transcript.segments[start_index : start_index + config.STAGE2_LOOKAHEAD_MAX_SEGMENTS]:
+        if lookahead and cumulative_sec >= config.STAGE2_LOOKAHEAD_MAX_SEC:
+            break
+        lookahead.append(
+            {
+                "segment_id": segment.id,
+                "text": segment.text,
+                "start_sec": round(segment.start, 1),
+                "end_sec": round(segment.end, 1),
+            }
+        )
+        cumulative_sec += segment.end - segment.start
+    return lookahead
+
+
 def _stage2_material_summary(material_id: str, material: RawMaterial, transcript: Transcript) -> dict:
     """Builds the compact per-material summary Stage2 sees -- never the
     full transcript. Unlike the old ranking-only _stage2_summary (one
@@ -1921,6 +2019,12 @@ def _stage2_material_summary(material_id: str, material: RawMaterial, transcript
     score, and never per-segment role) -- those finished-candidate
     properties don't exist on a RawMaterial; Stage2 assigns them itself,
     once, to whatever it actually designs (see Stage2CandidateOutput).
+
+    "lookahead" (see _material_lookahead_segments) is reference-only real
+    transcript content past this material's own last segment -- included
+    so Stage2 can check for a more natural ending point a bit further on
+    before locking in this material's own boundary as a candidate's final
+    segment.
     """
     pseudo = _material_as_pseudo_candidate(material)
     resolved = boundary.resolve_candidate(pseudo, transcript, candidate_id=material_id)
@@ -1938,6 +2042,7 @@ def _stage2_material_summary(material_id: str, material: RawMaterial, transcript
             }
             for seg, raw_seg in zip(resolved.segments, material.segments)
         ],
+        "lookahead": _material_lookahead_segments(material, transcript),
     }
 
 
@@ -2005,8 +2110,14 @@ def design_final_candidates(
     # result.json must never hold an unsuccessful run's picks), which
     # previously meant Stage2's actual raw output was lost the moment the
     # process exited, making "what did Stage2 actually design" impossible
-    # to answer without a fresh, API-calling re-analysis.
-    cache.save_stage2_diagnostic(transcript.video_id, candidates)
+    # to answer without a fresh, API-calling re-analysis. materials_
+    # lookahead is only ever available here (the materials dict is in
+    # scope) -- see cache.save_stage2_diagnostic's docstring for how the
+    # second (evaluations) save preserves it without needing it re-passed.
+    materials_lookahead = {mid: s["lookahead"] for mid, s in zip(materials, summaries)}
+    cache.save_stage2_diagnostic(
+        transcript.video_id, candidates, materials_lookahead=materials_lookahead
+    )
     return _dedupe_by_segment_sequence(candidates)
 
 

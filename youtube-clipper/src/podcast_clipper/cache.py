@@ -169,6 +169,7 @@ def save_stage2_diagnostic(
     candidates: list[RawClipCandidate],
     *,
     evaluations: list[dict] | None = None,
+    materials_lookahead: dict | None = None,
 ) -> None:
     """Diagnostic-only snapshot of what Stage2 actually designed, written
     at two points: (1) immediately after Stage2's Structured Output is
@@ -186,6 +187,17 @@ def save_stage2_diagnostic(
     real "why did this fail" diagnosis impossible after the fact without
     a fresh, API-calling re-analysis.
 
+    materials_lookahead (material_id -> lookahead segment list, see
+    clip_selector._material_lookahead_segments) is only ever passed at the
+    first save point (right after the Structured Output parse, where the
+    materials dict is in scope) -- so the second save (evaluations, after
+    local validation, where only candidates are in scope) must not
+    silently drop it: when materials_lookahead is None, this merges in
+    whatever the existing on-disk file already has under that key, rather
+    than overwriting the file without it. This lets a future "why did the
+    23s cutoff happen again" diagnosis see exactly what lookahead Stage2
+    had available, alongside its actual per-candidate decisions.
+
     Never read by the production candidate-selection path -- load_stage2
     only ever reads stage2_path, never this file. This is purely a
     developer/diagnostic artifact (see load_stage2_diagnostic).
@@ -196,6 +208,14 @@ def save_stage2_diagnostic(
     }
     if evaluations is not None:
         payload["evaluations"] = evaluations
+    if materials_lookahead is not None:
+        payload["materials_lookahead"] = materials_lookahead
+    else:
+        existing = load_stage2_diagnostic(video_id)
+        if existing is not None and existing.get("schema_version") == config.CANDIDATE_SCHEMA_VERSION:
+            preserved = existing.get("materials_lookahead")
+            if preserved is not None:
+                payload["materials_lookahead"] = preserved
     _atomic_write_text(
         stage2_diagnostic_path(video_id), json.dumps(payload, ensure_ascii=False, indent=2)
     )
@@ -234,6 +254,14 @@ def _raw_candidate_from_dict(d: dict, *, context: str) -> RawClipCandidate:
         score=d["score"],
         reasoning=d["reasoning"],
         caveats=d["caveats"],
+        # .get()-based with the same defaults as RawClipCandidate itself:
+        # a cache entry written before the semantic-ending-design fields
+        # existed on the model still deserializes cleanly (schema_version
+        # bumps invalidate genuinely incompatible caches; these three are
+        # additive and don't need a hard miss).
+        semantic_ending_complete=d.get("semantic_ending_complete", True),
+        ending_rationale_code=d.get("ending_rationale_code", "natural_conclusion"),
+        recomposed_for_duration=d.get("recomposed_for_duration", False),
     )
 
 

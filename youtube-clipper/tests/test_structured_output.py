@@ -466,6 +466,9 @@ def test_pseudo_api_boundary_e2e_reaches_three_final_candidates(monkeypatch):
                 "segments": [{"role": "hook", "start_segment_id": i, "end_segment_id": i}],
                 "opening_hook_strength": 90,
                 "score": 80,
+                "semantic_ending_complete": True,
+                "ending_rationale_code": "natural_conclusion",
+                "recomposed_for_duration": False,
             }
             for i in range(3)
         ]

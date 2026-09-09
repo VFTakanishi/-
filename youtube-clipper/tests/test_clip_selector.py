@@ -350,7 +350,46 @@ def test_rank_and_finalize_prompt_forbids_fabricated_segment_ids():
 def test_rank_and_finalize_prompt_documents_duration_target():
     text = _rank_and_finalize_prompt_text()
     assert "20〜50秒" in text
-    assert "50秒を超える設計は絶対に出さないこと" in text
+    assert "50秒を超える自然な構成になった場合は" in text
+
+
+def test_rank_and_finalize_prompt_documents_ending_design_selection_criteria():
+    # Item 3: Stage2 must pick the semantically optimal ending, not the
+    # earliest legal one -- the A-E criteria and the worked example that
+    # pins down "select 34s, not 23s or 41s" must survive in the prompt.
+    text = _rank_and_finalize_prompt_text()
+    assert "最短で終われる地点ではなく、最適な自然終了を選ぶこと" in text
+    assert "hookで作った期待" in text
+    assert "34秒を選ぶこと" in text
+
+
+def test_rank_and_finalize_prompt_documents_lookahead():
+    text = _rank_and_finalize_prompt_text()
+    assert "`lookahead`" in text
+    assert "参考用の閲覧材料" in text
+
+
+def test_rank_and_finalize_prompt_documents_ten_step_design_order():
+    text = _rank_and_finalize_prompt_text()
+    assert "設計手順（この順序で考えること）" in text
+    assert "強いhookを選ぶ" in text
+    assert "自然に完結していて20〜50秒に収まっていれば" in text
+
+
+def test_rank_and_finalize_prompt_documents_recomposition_for_duration():
+    # Item 5/6/9: 50s-over designs must be recomposed in the same single
+    # call, never truncated at exactly 50s, with a clear deletion priority.
+    text = _rank_and_finalize_prompt_text()
+    assert "すぐにreject/50秒地点で機械的に切る、のどちらも禁止です" in text
+    assert "冗長な`context`" in text
+    assert "追加のAPI呼び出しを発生させません" in text
+
+
+def test_rank_and_finalize_prompt_documents_new_output_fields():
+    text = _rank_and_finalize_prompt_text()
+    assert "semantic_ending_complete" in text
+    assert "ending_rationale_code" in text
+    assert "recomposed_for_duration" in text
 
 
 def test_rank_and_finalize_prompt_documents_end_anchor_text():
@@ -1367,15 +1406,15 @@ def test_diagnose_local_filter_L_raises_clearly_without_cache():
         clip_selector.diagnose_local_filter(transcript)
 
 
-def test_candidate_schema_version_still_12():
-    # This round decouples Stage2Output.candidates' ceiling from
-    # NUM_CANDIDATES(3) to STAGE2_MAX_DESIGNS(6) (a real-machine incident
-    # showed Stage2 stopping at 2 designs when 3 were required, despite
-    # ample unused material) and updates rank_and_finalize.md to encourage
-    # using that headroom -- a genuine Structured Outputs schema change
-    # plus a prompt change on the Stage2 side, so the version was bumped
-    # once more (11->12); it must not drift further within this round.
-    assert config.CANDIDATE_SCHEMA_VERSION == 12
+def test_candidate_schema_version_still_13():
+    # Semantic-ending-design round: Stage2CandidateOutput gained three new
+    # required fields (semantic_ending_complete/ending_rationale_code/
+    # recomposed_for_duration) and rank_and_finalize.md's ending-design
+    # instructions changed materially -- a genuine Structured Outputs
+    # schema change plus a meaningfully-behavior-changing prompt change on
+    # the Stage2 side, so the version was bumped once more (12->13); it
+    # must not drift further within this round.
+    assert config.CANDIDATE_SCHEMA_VERSION == 13
 
 
 # --- repair-before-reject: real-machine incident (4/4 Stage1 candidates
@@ -3114,6 +3153,9 @@ def test_design_final_candidates_reassigns_reason_material_segment_to_hook_role(
                 segments=[Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=0)],
                 opening_hook_strength=85,
                 score=85,
+                semantic_ending_complete=True,
+                ending_rationale_code="natural_conclusion",
+                recomposed_for_duration=False,
             )
         ]
     )
@@ -3484,8 +3526,8 @@ def test_design_final_candidates_saves_raw_diagnostic_before_dedup(monkeypatch):
     same_segment = Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=2)
     output = Stage2Output(
         candidates=[
-            Stage2CandidateOutput(hook_type="story", segments=[same_segment], opening_hook_strength=85, score=85),
-            Stage2CandidateOutput(hook_type="story", segments=[same_segment], opening_hook_strength=85, score=85),
+            Stage2CandidateOutput(**{**_valid_stage2_candidate_kwargs(), "segments": [same_segment]}),
+            Stage2CandidateOutput(**{**_valid_stage2_candidate_kwargs(), "segments": [same_segment]}),
         ]
     )
     monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
@@ -3673,6 +3715,7 @@ def test_stage2_candidate_output_field_set_is_the_only_place_finished_properties
     # material schema deliberately has none of these.
     assert set(Stage2CandidateOutput.model_fields) == {
         "hook_type", "segments", "opening_hook_strength", "score",
+        "semantic_ending_complete", "ending_rationale_code", "recomposed_for_duration",
     }
     assert set(Stage2SegmentOutput.model_fields) == {
         "role", "start_segment_id", "end_segment_id", "start_anchor_text", "end_anchor_text",
@@ -3686,6 +3729,9 @@ def _valid_stage2_candidate_kwargs():
         "segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}],
         "opening_hook_strength": 80,
         "score": 80,
+        "semantic_ending_complete": True,
+        "ending_rationale_code": "natural_conclusion",
+        "recomposed_for_duration": False,
     }
 
 
@@ -3733,6 +3779,9 @@ def test_stage2_output_max_json_size_is_well_under_max_tokens():
         ],
         opening_hook_strength=95,
         score=92,
+        semantic_ending_complete=True,
+        ending_rationale_code="recomposed_for_duration",
+        recomposed_for_duration=True,
     )
     worst_case = Stage2Output(candidates=[candidate] * config.STAGE2_MAX_DESIGNS)
     text = worst_case.model_dump_json()
@@ -3943,6 +3992,9 @@ def test_design_final_candidates_converts_stage2_output_to_raw_candidates(monkey
                 ],
                 opening_hook_strength=85,
                 score=85,
+                semantic_ending_complete=True,
+                ending_rationale_code="natural_conclusion",
+                recomposed_for_duration=False,
             )
         ]
     )
@@ -3982,6 +4034,9 @@ def test_design_final_candidates_can_recombine_segments_across_materials(monkeyp
                 ],
                 opening_hook_strength=90,
                 score=90,
+                semantic_ending_complete=True,
+                ending_rationale_code="natural_conclusion",
+                recomposed_for_duration=False,
             )
         ]
     )
@@ -4013,6 +4068,9 @@ def test_design_final_candidates_carries_end_anchor_text_through(monkeypatch):
                 ],
                 opening_hook_strength=85,
                 score=85,
+                semantic_ending_complete=True,
+                ending_rationale_code="natural_conclusion",
+                recomposed_for_duration=False,
             )
         ]
     )
@@ -4053,14 +4111,204 @@ def test_design_final_candidates_deduplicates_exact_repeat_designs(monkeypatch):
     same_segment = Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=2)
     output = Stage2Output(
         candidates=[
-            Stage2CandidateOutput(hook_type="story", segments=[same_segment], opening_hook_strength=85, score=85),
-            Stage2CandidateOutput(hook_type="story", segments=[same_segment], opening_hook_strength=85, score=85),
+            Stage2CandidateOutput(**{**_valid_stage2_candidate_kwargs(), "segments": [same_segment]}),
+            Stage2CandidateOutput(**{**_valid_stage2_candidate_kwargs(), "segments": [same_segment]}),
         ]
     )
     monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
 
     designed = clip_selector.design_final_candidates(materials, transcript, "タイトル")
     assert len(designed) == 1
+
+
+# --- semantic-ending-design round: lookahead exposure + Stage2's own -----
+# --- ending-completeness self-report (real-machine incident: a candidate -
+# --- ended ~23s mid-explanation despite passing duration/hook/junction ---
+# --- checks -- Stage2 had no visibility past a material's own segments) --
+
+
+def test_material_lookahead_segments_returns_following_real_segments():
+    # A: the concrete fix for "Stage2 can't see past its own chosen
+    # segments" -- lookahead surfaces real transcript segments after the
+    # material's own last segment, as plain reference data.
+    transcript = _long_transcript(minutes=5)
+    material = _raw_material(0, 0)
+
+    lookahead = clip_selector._material_lookahead_segments(material, transcript)
+
+    assert len(lookahead) == config.STAGE2_LOOKAHEAD_MAX_SEGMENTS
+    assert [seg["segment_id"] for seg in lookahead] == [1, 2, 3, 4]
+    assert lookahead[0]["text"] == "segment 1"
+    assert lookahead[0]["start_sec"] == 20.0
+
+
+def test_material_lookahead_segments_bounded_by_segment_count(monkeypatch):
+    transcript = _long_transcript(minutes=5)
+    material = _raw_material(0, 0)
+    monkeypatch.setattr(config, "STAGE2_LOOKAHEAD_MAX_SEGMENTS", 2)
+
+    lookahead = clip_selector._material_lookahead_segments(material, transcript)
+
+    assert len(lookahead) == 2
+
+
+def test_material_lookahead_segments_bounded_by_cumulative_seconds(monkeypatch):
+    # Each _long_transcript segment is 2.0s long; capping the seconds
+    # budget below one full segment's duration must still not return zero
+    # segments outright once at least one has been included -- the cap
+    # only stops adding *further* segments once the budget is exceeded.
+    transcript = _long_transcript(minutes=5)
+    material = _raw_material(0, 0)
+    monkeypatch.setattr(config, "STAGE2_LOOKAHEAD_MAX_SEC", 3.0)
+
+    lookahead = clip_selector._material_lookahead_segments(material, transcript)
+
+    assert len(lookahead) == 2  # first segment (2.0s) included, then cumulative >= 3.0s stops it
+
+
+def test_material_lookahead_segments_always_includes_at_least_one_when_available():
+    # Even a single very long following segment (alone exceeding the
+    # seconds budget) must not leave Stage2 with an empty, uninformative
+    # lookahead just because the very next segment happens to be long.
+    transcript = _long_transcript(minutes=5)
+    transcript.segments[1] = TranscriptSegment(
+        id=1, start=20.0, end=20.0 + config.STAGE2_LOOKAHEAD_MAX_SEC + 10.0, text="very long segment",
+        words=[TranscriptWord(start=20.0, end=20.0 + config.STAGE2_LOOKAHEAD_MAX_SEC + 10.0, text="very long segment")],
+    )
+    material = _raw_material(0, 0)
+
+    lookahead = clip_selector._material_lookahead_segments(material, transcript)
+
+    assert len(lookahead) == 1
+    assert lookahead[0]["segment_id"] == 1
+
+
+def test_material_lookahead_segments_empty_at_end_of_transcript():
+    transcript = _long_transcript(minutes=5)
+    last_id = transcript.segments[-1].id
+    material = _raw_material(last_id, last_id)
+
+    assert clip_selector._material_lookahead_segments(material, transcript) == []
+
+
+def test_stage2_material_summary_includes_lookahead_key():
+    transcript = _long_transcript(minutes=5)
+    material = _raw_material(0, 0)
+
+    summary = clip_selector._stage2_material_summary("s1_m000", material, transcript)
+
+    assert "lookahead" in summary
+    assert summary["lookahead"][0]["segment_id"] == 1
+
+
+def test_design_final_candidates_stage2_can_reference_lookahead_segment_as_final(monkeypatch):
+    # H (plumbing half): Stage2 is free to reference a lookahead segment_id
+    # as part of its own designed final candidate -- referential integrity
+    # is judged the same way regardless of whether an id came from a
+    # material's own segments or its lookahead, since segment_ids are
+    # transcript-global. This doesn't (and can't, without a real API call)
+    # test that Stage2 *chooses well* -- only that the plumbing lets it
+    # extend into lookahead content when it does choose to.
+    transcript = _long_transcript(minutes=5)
+    materials = {"s1_m000": _raw_material(0, 0)}
+    output = Stage2Output(
+        candidates=[
+            Stage2CandidateOutput(
+                **{
+                    **_valid_stage2_candidate_kwargs(),
+                    "segments": [
+                        Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=0),
+                        Stage2SegmentOutput(role="answer", start_segment_id=1, end_segment_id=1),
+                    ],
+                }
+            )
+        ]
+    )
+    monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
+
+    designed = clip_selector.design_final_candidates(materials, transcript, "タイトル")
+
+    assert [s.start_segment_id for s in designed[0].segments] == [0, 1]
+
+
+def test_design_final_candidates_saves_materials_lookahead_to_diagnostic(monkeypatch):
+    # Item 12: materials_lookahead must land in stage2_diagnostic.json so a
+    # future mid-cutoff incident is debuggable -- what lookahead Stage2 had
+    # available, not just what it ultimately chose.
+    transcript = _long_transcript(minutes=5)
+    materials = {"s1_m000": _raw_material(0, 0)}
+    output = Stage2Output(candidates=[Stage2CandidateOutput(**_valid_stage2_candidate_kwargs())])
+    monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
+
+    clip_selector.design_final_candidates(materials, transcript, "タイトル")
+
+    diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
+    assert "materials_lookahead" in diagnostic
+    assert diagnostic["materials_lookahead"]["s1_m000"][0]["segment_id"] == 1
+
+
+def test_design_finalize_and_cache_preserves_materials_lookahead_after_second_save(monkeypatch):
+    # The second diagnostic save (inside _design_finalize_and_cache, with
+    # per-candidate evaluations attached) must not silently drop the
+    # materials_lookahead the first save already wrote -- cache.
+    # save_stage2_diagnostic merges it in when not re-passed.
+    transcript = _long_transcript(minutes=5)
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    monkeypatch.setattr(config, "MIN_OPENING_HOOK_STRENGTH", 0)
+    materials = [_raw_material(0, 0)]
+    output = Stage2Output(candidates=[Stage2CandidateOutput(**_valid_stage2_candidate_kwargs())])
+    monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
+
+    clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+
+    diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
+    assert "materials_lookahead" in diagnostic
+    assert "evaluations" in diagnostic
+    assert diagnostic["materials_lookahead"]["s1_m000"][0]["segment_id"] == 1
+
+
+def test_stage2_diagnostic_evaluation_includes_ending_design_fields(monkeypatch):
+    # Item 12/13: the per-candidate diagnostic must expose Stage2's own
+    # ending-point decision and rationale, not just accept/reject.
+    transcript = _long_transcript(minutes=5)
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    monkeypatch.setattr(config, "MIN_OPENING_HOOK_STRENGTH", 0)
+    materials = [_raw_material(0, 0)]
+    output = Stage2Output(
+        candidates=[
+            Stage2CandidateOutput(
+                **{
+                    **_valid_stage2_candidate_kwargs(),
+                    "ending_rationale_code": "hook_resolved",
+                    "recomposed_for_duration": True,
+                }
+            )
+        ]
+    )
+    monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
+
+    clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+
+    diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
+    evaluation = diagnostic["evaluations"][0]
+    assert evaluation["ending_rationale_code"] == "hook_resolved"
+    assert evaluation["recomposed_for_duration"] is True
+    assert evaluation["semantic_ending_complete"] is True
+    assert "selected_end_segment_id" in evaluation
+
+
+def test_raw_clip_candidate_defaults_semantic_ending_fields():
+    # Every pre-existing direct RawClipCandidate(...) construction across
+    # the test suite (hundreds of call sites) must keep working unchanged
+    # -- these three fields are defaulted, never required, on the internal
+    # dataclass (only Stage2CandidateOutput, the Claude-facing schema,
+    # requires them).
+    raw = _raw_candidate(0, 0)
+    assert raw.semantic_ending_complete is True
+    assert raw.ending_rationale_code == "natural_conclusion"
+    assert raw.recomposed_for_duration is False
 
 
 # --- Stage2 semantic closure hard gate (real-machine incident: a --------
@@ -4087,6 +4335,9 @@ def test_design_final_candidates_supports_omitting_a_closure_failing_design(monk
                 segments=[Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=2)],
                 opening_hook_strength=85,
                 score=85,
+                semantic_ending_complete=True,
+                ending_rationale_code="natural_conclusion",
+                recomposed_for_duration=False,
             )
         ]
     )

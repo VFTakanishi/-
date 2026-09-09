@@ -28,6 +28,17 @@ SegmentRole = Literal["hook", "context", "answer", "payoff"]
 # for "is this hook material or not" (see prompts/extract_candidates.md).
 MaterialType = Literal["hook", "reason", "example", "context", "payoff"]
 
+# Stage2's self-reported code for *why* it judges its chosen ending point to
+# be a natural, semantically complete stopping point (see RawClipCandidate
+# below and prompts/rank_and_finalize.md's ending-design section). This is a
+# small closed vocabulary, not free-text reasoning, so Structured Output
+# stays small -- it exists for stage2_diagnostic.json debuggability, not as
+# something Python branches on to decide accept/reject (that stays governed
+# by the existing deterministic gates in clip_selector.evaluate_local_candidate).
+EndingRationaleCode = Literal[
+    "natural_conclusion", "hook_resolved", "padding_excluded", "recomposed_for_duration"
+]
+
 _MAX_VALUE_REPR_LEN = 200
 
 
@@ -745,6 +756,15 @@ class RawClipCandidate:
     score: int
     reasoning: str
     caveats: str
+    # Semantic-ending-design fields (see prompts/rank_and_finalize.md's
+    # ending-design section). Defaulted so every pre-existing call site that
+    # constructs a RawClipCandidate directly (hundreds of fixtures/tests)
+    # keeps working unchanged; the Claude-facing Stage2CandidateOutput schema
+    # makes the equivalent fields required so Stage2 always commits to real
+    # values for freshly-designed candidates.
+    semantic_ending_complete: bool = True
+    ending_rationale_code: EndingRationaleCode = "natural_conclusion"
+    recomposed_for_duration: bool = False
 
     def __post_init__(self) -> None:
         if not (1 <= len(self.segments) <= 3):

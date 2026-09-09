@@ -424,6 +424,19 @@ def utterance_completeness_qa(
     mid-utterance after extension (e.g. still ends in "〜ので" with no
     viable further segment) fails here too -- a pause alone is never
     treated as completeness, matching clip_selector's own rule.
+
+    Honest scope note (semantic-ending redesign): because it deliberately
+    reuses the exact same mechanical logic as the primary fix rather than
+    an independently-implemented check, this can only ever catch what that
+    logic itself would catch -- an obvious, punctuation/gap-level dangling
+    ending. It is NOT an independent semantic judge of whether the
+    underlying explanation is actually finished; that judgment belongs to
+    Stage2 (see RawClipCandidate.semantic_ending_complete, informed by the
+    lookahead it's shown at design time). No additional Claude call is
+    made here to build a genuinely independent check -- this QA step's
+    real job is only "did an obviously-incomplete cut somehow reach
+    render() through a path that skipped the primary correction," not
+    "is this ending truly complete."
     """
     extended = clip_selector.extend_to_natural_ending(raw_candidate, transcript)
     still_extends = extended.segments[-1].end_segment_id != raw_candidate.segments[-1].end_segment_id
