@@ -28,6 +28,16 @@ SegmentRole = Literal["hook", "context", "answer", "payoff"]
 # for "is this hook material or not" (see prompts/extract_candidates.md).
 MaterialType = Literal["hook", "reason", "example", "context", "payoff"]
 
+# The hook-seed-discovery redesign's tag for *why* a standalone utterance is
+# an attention peak worth trying as a Shorts hook (see RawHookSeed below).
+# Deliberately a closed, small vocabulary (no free-text reasoning) so
+# Stage1's per-item cost stays low even with a higher item count than the
+# old single hook/reason/example/context/payoff list.
+SignalType = Literal[
+    "money_or_number", "failure_or_loss", "surprising_fact", "strong_claim",
+    "comparison", "direct_question", "strong_conclusion", "story_turn", "other",
+]
+
 # Stage2's self-reported code for *why* it judges its chosen ending point to
 # be a natural, semantically complete stopping point (see RawClipCandidate
 # below and prompts/rank_and_finalize.md's ending-design section). This is a
@@ -494,6 +504,54 @@ def find_speech_restart_marker(words: list[TranscriptWord]) -> str | None:
     return None
 
 
+# A hesitation filler standing alone as its own clause is short by nature
+# ("えっと、", "あの、", "その、", "まあ、") -- this just needs to be generous
+# enough that a genuine filler-only clause never exceeds it, not tuned to
+# any specific filler word (none are hardcoded below).
+_FILLER_CLAUSE_MAX_CHARS = 8
+_MIN_SANDWICHED_REPETITION_PHRASE_LEN = 2
+
+
+def find_filler_sandwiched_repetition(words: list[TranscriptWord]) -> str | None:
+    """Detects: a content clause, then a short filler-only clause, then a
+    clause that restates a long-enough content-bearing phrase from the
+    first -- e.g. "ミッション、えっと、ポルシェのミッション" (a noun repeated
+    verbatim right after a bare hesitation filler, with no reformulation
+    connective like "というか" anywhere). This is the gap has_speech_
+    disfluency and find_speech_restart_marker both leave uncovered: the
+    former only looks for a hesitation filler adjacent to a reformulation
+    connective (absent here), and the latter only fires when the first
+    clause dangles on a bare grammatical particle (a plain noun+comma like
+    "ミッション、" doesn't).
+
+    Generalizes structurally, not lexically: the middle clause is judged
+    purely by shape (short + _is_content_bearing false, i.e. it reads as
+    pure-hiragana connective tissue rather than a real word -- the same
+    generalization find_speech_restart_marker already relies on), and no
+    specific filler word or noun phrase is ever hardcoded. `words` may span
+    multiple consecutive original transcript segments, same as
+    find_speech_restart_marker.
+
+    Returns the shared phrase (for diagnostics) or None.
+    """
+    if not words:
+        return None
+    clauses = _split_words_into_clauses(words)
+    for i in range(len(clauses) - 2):
+        _, _, text_a = clauses[i]
+        _, _, text_mid = clauses[i + 1]
+        _, _, text_c = clauses[i + 2]
+        mid_core = text_mid.rstrip("、，,")
+        if not mid_core or len(mid_core) > _FILLER_CLAUSE_MAX_CHARS or _is_content_bearing(mid_core):
+            continue
+        core_a = text_a.rstrip("、，,")
+        core_c = text_c.rstrip("、，,")
+        shared = _longest_common_substring(core_a, core_c)
+        if len(shared) >= _MIN_SANDWICHED_REPETITION_PHRASE_LEN and _is_content_bearing(shared):
+            return shared
+    return None
+
+
 def find_anchor_start_word(segment: TranscriptSegment, anchor_text: str) -> TranscriptWord | None:
     """Locates an AI-chosen start_anchor_text (e.g. "86は" within a segment
     whose full text is "これも私の愛車である86はスープラを...") as an exact,
@@ -765,6 +823,14 @@ class RawClipCandidate:
     semantic_ending_complete: bool = True
     ending_rationale_code: EndingRationaleCode = "natural_conclusion"
     recomposed_for_duration: bool = False
+    # Hook-seed-discovery redesign: Stage2's own explicit semantic judgments,
+    # hard-gated in clip_selector.evaluate_local_candidate (see
+    # prompts/rank_and_finalize.md's opening_self_contained/
+    # hook_claim_resolved sections). Defaulted True for the same reason as
+    # the ending-design fields above -- existing direct construction call
+    # sites that don't care about these fields keep working unchanged.
+    opening_self_contained: bool = True
+    hook_claim_resolved: bool = True
 
     def __post_init__(self) -> None:
         if not (1 <= len(self.segments) <= 3):
@@ -821,6 +887,79 @@ class RawMaterial:
             raise ValueError(
                 f"usefulness_score must be within 0-100 (got {self.usefulness_score})"
             )
+
+
+@dataclass
+class RawHookSeed:
+    """Stage1's discovery-priority output: one standalone, attention-
+    grabbing utterance ("this is worth building a Shorts around"), tagged
+    with why (signal_type) and a soft, non-gating self-estimate
+    (soft_score). Deliberately reuses RawMaterialSegment (identical shape:
+    start/end segment id + optional start_anchor_text) rather than
+    inventing a fourth near-duplicate segment type -- a hook seed has no
+    text/reasoning field either, matching RawMaterial's own minimalism, so
+    Python resolves its real text from the transcript via segment ids.
+
+    Unlike RawMaterial's material_type="hook" (retired from Stage1's own
+    output in this redesign -- see prompts/extract_candidates.md), no hard
+    threshold is ever applied to soft_score at the Stage1 layer: Stage1's
+    role here is pure recall (cast a wide net of every attention peak,
+    strong or weak), and Python's coverage-target selection
+    (clip_selector._select_hook_seed_coverage_targets) only deduplicates
+    overlapping seeds -- it never discards a seed merely for scoring low.
+    """
+
+    signal_type: SignalType
+    segments: list[RawMaterialSegment]
+    soft_score: int = 0
+
+    def __post_init__(self) -> None:
+        if not (1 <= len(self.segments) <= 2):
+            raise ValueError(
+                f"segments must contain 1-2 entries (got {len(self.segments)})"
+            )
+        if not (0 <= self.soft_score <= 100):
+            raise ValueError(f"soft_score must be within 0-100 (got {self.soft_score})")
+
+
+@dataclass
+class RawFallbackSpan:
+    """Stage1's zero-output safety net: an already-coherent, already
+    self-contained, disfluency-free span that isn't necessarily a strong
+    hook, but is confidently editable to a 20-50s Shorts (see
+    prompts/extract_candidates.md's fallback_span section). Used only when
+    too few primary (hook-seed-driven) attempts survive the local hard gate
+    -- never a primary source, never inflated to pad a target count (see
+    config.STAGE1_MAX_FALLBACK_SPANS_PER_CHUNK's docstring). Reuses
+    RawMaterialSegment for the same reason RawHookSeed does.
+    """
+
+    segments: list[RawMaterialSegment]
+    safety_score: int = 51
+
+    def __post_init__(self) -> None:
+        if not (1 <= len(self.segments) <= 3):
+            raise ValueError(
+                f"segments must contain 1-3 entries (got {len(self.segments)})"
+            )
+        if not (0 <= self.safety_score <= 100):
+            raise ValueError(f"safety_score must be within 0-100 (got {self.safety_score})")
+
+
+@dataclass
+class Stage1ChunkResult:
+    """One chunk's Stage1 output, split into the three discovery-first
+    groups (hook-seed-discovery redesign) -- see prompts/extract_
+    candidates.md. hook_seeds/support_materials/fallback_spans are cached
+    and aggregated across chunks identically (see clip_selector.run_
+    stage1/cache.save_stage1_chunk), just as the single "materials" list
+    used to be. Lives in models.py (not clip_selector.py) so cache.py can
+    reference it without a circular import.
+    """
+
+    hook_seeds: list[RawHookSeed]
+    support_materials: list[RawMaterial]
+    fallback_spans: list[RawFallbackSpan]
 
 
 @dataclass

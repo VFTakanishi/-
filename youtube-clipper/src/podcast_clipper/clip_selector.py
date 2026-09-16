@@ -56,14 +56,17 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import boundary, cache, config, models, structured_output
 from .models import (
     RawClipCandidate,
+    RawFallbackSpan,
+    RawHookSeed,
     RawMaterial,
     RawMaterialSegment,
     RawUsedSegment,
+    Stage1ChunkResult,
     Transcript,
     TranscriptSegment,
 )
@@ -86,49 +89,106 @@ class Stage1MaterialSegmentOutput(BaseModel):
     # Optional: a short substring that exists verbatim, contiguously, at a
     # real word boundary near the start of the start_segment_id transcript
     # segment (e.g. "86は" within "これも私の愛車である86はスープラを...").
-    # Lets a material start mid-segment at a natural phrase boundary
-    # instead of always using the segment's literal first word. Never
-    # AI-authored replacement text -- boundary.py verifies it against the
-    # real transcript (models.find_anchor_start_word) and falls back to no
-    # trim if it doesn't match exactly. Length-bounded since it's meant to
-    # be a short phrase/clause, not a rewritten sentence.
-    # No `role` field: a material is single-purpose (see material_type on
-    # Stage1MaterialOutput below), not a structural position within a
-    # finished candidate -- that's only decided when Stage2 designs one.
+    # Lets a material/hook_seed/fallback_span start mid-segment at a
+    # natural phrase boundary instead of always using the segment's
+    # literal first word. Never AI-authored replacement text -- boundary.py
+    # verifies it against the real transcript (models.find_anchor_start_
+    # word) and falls back to no trim if it doesn't match exactly.
+    # Length-bounded since it's meant to be a short phrase/clause, not a
+    # rewritten sentence. No `role` field: none of Stage1's three output
+    # groups have a structural position within a finished candidate --
+    # that's only decided when Stage2 designs one. Reused as-is across all
+    # three of Stage1's output groups (hook_seeds/support_materials/
+    # fallback_spans) rather than three near-duplicate segment schemas.
     start_anchor_text: str | None = Field(default=None, min_length=1, max_length=60)
 
 
-class Stage1MaterialOutput(BaseModel):
+class Stage1HookSeedOutput(BaseModel):
+    """One standalone, attention-grabbing utterance Stage1 discovered --
+    "this is worth building a Shorts around" -- tagged with why
+    (signal_type) and a soft, non-gating self-estimate (soft_score).
+    Deliberately no text/reasoning field: Python resolves the real text
+    from the transcript via segment_id, keeping this schema (and Stage1's
+    per-item output-token cost) small despite covering more items than the
+    old single hook/reason/example/context/payoff list did.
+
+    Recall-priority by design (hook-seed-discovery redesign): unlike the
+    old material_type="hook" material, NO hard threshold is ever applied
+    to soft_score here -- Stage1's job is to surface every attention peak,
+    strong or weak, so a genuinely strong signal (e.g. a specific loss
+    amount) is never silently passed over merely because a weaker,
+    already-extracted signal about the same general topic exists nearby
+    (the real-machine incident this redesign fixes: a weak, context-
+    dependent opening was extracted and used, while a much stronger,
+    self-contained utterance elsewhere in the same material was never
+    even tried as a hook).
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    material_type: Literal["hook", "reason", "example", "context", "payoff"]
+    signal_type: Literal[
+        "money_or_number", "failure_or_loss", "surprising_fact", "strong_claim",
+        "comparison", "direct_question", "strong_conclusion", "story_turn", "other",
+    ]
+    segments: list[Stage1MaterialSegmentOutput] = Field(min_length=1, max_length=2)
+    soft_score: int = Field(ge=0, le=100)
+
+
+class Stage1SupportMaterialOutput(BaseModel):
+    """Support material for building a finished candidate around a hook
+    seed -- equivalent to the old Stage1MaterialOutput, with "hook" removed
+    from material_type (discovering hooks is now hook_seeds' job)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    material_type: Literal["reason", "example", "context", "payoff"]
     segments: list[Stage1MaterialSegmentOutput] = Field(min_length=1, max_length=3)
     # A single, generic usefulness rating -- never a hook-strength or
-    # overall-candidate score. Only material_type="hook" material is
-    # expected to be judged by hook-opening standards (see prompts/
-    # extract_candidates.md); reason/example/context/payoff material is
-    # rated on how useful/clear/self-contained it is for its own purpose.
+    # overall-candidate score. Rated on how useful/clear/self-contained
+    # this material is for its own purpose (see prompts/extract_
+    # candidates.md's support_material section).
     usefulness_score: int = Field(ge=0, le=100)
+
+
+class Stage1FallbackSpanOutput(BaseModel):
+    """Stage1's zero-output safety net: an already-coherent, already
+    self-contained, disfluency-free span Stage1 judges confidently
+    editable to a 20-50s Shorts, even though it isn't necessarily a strong
+    hook. Used only when too few primary (hook-seed-driven) attempts
+    survive the local hard gate -- see config.STAGE1_MAX_FALLBACK_SPANS_
+    PER_CHUNK's docstring for why this is deliberately capped small
+    (never a padding vector)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    segments: list[Stage1MaterialSegmentOutput] = Field(min_length=1, max_length=3)
+    safety_score: int = Field(ge=0, le=100)  # prompt instructs: never output below 51
 
 
 class Stage1Output(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    materials: list[Stage1MaterialOutput] = Field(
-        min_length=0, max_length=config.STAGE1_MAX_CANDIDATES_PER_CHUNK
+    hook_seeds: list[Stage1HookSeedOutput] = Field(
+        min_length=0, max_length=config.STAGE1_MAX_HOOK_SEEDS_PER_CHUNK
+    )
+    support_materials: list[Stage1SupportMaterialOutput] = Field(
+        min_length=0, max_length=config.STAGE1_MAX_SUPPORT_MATERIALS_PER_CHUNK
+    )
+    fallback_spans: list[Stage1FallbackSpanOutput] = Field(
+        min_length=0, max_length=config.STAGE1_MAX_FALLBACK_SPANS_PER_CHUNK
     )
 
 
 class Stage2SegmentOutput(BaseModel):
     """A segment within one of Stage2's finished candidate designs. Unlike
-    Stage1MaterialSegmentOutput (which has no `role`, since a material is
-    single-purpose), this has both `role` -- Stage2 is the only place a
-    segment's structural position within a finished candidate is ever
-    decided -- and `end_anchor_text`, a genuinely new capability versus
-    Stage1: Stage2 designs the final candidate, so it needs the same
-    word-boundary-verified control over where a segment *ends* that
-    start_anchor_text already gives it over where it *starts*. Both
-    anchors are verified the identical way at resolve time
+    Stage1MaterialSegmentOutput (which has no `role`, since Stage1's three
+    output groups are all single-purpose), this has both `role` -- Stage2
+    is the only place a segment's structural position within a finished
+    candidate is ever decided -- and `end_anchor_text`, a genuinely new
+    capability versus Stage1: Stage2 designs the final candidate, so it
+    needs the same word-boundary-verified control over where a segment
+    *ends* that start_anchor_text already gives it over where it *starts*.
+    Both anchors are verified the identical way at resolve time
     (models.find_anchor_start_word / find_anchor_end_word) and silently
     fall back to "no trim" if they don't match real transcript text
     exactly -- never AI-authored replacement text.
@@ -146,24 +206,25 @@ class Stage2SegmentOutput(BaseModel):
 class Stage2CandidateOutput(BaseModel):
     """A finished candidate design: hook_type/opening_hook_strength/score
     all describe this specific design, self-scored by Stage2 for whatever
-    it actually constructed -- never copied forward from a source
-    material, since a material has no such properties (RawMaterial has no
-    hook_type/opening_hook_strength/score at all) and a recombined
-    candidate's real opening/overall quality can differ from any single
-    material it drew from.
+    it actually constructed -- never copied forward from any source
+    material/hook_seed/fallback_span, none of which have such properties.
+    opening_hook_strength/score are SOFT/diagnostic only (hook-seed-
+    discovery redesign) -- they feed Stage2's own relative `ranking`
+    (Stage2Output below), never a Python accept/reject decision; see
+    config.py's retired MIN_OPENING_HOOK_STRENGTH for why a pure
+    self-reported number was dropped as a hard gate.
 
     semantic_ending_complete/ending_rationale_code/recomposed_for_duration
     make Stage2's ending-point judgment an explicit, required part of its
-    output (see prompts/rank_and_finalize.md's ending-design section) --
-    Stage2 must commit to a real value for each, not leave ending
-    completeness as something only Python's mechanical safety net (gap
-    size, terminal punctuation) infers after the fact. These are a small
-    closed vocabulary / booleans, not free-text reasoning, so Structured
-    Output stays small; they flow into stage2_diagnostic.json for
-    debuggability but are never the sole gate Python relies on to accept a
-    candidate -- the existing deterministic checks in
-    evaluate_local_candidate are unchanged and still run regardless of what
-    Stage2 self-reports here.
+    output (see prompts/rank_and_finalize.md's ending-design section).
+    opening_self_contained/hook_claim_resolved are the hook-seed-discovery
+    redesign's equivalent for the opening/semantic-closure judgments --
+    all six of these are small closed vocabulary/booleans, not free-text
+    reasoning, so Structured Output stays small; they flow into stage2_
+    diagnostic.json for debuggability, and (unlike opening_hook_strength/
+    score) ARE now hard-gated in clip_selector.evaluate_local_candidate --
+    Stage2 must commit to a real value for each, not leave these judgments
+    to be inferred after the fact by a Python mechanical backstop alone.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -172,6 +233,8 @@ class Stage2CandidateOutput(BaseModel):
     segments: list[Stage2SegmentOutput] = Field(min_length=1, max_length=3)
     opening_hook_strength: int = Field(ge=0, le=100)
     score: int = Field(ge=0, le=100)
+    opening_self_contained: bool
+    hook_claim_resolved: bool
     semantic_ending_complete: bool
     ending_rationale_code: Literal[
         "natural_conclusion", "hook_resolved", "padding_excluded", "recomposed_for_duration"
@@ -179,28 +242,90 @@ class Stage2CandidateOutput(BaseModel):
     recomposed_for_duration: bool
 
 
-class Stage2Output(BaseModel):
-    """Replaces the old ranking-only Stage2RankingOutput. min_length=0 lets
-    Stage2 return fewer than config.NUM_CANDIDATES designs when it can't
-    construct that many that satisfy semantic closure -- the caller must
-    never pad this back up (see _design_finalize_and_cache).
+Stage2AttemptRejectReasonCode = Literal[
+    "insufficient_context_available",
+    "unnatural_junction_only",
+    "duration_infeasible",
+    "disfluency_unavoidable",
+    "semantic_closure_unavailable",
+    "duplicate_of_stronger_attempt",
+]
 
-    max_length is config.STAGE2_MAX_DESIGNS, deliberately NOT config.
-    NUM_CANDIDATES -- a real-machine incident showed Stage2 designing only
-    2 candidates (both later passing local validation) when 3 were
-    required, despite Stage1 having supplied plenty of still-unused
-    material: capping Stage2's own output at exactly NUM_CANDIDATES gave
-    it no room to over-produce so the (unchanged) local validation gate
-    could pick the best NUM_CANDIDATES from a larger, pre-validation pool.
-    _design_finalize_and_cache still requires NUM_CANDIDATES to actually
-    pass local validation for the run to succeed -- this only widens how
-    many designs Stage2 may attempt before that gate runs, it never lowers
-    the bar a design must clear.
+
+class Stage2AttemptOutput(BaseModel):
+    """Stage2's mandatory response to ONE coverage-target hook seed
+    (hook-seed-discovery redesign): either a real finished candidate built
+    from it (status="candidate"), or an explicit, reasoned refusal
+    (status="rejected") -- silently omitting a coverage target from
+    `attempts` entirely is what this schema exists to make impossible (see
+    design_final_candidates/_design_finalize_and_cache's coverage-
+    completeness check). The real-machine incident this fixes: a strong,
+    self-contained hook seed (a specific loss amount) existed in the
+    source material but was never even attempted, because nothing forced
+    Stage2 to account for every seed it was shown.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    candidates: list[Stage2CandidateOutput] = Field(min_length=0, max_length=config.STAGE2_MAX_DESIGNS)
+    hook_seed_id: str = Field(min_length=1, max_length=32)
+    status: Literal["candidate", "rejected"]
+    candidate: Stage2CandidateOutput | None = None
+    reject_reason_code: Stage2AttemptRejectReasonCode | None = None
+
+    @model_validator(mode="after")
+    def _status_matches_payload(self) -> "Stage2AttemptOutput":
+        if self.status == "candidate" and (self.candidate is None or self.reject_reason_code is not None):
+            raise ValueError("status=candidate requires candidate set and reject_reason_code unset")
+        if self.status == "rejected" and (self.candidate is not None or self.reject_reason_code is None):
+            raise ValueError("status=rejected requires reject_reason_code set and candidate unset")
+        return self
+
+
+class Stage2FallbackCandidateOutput(BaseModel):
+    """A candidate built primarily from a fallback_span (see
+    Stage1FallbackSpanOutput), used only when too few primary attempts
+    pass the local hard gate. Held to the exact same Stage2CandidateOutput
+    shape and the exact same hard gates as a primary attempt's candidate
+    -- see prompts/rank_and_finalize.md's explicit "don't lower the bar
+    for fallback" instruction. `fallback_id` is a short id Stage2 assigns
+    itself (e.g. "fb1"), distinct from hook_seed_id's namespace.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    fallback_id: str = Field(min_length=1, max_length=16)
+    candidate: Stage2CandidateOutput
+
+
+class Stage2Output(BaseModel):
+    """Replaces the old free-form "design up to N candidates from pooled
+    material" Stage2Output. `attempts` covers every coverage-target hook
+    seed Python selected (see _select_hook_seed_coverage_targets) --
+    max_length is config.STAGE2_MAX_COVERAGE_TARGETS, matching the number
+    of targets Python will ever send. `fallback_candidates` is a separate,
+    small, capped list (config.STAGE2_MAX_FALLBACK_CANDIDATES ==
+    config.NUM_CANDIDATES -- never more could ever be used, see that
+    constant's docstring) that exists purely to guarantee a non-empty
+    result when too few primary attempts survive the local hard gate.
+    `ranking` is Stage2's own explicit relative-quality ordering across
+    every candidate it actually built (both attempt-produced and
+    fallback), referenced by hook_seed_id or fallback_id -- Python no
+    longer infers "strongest first" from raw list order (see
+    _select_final_candidates).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempts: list[Stage2AttemptOutput] = Field(
+        min_length=0, max_length=config.STAGE2_MAX_COVERAGE_TARGETS
+    )
+    fallback_candidates: list[Stage2FallbackCandidateOutput] = Field(
+        min_length=0, max_length=config.STAGE2_MAX_FALLBACK_CANDIDATES
+    )
+    ranking: list[str] = Field(
+        min_length=0,
+        max_length=config.STAGE2_MAX_COVERAGE_TARGETS + config.STAGE2_MAX_FALLBACK_CANDIDATES,
+    )
 
 
 # Weak "warm-up" openings explicitly called out as unacceptable: a mechanical
@@ -294,6 +419,37 @@ def _candidate_speech_restart_marker(
     return None
 
 
+def _segment_has_filler_sandwiched_repetition(raw_used: RawUsedSegment, transcript: Transcript) -> str | None:
+    """Concatenates the real word list of every original transcript
+    segment in raw_used's range (not just the resolved/trimmed text) and
+    checks it for a filler-sandwiched repetition (models.find_filler_
+    sandwiched_repetition) -- same cross-original-segment-boundary
+    approach as _segment_has_speech_restart, for the same reason.
+    """
+    start_idx = transcript.segment_index(raw_used.start_segment_id)
+    end_idx = transcript.segment_index(raw_used.end_segment_id)
+    words = [w for i in range(start_idx, end_idx + 1) for w in transcript.segments[i].words]
+    return models.find_filler_sandwiched_repetition(words)
+
+
+def _candidate_filler_sandwiched_repetition_marker(
+    raw: RawClipCandidate, transcript: Transcript
+) -> tuple[str, str] | None:
+    """Checks every segment of the candidate (hook included, same rationale
+    as _candidate_speech_restart_marker) for a filler-sandwiched repetition
+    -- e.g. "ミッション、えっと、ポルシェのミッション" (a real-machine
+    incident: neither has_speech_disfluency nor find_speech_restart_marker
+    caught this shape -- see models.find_filler_sandwiched_repetition's
+    docstring for exactly why). Returns (segment_role, shared_phrase) for
+    the first one found, or None if none of them have one.
+    """
+    for raw_used in raw.segments:
+        marker = _segment_has_filler_sandwiched_repetition(raw_used, transcript)
+        if marker is not None:
+            return (raw_used.role, marker)
+    return None
+
+
 def _force_first_segment_is_hook(raw: RawClipCandidate) -> None:
     """The first segment of a candidate must be tagged role=hook (this is a
     labeling/consistency requirement, not a semantic judgement -- whatever
@@ -336,25 +492,45 @@ def _deterministic_hook_text(
     return text
 
 
-def _raw_material_from_stage1_output(m: Stage1MaterialOutput) -> RawMaterial:
+def _raw_material_segments_from_stage1_output(
+    segments: list[Stage1MaterialSegmentOutput],
+) -> list[RawMaterialSegment]:
+    return [
+        RawMaterialSegment(
+            start_segment_id=s.start_segment_id,
+            end_segment_id=s.end_segment_id,
+            start_anchor_text=s.start_anchor_text,
+        )
+        for s in segments
+    ]
+
+
+def _raw_hook_seed_from_stage1_output(s: Stage1HookSeedOutput) -> RawHookSeed:
+    return RawHookSeed(
+        signal_type=s.signal_type,
+        segments=_raw_material_segments_from_stage1_output(s.segments),
+        soft_score=s.soft_score,
+    )
+
+
+def _raw_support_material_from_stage1_output(m: Stage1SupportMaterialOutput) -> RawMaterial:
     """Converts Claude's minimal Stage1 output into the internal RawMaterial
     pipeline dataclass. No chunk_segments/hook_text needed here, unlike the
     old candidate conversion -- a material has no hook_text (that's a
     finished-candidate display concept only Stage2's conversion computes,
     see _raw_candidate_from_stage2_output/_deterministic_hook_text below).
     """
-    segments = [
-        RawMaterialSegment(
-            start_segment_id=s.start_segment_id,
-            end_segment_id=s.end_segment_id,
-            start_anchor_text=s.start_anchor_text,
-        )
-        for s in m.segments
-    ]
     return RawMaterial(
         material_type=m.material_type,
-        segments=segments,
+        segments=_raw_material_segments_from_stage1_output(m.segments),
         usefulness_score=m.usefulness_score,
+    )
+
+
+def _raw_fallback_span_from_stage1_output(f: Stage1FallbackSpanOutput) -> RawFallbackSpan:
+    return RawFallbackSpan(
+        segments=_raw_material_segments_from_stage1_output(f.segments),
+        safety_score=f.safety_score,
     )
 
 
@@ -393,6 +569,8 @@ def _raw_candidate_from_stage2_output(
         score=c.score,
         reasoning="",
         caveats="",
+        opening_self_contained=c.opening_self_contained,
+        hook_claim_resolved=c.hook_claim_resolved,
         semantic_ending_complete=c.semantic_ending_complete,
         ending_rationale_code=c.ending_rationale_code,
         recomposed_for_duration=c.recomposed_for_duration,
@@ -434,7 +612,7 @@ def _build_chunks(
 
 def extract_candidates_for_chunk(
     chunk_segments: list[TranscriptSegment], video_title: str
-) -> list[RawMaterial]:
+) -> Stage1ChunkResult:
     system_prompt = (_PROMPTS_DIR / "extract_candidates.md").read_text(encoding="utf-8")
     user_content = (
         f"# 番組タイトル\n{video_title}\n\n"
@@ -448,29 +626,46 @@ def extract_candidates_for_chunk(
         user_content=user_content,
         max_tokens=config.STAGE1_MAX_OUTPUT_TOKENS,
     )
-    return [_raw_material_from_stage1_output(m) for m in parsed.materials]
+    return Stage1ChunkResult(
+        hook_seeds=[_raw_hook_seed_from_stage1_output(s) for s in parsed.hook_seeds],
+        support_materials=[_raw_support_material_from_stage1_output(m) for m in parsed.support_materials],
+        fallback_spans=[_raw_fallback_span_from_stage1_output(f) for f in parsed.fallback_spans],
+    )
 
 
 def run_stage1(
     transcript: Transcript, video_title: str, force_refresh: bool = False
-) -> list[RawMaterial]:
+) -> Stage1ChunkResult:
     """Runs Stage1 chunk by chunk, caching each chunk's result the moment
     it succeeds (cache.save_stage1_chunk) -- so if a later chunk's API
     call fails, the already-paid-for results from earlier chunks are not
     discarded, and a subsequent run only re-requests the missing chunk(s).
+    Aggregates all three groups across every chunk into one
+    Stage1ChunkResult (the name is retained for the whole-transcript
+    aggregate too, since the shape is identical to a single chunk's).
     """
-    all_candidates: list[RawMaterial] = []
+    all_hook_seeds: list[RawHookSeed] = []
+    all_support_materials: list[RawMaterial] = []
+    all_fallback_spans: list[RawFallbackSpan] = []
     for chunk_index, chunk_segments in _build_chunks(_usable_segments(transcript)):
         if not force_refresh:
             cached = cache.load_stage1_chunk(transcript.video_id, chunk_index)
             if cached is not None:
-                all_candidates.extend(cached)
+                all_hook_seeds.extend(cached.hook_seeds)
+                all_support_materials.extend(cached.support_materials)
+                all_fallback_spans.extend(cached.fallback_spans)
                 continue
 
-        candidates = extract_candidates_for_chunk(chunk_segments, video_title)
-        cache.save_stage1_chunk(transcript.video_id, chunk_index, candidates)
-        all_candidates.extend(candidates)
-    return all_candidates
+        result = extract_candidates_for_chunk(chunk_segments, video_title)
+        cache.save_stage1_chunk(transcript.video_id, chunk_index, result)
+        all_hook_seeds.extend(result.hook_seeds)
+        all_support_materials.extend(result.support_materials)
+        all_fallback_spans.extend(result.fallback_spans)
+    return Stage1ChunkResult(
+        hook_seeds=all_hook_seeds,
+        support_materials=all_support_materials,
+        fallback_spans=all_fallback_spans,
+    )
 
 
 def _candidate_duration(raw: RawClipCandidate, transcript: Transcript) -> float:
@@ -932,13 +1127,16 @@ def is_candidate_junction_safe(raw: RawClipCandidate, transcript: Transcript) ->
 LocalRejectReason = Literal[
     "invalid_segment_reference",
     "incomplete_final_ending",
+    "semantic_ending_incomplete",
     "overlap",
     "duration_too_short",
     "duration_too_long",
-    "hook_strength_below_80",
+    "opening_not_self_contained",
+    "hook_claim_unresolved",
     "weak_opening_prefix",
     "speech_disfluency",
     "hook_incomplete_thought",
+    "filler_sandwiched_disfluency",
     "speech_restart",
     "context_dependent_opening",
     "unsafe_junction",
@@ -1087,19 +1285,42 @@ def evaluate_local_candidate(
        to turn an unfinished ending (internal or final) into a complete
        one via the original transcript before judging anything below
     4. has_confident_natural_ending on the (possibly extended) last
-       segment -> "incomplete_final_ending"
-    5. _has_overlapping_segments (beyond the allowed hook/payoff
+       segment -> "incomplete_final_ending" (mechanical: obvious
+       punctuation/gap-level dangling ending only)
+    5. candidate.semantic_ending_complete (Stage2's own semantic judgment,
+       informed by the lookahead it was shown at design time -- see
+       prompts/rank_and_finalize.md's ending-design section) ->
+       "semantic_ending_incomplete" if False. Hard-gated here (hook-seed-
+       discovery redesign) rather than left purely diagnostic, since a
+       "the underlying explanation isn't actually finished" verdict is a
+       real accept/reject signal, not just debug context.
+    6. _has_overlapping_segments (beyond the allowed hook/payoff
        exact-repeat exception) -> "overlap"
-    6. hard duration bounds, re-checked *after* extension ->
+    7. hard duration bounds, re-checked *after* extension ->
        "duration_too_short" / "duration_too_long"
-    7. opening_hook_strength vs config.MIN_OPENING_HOOK_STRENGTH ->
-       "hook_strength_below_80" (named for the current default; see
-       config.py for the live threshold) -- this AI self-rating can never
-       override the fluency checks below it: a real-machine incident had
-       a disfluent, unfinished hook self-rated 85/100.
-    8. _looks_like_weak_opening on the resolved opening
-       (models.WEAK_OPENING_PREFIXES) -> "weak_opening_prefix"
-    9. models.has_speech_disfluency on the resolved opening (word-search/
+    8. candidate.opening_self_contained (Stage2's own semantic judgment --
+       see prompts/rank_and_finalize.md's opening_self_contained section)
+       -> "opening_not_self_contained" if False. Hook-seed-discovery
+       redesign: this REPLACES the old numeric opening_hook_strength <
+       MIN_OPENING_HOOK_STRENGTH hard gate (real-machine incident: Claude
+       self-rated a context-dependent, unusable opening at 80 and it
+       sailed through, while a genuinely usable candidate could be
+       hard-rejected for scoring 78-79 -- a pure self-reported number was
+       not a reliable pass/fail signal). opening_hook_strength/score are
+       now soft/diagnostic only, feeding Stage2's own relative `ranking`,
+       never a Python accept/reject decision.
+    9. candidate.hook_claim_resolved (Stage2's own semantic judgment -- see
+       prompts/rank_and_finalize.md's hook_claim_resolved section, tied to
+       the existing "意味的な完結性" A-E criteria) -> "hook_claim_unresolved"
+       if False. This makes semantic closure an explicit, hard-gated field
+       rather than something enforced purely by Stage2 omitting a
+       violating design from its own output.
+    10. _looks_like_weak_opening on the resolved opening
+       (models.WEAK_OPENING_PREFIXES) -> "weak_opening_prefix" (mechanical
+       backstop for the obvious literal cases -- opening_self_contained
+       above is now the primary defense against a context-dependent/
+       unusable opening)
+    11. models.has_speech_disfluency on the resolved opening (word-search/
        self-correction, e.g. "実は逆っていうのか、間違っていて") ->
        "speech_disfluency"; then _looks_like_hook_incomplete_thought (a
        short, punctuation-less hook dangling on a bare topic/case
@@ -1108,17 +1329,26 @@ def evaluate_local_candidate(
        every *other* resolved segment (context/answer/payoff -- a
        disfluent body is enough to fail the whole candidate even with a
        strong hook) -> "speech_disfluency"
-    10. _candidate_speech_restart_marker across every segment (hook and
+    12. _candidate_filler_sandwiched_repetition_marker across every segment
+       (hook and body alike -- models.find_filler_sandwiched_repetition,
+       e.g. "ミッション、えっと、ポルシェのミッション": a content word
+       repeated verbatim right after a bare hesitation filler, with no
+       reformulation connective -- the gap has_speech_disfluency and
+       find_speech_restart_marker both leave uncovered) ->
+       "filler_sandwiched_disfluency"
+    13. _candidate_speech_restart_marker across every segment (hook and
        body alike -- models.find_speech_restart_marker, e.g. "Nレンジで
        下るというのは、Nレンジにすると、..."; an abandoned, unfinished
        clause restarted with the same content word in a different
        construction, distinct from speech_disfluency's marker/connective
        vocabulary) -> "speech_restart"
-    11. evaluate_candidate_junctions -- the hook itself opening on a
+    14. evaluate_candidate_junctions -- the hook itself opening on a
        dangling reference maps to "context_dependent_opening"
        (junction_reason="hook_context_dependent"); an unsafe A->B cut
        elsewhere maps to "unsafe_junction" (junction_reason=
-       "jump_prev_incomplete" or "jump_next_context_dependent")
+       "jump_prev_incomplete" or "jump_next_context_dependent"). Kept as a
+       mechanical backstop alongside opening_self_contained (step 8) --
+       neither replaces the other.
     Anything surviving all of the above is "accepted".
     """
     try:
@@ -1154,6 +1384,8 @@ def evaluate_local_candidate(
 
     if not has_confident_natural_ending(c, transcript):
         return _rejected("incomplete_final_ending")
+    if not c.semantic_ending_complete:
+        return _rejected("semantic_ending_incomplete")
 
     if _has_overlapping_segments(c, transcript):
         return _rejected("overlap")
@@ -1163,8 +1395,10 @@ def evaluate_local_candidate(
     if duration_sec > config.DURATION_HARD_MAX_SEC:
         return _rejected("duration_too_long")
 
-    if c.opening_hook_strength < config.MIN_OPENING_HOOK_STRENGTH:
-        return _rejected("hook_strength_below_80")
+    if not c.opening_self_contained:
+        return _rejected("opening_not_self_contained")
+    if not c.hook_claim_resolved:
+        return _rejected("hook_claim_unresolved")
     if _looks_like_weak_opening(opening_text):
         return _rejected("weak_opening_prefix")
 
@@ -1177,6 +1411,11 @@ def evaluate_local_candidate(
     if body_finding is not None:
         body_role, body_marker = body_finding
         return _rejected("speech_disfluency", disfluency_detail=f"{body_role}: {body_marker}")
+
+    filler_finding = _candidate_filler_sandwiched_repetition_marker(c, transcript)
+    if filler_finding is not None:
+        filler_role, filler_marker = filler_finding
+        return _rejected("filler_sandwiched_disfluency", disfluency_detail=f"{filler_role}: {filler_marker}")
 
     restart_finding = _candidate_speech_restart_marker(c, transcript)
     if restart_finding is not None:
@@ -1553,21 +1792,27 @@ def _build_repair_candidates(
     both variants ready for evaluate_local_candidate and ones that
     couldn't be constructed at all -- scoped to the specific reason the
     original candidate was rejected for. A reason with no known repair
-    (e.g. hook_strength_below_80, weak_opening_prefix, overlap,
-    unsafe_junction on a non-hook junction) yields an empty list, leaving
-    the original rejection as the final answer. Every variant is built
-    only from real transcript text/word timestamps/existing segments (see
-    each _try_*_repair*'s docstring) -- nothing here ever authors new
-    speech, reorders words within a sentence, or guesses a timestamp.
-    hook_incomplete_thought has no known repair either (a hook that never
-    delivered a claim within its own segment isn't fixable by mechanically
-    skipping a preamble) -- yields an empty list, same as the others.
-    speech_restart also has no repair (deliberate scope decision, not an
-    oversight): the abandoned clause and its restart could in principle be
-    disambiguated the same way disfluency_trim skips a preamble, but this
-    was not requested and the reject-only behavior already matches every
-    other reason without a bespoke repair strategy -- yields an empty
-    list too.
+    (e.g. opening_not_self_contained, hook_claim_unresolved,
+    weak_opening_prefix, overlap, unsafe_junction on a non-hook junction)
+    yields an empty list, leaving the original rejection as the final
+    answer. Every variant is built only from real transcript text/word
+    timestamps/existing segments (see each _try_*_repair*'s docstring) --
+    nothing here ever authors new speech, reorders words within a
+    sentence, or guesses a timestamp. hook_incomplete_thought has no known
+    repair either (a hook that never delivered a claim within its own
+    segment isn't fixable by mechanically skipping a preamble) -- yields
+    an empty list, same as the others. speech_restart also has no repair
+    (deliberate scope decision, not an oversight): the abandoned clause
+    and its restart could in principle be disambiguated the same way
+    disfluency_trim skips a preamble, but this was not requested and the
+    reject-only behavior already matches every other reason without a
+    bespoke repair strategy -- yields an empty list too.
+    filler_sandwiched_disfluency does try dropping a whole optional body
+    segment (same repair speech_disfluency already uses below) since the
+    intended primary fix for this pattern is Stage2 editing around the
+    span at design time (see prompts/rank_and_finalize.md), not a Python
+    repair -- this is only a secondary safety net when the pattern happens
+    to be confined to a droppable non-hook segment.
     """
     if reason == "context_dependent_opening":
         trimmed, skip = _try_opening_trim_repair(candidate, transcript)
@@ -1606,6 +1851,9 @@ def _build_repair_candidates(
         return [RepairBuildResult("disfluency_trim", trimmed, skip)] + _try_drop_optional_segment_repairs(
             candidate
         )
+
+    if reason == "filler_sandwiched_disfluency":
+        return _try_drop_optional_segment_repairs(candidate)
 
     return []
 
@@ -1714,13 +1962,16 @@ def _filter_local_quality(
 _LOCAL_REJECT_REASON_LABELS: dict[str, str] = {
     "invalid_segment_reference": "存在しないsegment参照",
     "incomplete_final_ending": "終端未完結",
+    "semantic_ending_incomplete": "意味的に未完結の終了",
     "overlap": "segment重複",
     "duration_too_short": "尺不足(20秒未満)",
     "duration_too_long": "尺超過(50秒超)",
-    "hook_strength_below_80": "hook強度不足",
+    "opening_not_self_contained": "冒頭が自己完結していない",
+    "hook_claim_unresolved": "hookの問いを回収していない",
     "weak_opening_prefix": "弱い導入句",
     "speech_disfluency": "言い淀み・自己修正",
     "hook_incomplete_thought": "hookが未完結",
+    "filler_sandwiched_disfluency": "フィラー挟み言い直し",
     "speech_restart": "文の言い直し(restart)",
     "context_dependent_opening": "文脈依存の冒頭",
     "unsafe_junction": "カット接続不自然",
@@ -1739,7 +1990,12 @@ def _stage2_diagnostic_evaluation(e: LocalCandidateEvaluation) -> dict:
     make Stage2's own ending-point decision (and its self-reported
     rationale) visible alongside the local-validation verdict, so a future
     mid-cutoff incident can be diagnosed by reading this file instead of
-    needing a fresh, API-calling re-analysis.
+    needing a fresh, API-calling re-analysis. opening_self_contained/
+    hook_claim_resolved/opening_hook_strength/score do the same for the
+    hook-seed-discovery redesign's judgments -- e.g. answering "was this
+    hook seed ever tried, and if so, why did it lose" from this file alone
+    (opening_hook_strength/score are soft/diagnostic-only -- see
+    Stage2CandidateOutput's docstring -- but still worth recording here).
     """
     last_segment = e.candidate.segments[-1]
     return {
@@ -1749,6 +2005,10 @@ def _stage2_diagnostic_evaluation(e: LocalCandidateEvaluation) -> dict:
         "opening_text": e.opening_text,
         "selected_end_segment_id": last_segment.end_segment_id,
         "selected_end_anchor_text": last_segment.end_anchor_text,
+        "opening_self_contained": e.candidate.opening_self_contained,
+        "hook_claim_resolved": e.candidate.hook_claim_resolved,
+        "opening_hook_strength": e.candidate.opening_hook_strength,
+        "score": e.candidate.score,
         "semantic_ending_complete": e.candidate.semantic_ending_complete,
         "ending_rationale_code": e.candidate.ending_rationale_code,
         "recomposed_for_duration": e.candidate.recomposed_for_duration,
@@ -1857,14 +2117,19 @@ def diagnose_local_filter(transcript: Transcript) -> list[MaterialUsabilityResul
     transcript (_load_stage1_from_cache_only -- never run_stage1 with
     force_refresh=True, never the Stage1 or Stage2 Anthropic API) and
     returns the per-material usability verdict (_material_rejection_
-    reason) for every one of them -- the same lightweight prefilter
+    reason) for every support_material -- the same lightweight prefilter
     select_candidates/refresh_candidates_only/refresh_stage1_and_
-    candidates actually run materials through before Stage2, not the full
-    evaluate_local_candidate_with_repair gate (that gate only ever runs
-    against Stage2's *designed* candidates -- see _design_finalize_and_
-    cache). Lets "why did the material prefilter leave too few usable
-    materials" be re-answered against an already-populated cache (e.g.
-    after pulling a prompt/threshold change) at zero additional API cost.
+    candidates actually run support materials through before Stage2, not
+    the full evaluate_local_candidate_with_repair gate (that gate only
+    ever runs against Stage2's *designed* candidates -- see _design_
+    finalize_and_cache). Lets "why did the material prefilter leave too
+    few usable materials" be re-answered against an already-populated
+    cache (e.g. after pulling a prompt/threshold change) at zero
+    additional API cost. Scoped to support_materials only -- hook_seeds/
+    fallback_spans have their own equivalent rejection-reason functions
+    (_hook_seed_rejection_reason/_fallback_span_rejection_reason) but no
+    dedicated diagnostic report, since neither is a required precondition
+    the way "at least one usable support material" used to be.
 
     Raises RuntimeError (no evaluations computed) if the Stage1 chunk
     cache is missing or incomplete for this transcript -- this never
@@ -1872,93 +2137,120 @@ def diagnose_local_filter(transcript: Transcript) -> list[MaterialUsabilityResul
     run a real analysis (or refresh_stage1_and_candidates) first to
     populate the cache.
     """
-    stage1_materials = _load_stage1_from_cache_only(transcript)
-    if stage1_materials is None:
+    stage1_result = _load_stage1_from_cache_only(transcript)
+    if stage1_result is None:
         raise RuntimeError(
             "診断用のStage1素材キャッシュが見つからないか不完全です。"
             "先に解析（またはStage1からの再解析）を一度実行してキャッシュを作成してから、"
             "この診断を実行してください。（この診断自体はAPIを呼び出しません）"
         )
     results = []
-    for m in stage1_materials:
+    for m in stage1_result.support_materials:
         reason = _material_rejection_reason(m, transcript)
         results.append(MaterialUsabilityResult(material=m, usable=reason is None, reason=reason))
     return results
 
 
-def _material_as_pseudo_candidate(material: RawMaterial) -> RawClipCandidate:
+def _pseudo_candidate_from_segments(segments: list[RawMaterialSegment], score: int) -> RawClipCandidate:
     """A private, throwaway adapter -- never persisted or exposed outside a
-    single call within this module -- that lets a RawMaterial reuse the
-    existing RawClipCandidate/RawUsedSegment-typed generic utilities
-    (boundary.resolve_candidate, _candidate_speech_restart_marker) without
-    duplicating their logic or touching boundary.py. The placeholder
-    role="context"/hook_type="story"/hook_text=""/title/description/
-    reasoning/caveats values carry no meaning and are discarded the
-    instant the caller is done with the adapter's return value;
-    opening_hook_strength/score are set to the material's own
-    usefulness_score purely so RawClipCandidate.__post_init__'s existing
-    0-100 validation has something consistent to check (usefulness_score
-    is already validated 0-100 by RawMaterial itself).
+    single call within this module -- that lets any of Stage1's three
+    output groups (RawMaterial/RawHookSeed/RawFallbackSpan, all of which
+    share RawMaterialSegment's shape) reuse the existing RawClipCandidate/
+    RawUsedSegment-typed generic utilities (boundary.resolve_candidate,
+    _candidate_speech_restart_marker, _candidate_filler_sandwiched_
+    repetition_marker) without duplicating their logic or touching
+    boundary.py. The placeholder role="context"/hook_type="story"/
+    hook_text=""/title/description/reasoning/caveats values carry no
+    meaning and are discarded the instant the caller is done with the
+    adapter's return value; opening_hook_strength/score are both set to
+    `score` purely so RawClipCandidate.__post_init__'s existing 0-100
+    validation has something consistent to check (the caller's own score
+    field is already validated 0-100 by its own dataclass).
     """
-    segments = [
+    used_segments = [
         RawUsedSegment(
             role="context",
             start_segment_id=s.start_segment_id,
             end_segment_id=s.end_segment_id,
             start_anchor_text=s.start_anchor_text,
         )
-        for s in material.segments
+        for s in segments
     ]
     return RawClipCandidate(
         hook_type="story",
-        segments=segments,
+        segments=used_segments,
         hook_text="",
-        opening_hook_strength=material.usefulness_score,
+        opening_hook_strength=score,
         title="",
         description="",
-        score=material.usefulness_score,
+        score=score,
         reasoning="",
         caveats="",
     )
 
 
-def _material_rejection_reason(material: RawMaterial, transcript: Transcript) -> str | None:
-    """The only filter a Stage1 *material* goes through before being shown
-    to Stage2 -- deliberately much lighter than evaluate_local_candidate.
-    A material is recall-priority raw ingredient, not a final candidate:
-    it doesn't need to stand alone at 20-50s, have a confidently complete
-    ending, or form a safe junction with anything, because Stage2 (not
-    Stage1) is now responsible for assembling those properties into the
-    final design. What's checked here is only what's disqualifying no
-    matter which role a piece of material eventually plays: real segment
-    references, and speech that's actively broken (word-search/self-
-    correction, or an abandoned-and-restarted clause) -- reusing models.
-    has_speech_disfluency and _candidate_speech_restart_marker exactly as
-    evaluate_local_candidate does, rather than inventing a new detector.
-    Duration/ending-completeness/junction-safety/hook-strength/weak-
-    opening are deliberately NOT checked here; they're re-checked (via the
-    unchanged evaluate_local_candidate_with_repair) against whatever
-    Stage2 actually designs, since only *that* is a claimed-final
-    candidate.
+def _material_as_pseudo_candidate(material: RawMaterial) -> RawClipCandidate:
+    return _pseudo_candidate_from_segments(material.segments, material.usefulness_score)
+
+
+def _hook_seed_as_pseudo_candidate(seed: RawHookSeed) -> RawClipCandidate:
+    return _pseudo_candidate_from_segments(seed.segments, seed.soft_score)
+
+
+def _fallback_span_as_pseudo_candidate(span: RawFallbackSpan) -> RawClipCandidate:
+    return _pseudo_candidate_from_segments(span.segments, span.safety_score)
+
+
+def _segments_rejection_reason(segments: list[RawMaterialSegment], transcript: Transcript) -> str | None:
+    """The only filter any of Stage1's three output groups (hook_seeds/
+    support_materials/fallback_spans) go through before being shown to
+    Stage2 -- deliberately much lighter than evaluate_local_candidate. A
+    hook_seed/support material/fallback span is recall-priority raw
+    ingredient, not a final candidate: it doesn't need to stand alone at
+    20-50s, have a confidently complete ending, or form a safe junction
+    with anything, because Stage2 (not Stage1) is now responsible for
+    assembling those properties into the final design. What's checked
+    here is only what's disqualifying no matter which role a piece of
+    material eventually plays: real segment references, and speech that's
+    actively broken (word-search/self-correction, an abandoned-and-
+    restarted clause, or a content word repeated right after a bare
+    hesitation filler) -- reusing models.has_speech_disfluency/
+    _candidate_speech_restart_marker/_candidate_filler_sandwiched_
+    repetition_marker exactly as evaluate_local_candidate does, rather
+    than inventing a new detector. Duration/ending-completeness/junction-
+    safety/hook-strength/weak-opening are deliberately NOT checked here;
+    they're re-checked (via the unchanged evaluate_local_candidate_with_
+    repair) against whatever Stage2 actually designs, since only *that*
+    is a claimed-final candidate.
 
     Returns None when usable, otherwise a short reason code
-    ("invalid_segment_reference" / "speech_disfluency" / "speech_restart")
-    for diagnostics (see MaterialUsabilityResult / diagnose_local_filter).
+    ("invalid_segment_reference" / "speech_disfluency" / "speech_restart" /
+    "filler_sandwiched_disfluency") for diagnostics.
     """
     try:
-        for s in material.segments:
+        for s in segments:
             transcript.segment_by_id(s.start_segment_id)
             transcript.segment_by_id(s.end_segment_id)
     except KeyError:
         return "invalid_segment_reference"
-    pseudo = _material_as_pseudo_candidate(material)
+    pseudo = _pseudo_candidate_from_segments(segments, 0)
     resolved = boundary.resolve_candidate(pseudo, transcript, candidate_id="_material_check")
     for seg in resolved.segments:
         if models.has_speech_disfluency(seg.text) is not None:
             return "speech_disfluency"
     if _candidate_speech_restart_marker(pseudo, transcript) is not None:
         return "speech_restart"
+    if _candidate_filler_sandwiched_repetition_marker(pseudo, transcript) is not None:
+        return "filler_sandwiched_disfluency"
     return None
+
+
+def _material_rejection_reason(material: RawMaterial, transcript: Transcript) -> str | None:
+    """See _segments_rejection_reason for exactly what is (and is not)
+    checked. Returns None when usable, otherwise a short reason code for
+    diagnostics (see MaterialUsabilityResult / diagnose_local_filter).
+    """
+    return _segments_rejection_reason(material.segments, transcript)
 
 
 def _material_is_usable(material: RawMaterial, transcript: Transcript) -> bool:
@@ -1968,14 +2260,41 @@ def _material_is_usable(material: RawMaterial, transcript: Transcript) -> bool:
     return _material_rejection_reason(material, transcript) is None
 
 
-def _material_lookahead_segments(material: RawMaterial, transcript: Transcript) -> list[dict]:
-    """Real transcript segments immediately following material's own last
-    segment, shown to Stage2 as reference-only "is there a more natural
-    ending a bit further on" material (see prompts/rank_and_finalize.md's
-    ending-design section). This is the concrete fix for the root cause
-    behind the ~23s mid-cutoff incident: Stage2 previously had zero
-    visibility past a material's own chosen segments, so it had no way to
-    even consider a cleaner stopping point that existed just beyond them.
+def _hook_seed_rejection_reason(seed: RawHookSeed, transcript: Transcript) -> str | None:
+    """See _segments_rejection_reason. Deliberately does NOT check
+    soft_score -- Stage1's hook-seed recall is threshold-free by design
+    (see RawHookSeed's docstring); a weak-scoring seed is still shown to
+    Stage2 as its own coverage-target candidate, never silently dropped
+    here merely for scoring low.
+    """
+    return _segments_rejection_reason(seed.segments, transcript)
+
+
+def _hook_seed_is_usable(seed: RawHookSeed, transcript: Transcript) -> bool:
+    return _hook_seed_rejection_reason(seed, transcript) is None
+
+
+def _fallback_span_rejection_reason(span: RawFallbackSpan, transcript: Transcript) -> str | None:
+    """See _segments_rejection_reason."""
+    return _segments_rejection_reason(span.segments, transcript)
+
+
+def _fallback_span_is_usable(span: RawFallbackSpan, transcript: Transcript) -> bool:
+    return _fallback_span_rejection_reason(span, transcript) is None
+
+
+def _lookahead_segments_after(last_segment_id: int, transcript: Transcript) -> list[dict]:
+    """Real transcript segments immediately following `last_segment_id`,
+    shown to Stage2 as reference-only "is there a more natural ending a
+    bit further on" material (see prompts/rank_and_finalize.md's ending-
+    design section). This is the concrete fix for the root cause behind
+    the ~23s mid-cutoff incident: Stage2 previously had zero visibility
+    past a material's own chosen segments, so it had no way to even
+    consider a cleaner stopping point that existed just beyond them. Now
+    shared identically across all three of Stage1's output groups (see
+    _material_lookahead_segments/_hook_seed_lookahead/_fallback_span_
+    lookahead) since the windowing logic doesn't depend on which group
+    the segment came from.
 
     Bounded by both config.STAGE2_LOOKAHEAD_MAX_SEGMENTS and
     config.STAGE2_LOOKAHEAD_MAX_SEC (whichever is hit first) to keep API
@@ -1985,10 +2304,9 @@ def _material_lookahead_segments(material: RawMaterial, transcript: Transcript) 
     included when one exists, even if its own duration alone exceeds the
     seconds budget, so Stage2 is never left with an empty, uninformative
     lookahead solely because the very next segment happens to be long.
-    Returns an empty list when material's last segment is already at (or
-    past) the end of the transcript.
+    Returns an empty list when `last_segment_id` is already at (or past)
+    the end of the transcript.
     """
-    last_segment_id = material.segments[-1].end_segment_id
     start_index = transcript.segment_index(last_segment_id) + 1
     lookahead: list[dict] = []
     cumulative_sec = 0.0
@@ -2005,6 +2323,40 @@ def _material_lookahead_segments(material: RawMaterial, transcript: Transcript) 
         )
         cumulative_sec += segment.end - segment.start
     return lookahead
+
+
+def _material_lookahead_segments(material: RawMaterial, transcript: Transcript) -> list[dict]:
+    return _lookahead_segments_after(material.segments[-1].end_segment_id, transcript)
+
+
+def _hook_seed_lookahead(seed: RawHookSeed, transcript: Transcript) -> list[dict]:
+    return _lookahead_segments_after(seed.segments[-1].end_segment_id, transcript)
+
+
+def _fallback_span_lookahead(span: RawFallbackSpan, transcript: Transcript) -> list[dict]:
+    return _lookahead_segments_after(span.segments[-1].end_segment_id, transcript)
+
+
+def _resolved_segments_summary(
+    pseudo: RawClipCandidate, real_segments: list[RawMaterialSegment], transcript: Transcript, resolve_id: str
+) -> list[dict]:
+    """The shared per-segment {start_segment_id, end_segment_id, text,
+    start_sec, end_sec} block sent to Stage2 for any of its three input
+    groups -- factored out of the old _stage2_material_summary so hook_seed
+    and fallback_span summaries can build the identical shape without
+    duplicating the resolve-then-zip logic.
+    """
+    resolved = boundary.resolve_candidate(pseudo, transcript, candidate_id=resolve_id)
+    return [
+        {
+            "start_segment_id": raw_seg.start_segment_id,
+            "end_segment_id": raw_seg.end_segment_id,
+            "text": seg.text,
+            "start_sec": round(seg.start, 1),
+            "end_sec": round(seg.end, 1),
+        }
+        for seg, raw_seg in zip(resolved.segments, real_segments)
+    ]
 
 
 def _stage2_material_summary(material_id: str, material: RawMaterial, transcript: Transcript) -> dict:
@@ -2027,70 +2379,153 @@ def _stage2_material_summary(material_id: str, material: RawMaterial, transcript
     segment.
     """
     pseudo = _material_as_pseudo_candidate(material)
-    resolved = boundary.resolve_candidate(pseudo, transcript, candidate_id=material_id)
     return {
         "material_id": material_id,
         "material_type": material.material_type,
         "usefulness_score": material.usefulness_score,
-        "segments": [
-            {
-                "start_segment_id": raw_seg.start_segment_id,
-                "end_segment_id": raw_seg.end_segment_id,
-                "text": seg.text,
-                "start_sec": round(seg.start, 1),
-                "end_sec": round(seg.end, 1),
-            }
-            for seg, raw_seg in zip(resolved.segments, material.segments)
-        ],
+        "segments": _resolved_segments_summary(pseudo, material.segments, transcript, material_id),
         "lookahead": _material_lookahead_segments(material, transcript),
     }
 
 
-def _dedupe_by_segment_sequence(candidates: list[RawClipCandidate]) -> list[RawClipCandidate]:
-    """Safety-net dedup for Stage2's own output: drops a later candidate
-    whose segment sequence -- (role, start_segment_id, end_segment_id,
-    start_anchor_text, end_anchor_text) for every segment, in order -- is
-    byte-identical to an earlier one's. rank_and_finalize.md also
-    instructs Stage2 not to design near-duplicate final candidates itself;
-    this only catches the cheap, exact-duplicate case deterministically,
-    it never judges "large overlap" (that nuance stays Stage2's editorial
-    call, same as before).
+def _stage2_hook_seed_summary(hook_seed_id: str, seed: RawHookSeed, transcript: Transcript) -> dict:
+    """The coverage-target summary Stage2 sees for one hook_seed -- same
+    per-segment shape as _stage2_material_summary, plus signal_type/
+    soft_score (see RawHookSeed) and a lookahead window past the seed's
+    own last segment, for the identical "is there a more natural ending a
+    bit further on" purpose.
     """
-    seen: set[tuple] = set()
-    deduped: list[RawClipCandidate] = []
-    for c in candidates:
-        key = tuple(
-            (s.role, s.start_segment_id, s.end_segment_id, s.start_anchor_text, s.end_anchor_text)
-            for s in c.segments
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(c)
-    return deduped
+    pseudo = _hook_seed_as_pseudo_candidate(seed)
+    return {
+        "hook_seed_id": hook_seed_id,
+        "signal_type": seed.signal_type,
+        "soft_score": seed.soft_score,
+        "segments": _resolved_segments_summary(pseudo, seed.segments, transcript, hook_seed_id),
+        "lookahead": _hook_seed_lookahead(seed, transcript),
+    }
+
+
+def _stage2_fallback_span_summary(fallback_span_id: str, span: RawFallbackSpan, transcript: Transcript) -> dict:
+    """Same shape as _stage2_hook_seed_summary, for one fallback_span."""
+    pseudo = _fallback_span_as_pseudo_candidate(span)
+    return {
+        "fallback_span_id": fallback_span_id,
+        "safety_score": span.safety_score,
+        "segments": _resolved_segments_summary(pseudo, span.segments, transcript, fallback_span_id),
+        "lookahead": _fallback_span_lookahead(span, transcript),
+    }
+
+
+def _hook_seed_index_range(seed: RawHookSeed, transcript: Transcript) -> tuple[int, int]:
+    starts = [transcript.segment_index(s.start_segment_id) for s in seed.segments]
+    ends = [transcript.segment_index(s.end_segment_id) for s in seed.segments]
+    return (min(starts), max(ends))
+
+
+def _ranges_overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    return a[0] <= b[1] and b[0] <= a[1]
+
+
+def _select_hook_seed_coverage_targets(
+    hook_seeds: list[RawHookSeed], transcript: Transcript
+) -> list[tuple[str, RawHookSeed]]:
+    """Python-side coverage-target selection (hook-seed-discovery
+    redesign): clusters hook_seeds whose real transcript-index ranges
+    overlap at all (this catches chunk-overlap duplicates -- the same
+    utterance extracted twice near a chunk boundary -- and near-identical
+    picks of the exact same moment), keeps each cluster's highest-
+    soft_score member as that cluster's representative, then sorts
+    representatives by soft_score descending (Python's sort is stable, so
+    ties keep discovery order) and takes the top
+    config.STAGE2_MAX_COVERAGE_TARGETS.
+
+    Deliberately does NOT merge two hook_seeds just because they're about
+    the same general topic -- only overlapping segment ranges are merged.
+    This is the fix for the real-machine incident's core failure: a weak,
+    context-dependent hook_seed ("ちょくちょく壊れちゃいます...") and a much
+    stronger, self-contained one nearby (a specific loss amount) reference
+    *different* transcript moments, so both survive as independent
+    coverage targets here -- neither is silently dropped for "already
+    covering a similar topic."
+
+    Assigns deterministic ids ("s1_hookseed_000", "s1_hookseed_001", ...)
+    in final (soft_score-descending) order. Callers are expected to have
+    already filtered to referentially-valid, disfluency/restart-clean
+    hook_seeds (_hook_seed_is_usable) before calling this.
+    """
+    clusters: list[list[tuple[RawHookSeed, tuple[int, int]]]] = []
+    for seed in hook_seeds:
+        rng = _hook_seed_index_range(seed, transcript)
+        for cluster in clusters:
+            if any(_ranges_overlap(rng, other_rng) for _, other_rng in cluster):
+                cluster.append((seed, rng))
+                break
+        else:
+            clusters.append([(seed, rng)])
+
+    representatives = [max(cluster, key=lambda pair: pair[0].soft_score)[0] for cluster in clusters]
+    representatives.sort(key=lambda s: s.soft_score, reverse=True)
+    top = representatives[: config.STAGE2_MAX_COVERAGE_TARGETS]
+    return [(f"s1_hookseed_{i:03d}", seed) for i, seed in enumerate(top)]
+
+
+@dataclass
+class Stage2AttemptResult:
+    """Internal counterpart to Stage2AttemptOutput, after converting its
+    Stage2CandidateOutput (if any) into a RawClipCandidate."""
+
+    hook_seed_id: str
+    status: Literal["candidate", "rejected"]
+    candidate: RawClipCandidate | None = None
+    reject_reason_code: str | None = None
+
+
+@dataclass
+class Stage2DesignResult:
+    """Stage2's full response for one design_final_candidates call:
+    attempts (one per coverage-target hook_seed, see Stage2AttemptResult),
+    fallback_candidates (keyed by Stage2's own fallback_id), and Stage2's
+    own relative-quality ranking across everything it built (referencing
+    either a hook_seed_id or a fallback_id).
+    """
+
+    attempts: list[Stage2AttemptResult]
+    fallback_candidates: dict[str, RawClipCandidate]
+    ranking: list[str]
 
 
 def design_final_candidates(
-    materials: dict[str, RawMaterial], transcript: Transcript, video_title: str
-) -> list[RawClipCandidate]:
-    """Stage2: final edit design (replaces the old ranking-only Stage2).
-    Claude sees compact per-material summaries (never the full transcript)
-    and returns up to config.STAGE2_MAX_DESIGNS fully-designed final
-    candidates -- real segment references it may freely recombine across
-    different materials, never new/fabricated speech. STAGE2_MAX_DESIGNS
-    is deliberately wider than config.NUM_CANDIDATES (the number that must
-    actually survive local validation): see Stage2Output's docstring for
-    why over-producing here matters. Exactly one Anthropic call, exactly
-    like before; the only difference from the old rank_candidates is what
-    Claude is asked to produce (a designed candidate list, not an id
-    ranking) and what it's given to work with (per-segment ids/text/
-    timing, not one joined text block per candidate).
+    coverage_targets: list[tuple[str, RawHookSeed]],
+    support_materials: dict[str, RawMaterial],
+    fallback_spans: dict[str, RawFallbackSpan],
+    transcript: Transcript,
+    video_title: str,
+) -> Stage2DesignResult:
+    """Stage2: hook-seed coverage-driven final edit design (replaces the
+    old "design up to STAGE2_MAX_DESIGNS candidates from pooled material"
+    Stage2). Claude sees compact summaries of every coverage-target hook
+    seed, support material, and fallback span (never the full transcript)
+    and must return exactly one attempt per coverage target -- either a
+    real candidate built from it, or an explicit, reasoned rejection (see
+    Stage2AttemptOutput) -- plus up to config.STAGE2_MAX_FALLBACK_
+    CANDIDATES fallback candidates and its own relative ranking across
+    everything it built. Exactly one Anthropic call, exactly like before;
+    the schema itself (not just prompt wording) is what makes silently
+    dropping a coverage target structurally detectable (see
+    _design_finalize_and_cache's coverage-completeness check).
     """
     system_prompt = (_PROMPTS_DIR / "rank_and_finalize.md").read_text(encoding="utf-8")
-    summaries = [_stage2_material_summary(mid, m, transcript) for mid, m in materials.items()]
+    hook_seed_summaries = [_stage2_hook_seed_summary(hsid, seed, transcript) for hsid, seed in coverage_targets]
+    material_summaries = [_stage2_material_summary(mid, m, transcript) for mid, m in support_materials.items()]
+    fallback_summaries = [
+        _stage2_fallback_span_summary(fid, f, transcript) for fid, f in fallback_spans.items()
+    ]
     user_content = (
         f"# 番組タイトル\n{video_title}\n\n"
-        f"# Stage1素材一覧\n{json.dumps(summaries, ensure_ascii=False, indent=2)}"
+        f"# coverage_targets（hook_seed一覧。各hook_seedについて必ず1件attemptを返すこと）\n"
+        f"{json.dumps(hook_seed_summaries, ensure_ascii=False, indent=2)}\n\n"
+        f"# support_materials\n{json.dumps(material_summaries, ensure_ascii=False, indent=2)}\n\n"
+        f"# fallback_spans\n{json.dumps(fallback_summaries, ensure_ascii=False, indent=2)}"
     )
 
     parsed = structured_output.call(
@@ -2101,24 +2536,62 @@ def design_final_candidates(
         max_tokens=config.STAGE2_MAX_OUTPUT_TOKENS,
     )
 
-    candidates = [_raw_candidate_from_stage2_output(c, transcript.segments) for c in parsed.candidates]
+    attempts = [
+        Stage2AttemptResult(
+            hook_seed_id=a.hook_seed_id,
+            status=a.status,
+            candidate=(
+                _raw_candidate_from_stage2_output(a.candidate, transcript.segments)
+                if a.candidate is not None else None
+            ),
+            reject_reason_code=a.reject_reason_code,
+        )
+        for a in parsed.attempts
+    ]
+    fallback_candidates = {
+        f.fallback_id: _raw_candidate_from_stage2_output(f.candidate, transcript.segments)
+        for f in parsed.fallback_candidates
+    }
+    ranking = list(parsed.ranking)
+
     # Diagnostic-only snapshot, written immediately after a successful
-    # parse and before dedup/local validation -- see cache.
-    # save_stage2_diagnostic's docstring. Real-machine incident this
-    # exists for: a run that designs too few locally-valid candidates
-    # raises before cache.save_stage2 ever runs (correct -- stage2_
-    # result.json must never hold an unsuccessful run's picks), which
-    # previously meant Stage2's actual raw output was lost the moment the
-    # process exited, making "what did Stage2 actually design" impossible
-    # to answer without a fresh, API-calling re-analysis. materials_
-    # lookahead is only ever available here (the materials dict is in
-    # scope) -- see cache.save_stage2_diagnostic's docstring for how the
-    # second (evaluations) save preserves it without needing it re-passed.
-    materials_lookahead = {mid: s["lookahead"] for mid, s in zip(materials, summaries)}
-    cache.save_stage2_diagnostic(
-        transcript.video_id, candidates, materials_lookahead=materials_lookahead
+    # parse and before local validation -- see cache.save_stage2_
+    # diagnostic's docstring. Real-machine incident this exists for: a run
+    # that designs too few locally-valid candidates raises before cache.
+    # save_stage2 ever runs (correct -- stage2_result.json must never hold
+    # an unsuccessful run's picks), which previously meant Stage2's actual
+    # raw output was lost the moment the process exited, making "was this
+    # hook seed ever tried, and why did it lose" impossible to answer
+    # without a fresh, API-calling re-analysis. lookahead_by_id is keyed
+    # by whichever id each input item has (hook_seed_id/material_id/
+    # fallback_span_id -- distinct namespaces, so no collisions), only
+    # ever available here (the input dicts are in scope) -- see cache.
+    # save_stage2_diagnostic's docstring for how the second (evaluations)
+    # save preserves it without needing it re-passed.
+    lookahead_by_id: dict[str, list[dict]] = {}
+    for (hsid, _), summary in zip(coverage_targets, hook_seed_summaries):
+        lookahead_by_id[hsid] = summary["lookahead"]
+    for mid, summary in zip(support_materials, material_summaries):
+        lookahead_by_id[mid] = summary["lookahead"]
+    for fid, summary in zip(fallback_spans, fallback_summaries):
+        lookahead_by_id[fid] = summary["lookahead"]
+
+    built_candidates = [a.candidate for a in attempts if a.candidate is not None] + list(
+        fallback_candidates.values()
     )
-    return _dedupe_by_segment_sequence(candidates)
+    cache.save_stage2_diagnostic(
+        transcript.video_id,
+        built_candidates,
+        materials_lookahead=lookahead_by_id,
+        selected_hook_seed_ids=[hsid for hsid, _ in coverage_targets],
+        attempts=[
+            {"hook_seed_id": a.hook_seed_id, "status": a.status, "reject_reason_code": a.reject_reason_code}
+            for a in attempts
+        ],
+        fallback_ids=list(fallback_candidates),
+        ranking=ranking,
+    )
+    return Stage2DesignResult(attempts=attempts, fallback_candidates=fallback_candidates, ranking=ranking)
 
 
 def finalize_candidates(
@@ -2141,8 +2614,9 @@ def finalize_candidates(
     _validate_candidate_junctions, the identical junction-safety rules
     _filter_local_quality uses, so a cache hit can never bypass them.
     The speech-fluency veto (models.has_speech_disfluency /
-    _looks_like_hook_incomplete_thought / _candidate_speech_restart_marker)
-    is re-checked here too -- this is the *only* enforcement point a
+    _looks_like_hook_incomplete_thought / _candidate_filler_sandwiched_
+    repetition_marker / _candidate_speech_restart_marker) is re-checked
+    here too -- this is the *only* enforcement point a
     cache-hit or web.py's render path
     (_run_render, which reads cache.load_stage2 directly) ever goes
     through, so a candidate already sitting in a stale Stage2 cache from
@@ -2192,6 +2666,8 @@ def finalize_candidates(
             continue
         if _body_disfluency_marker(extended, transcript) is not None:
             continue
+        if _candidate_filler_sandwiched_repetition_marker(extended, transcript) is not None:
+            continue
         if _candidate_speech_restart_marker(extended, transcript) is not None:
             continue
         dur = _candidate_duration(extended, transcript)
@@ -2210,27 +2686,99 @@ def finalize_candidates(
     return finalized
 
 
+def _segment_sequence_key(c: RawClipCandidate) -> tuple:
+    return tuple(
+        (s.role, s.start_segment_id, s.end_segment_id, s.start_anchor_text, s.end_anchor_text)
+        for s in c.segments
+    )
+
+
+def _select_final_candidates(
+    attempt_evals: dict[str, LocalCandidateEvaluation],
+    fallback_evals: dict[str, LocalCandidateEvaluation],
+    ranking: list[str],
+) -> list[tuple[str, RawClipCandidate]]:
+    """Replaces the old "trust Stage2's raw output order as strongest-
+    first" truncation (accepted[:config.NUM_CANDIDATES]) with Stage2's own
+    explicit `ranking` field, applied only after the hard gate, plus the
+    fallback-tier logic needed to avoid a 0-candidate result (item 17):
+    3+ hard-valid primary -> top NUM_CANDIDATES primary; fewer -> fill the
+    remainder from hard-valid fallback candidates, in ranking order; 0
+    primary -> fallback-only. Fallback candidates go through the exact
+    same hard gate as primary ones (see _design_finalize_and_cache) --
+    there is no separate, more lenient path for them here.
+
+    Stage2's `ranking` may omit a hard-valid id by mistake (or simply not
+    rank something it still built) -- such an id is never silently
+    dropped: it's appended, in its original attempt/fallback order, after
+    everything Stage2 did rank. Also applies a safety-net dedup (mirrors
+    the old _dedupe_by_segment_sequence): a later-ranked id whose
+    candidate has a byte-identical segment sequence to an earlier-ranked
+    one's is dropped, rank order deciding which survives.
+
+    Returns (id, candidate) pairs -- id is a hook_seed_id for a primary
+    candidate or a fallback_id for a fallback one -- rather than raising
+    itself; the caller decides what an empty result means.
+    """
+    hard_valid_primary = {k: e.candidate for k, e in attempt_evals.items() if e.accepted}
+    hard_valid_fallback = {k: e.candidate for k, e in fallback_evals.items() if e.accepted}
+
+    ranked_ids = [rid for rid in ranking if rid in hard_valid_primary or rid in hard_valid_fallback]
+    for hsid in attempt_evals:
+        if hsid in hard_valid_primary and hsid not in ranked_ids:
+            ranked_ids.append(hsid)
+    for fid in fallback_evals:
+        if fid in hard_valid_fallback and fid not in ranked_ids:
+            ranked_ids.append(fid)
+
+    combined = {**hard_valid_primary, **hard_valid_fallback}
+    seen_sequences: set[tuple] = set()
+    deduped_ids = []
+    for rid in ranked_ids:
+        key = _segment_sequence_key(combined[rid])
+        if key in seen_sequences:
+            continue
+        seen_sequences.add(key)
+        deduped_ids.append(rid)
+
+    ranked_primary = [rid for rid in deduped_ids if rid in hard_valid_primary]
+    ranked_fallback = [rid for rid in deduped_ids if rid in hard_valid_fallback]
+
+    n_primary = len(ranked_primary)
+    if n_primary >= config.NUM_CANDIDATES:
+        chosen_ids = ranked_primary[: config.NUM_CANDIDATES]
+    else:
+        chosen_ids = ranked_primary + ranked_fallback[: config.NUM_CANDIDATES - n_primary]
+
+    return [(i, combined[i]) for i in chosen_ids]
+
+
 def select_candidates(
     transcript: Transcript, video_title: str, force_refresh: bool = False
 ) -> list[RawClipCandidate]:
-    """Runs Stage1 (per-chunk cached, recall-priority materials) -> a
-    lightweight material prefilter -> Stage2 (final edit design) and
-    returns 1 to config.NUM_CANDIDATES candidates -- NUM_CANDIDATES is a
-    target/ceiling, not a required minimum (see finalize_candidates'
-    docstring): a run that produces fewer good candidates than the
-    ceiling still succeeds and returns exactly what it has. Neither stage
-    retries automatically: only when literally no usable material
-    survives the prefilter, or NOTHING Stage2 designed survives local
-    validation, does this raise instead of requesting more from the API.
-    Every return path calls finalize_candidates *before*
-    cache.save_stage2 (never after), so the Stage2 cache on disk always
-    holds the finalized (ending-corrected, duration-validated) result --
-    a cache hit never bypasses that correction, and render.py's
-    cache.load_stage2 reads (see web._run_render) always see the same
-    finalized state the UI already showed. A cache hit whose candidates
-    are no longer sufficiently valid (finalize_candidates raises) leaves
-    the on-disk cache completely untouched -- it is never overwritten
-    with a known-bad/insufficient result.
+    """Runs Stage1 (per-chunk cached, discovery-first hook_seeds/support_
+    materials/fallback_spans) -> lightweight prefilters -> Stage2 (hook-
+    seed coverage-driven final edit design) and returns 1 to config.
+    NUM_CANDIDATES candidates -- NUM_CANDIDATES is a target/ceiling, not a
+    required minimum (see finalize_candidates' docstring): a run that
+    produces fewer good candidates than the ceiling still succeeds and
+    returns exactly what it has. Neither stage retries automatically:
+    only when literally no usable hook_seed AND no usable fallback_span
+    survive the prefilter, or NOTHING Stage2 designed (attempts or
+    fallback) survives local validation, does this raise instead of
+    requesting more from the API. A run with zero usable support_
+    materials is not itself fatal -- Stage2 may still build self-
+    contained hook_seed-only or fallback-only candidates.
+
+    Every return path calls finalize_candidates *before* cache.save_
+    stage2 (never after), so the Stage2 cache on disk always holds the
+    finalized (ending-corrected, duration-validated) result -- a cache
+    hit never bypasses that correction, and render.py's cache.load_
+    stage2 reads (see web._run_render) always see the same finalized
+    state the UI already showed. A cache hit whose candidates are no
+    longer sufficiently valid (finalize_candidates raises) leaves the
+    on-disk cache completely untouched -- it is never overwritten with a
+    known-bad/insufficient result.
     """
     if not force_refresh:
         cached = cache.load_stage2(transcript.video_id)
@@ -2239,102 +2787,132 @@ def select_candidates(
             cache.save_stage2(transcript.video_id, finalized)
             return finalized
 
-    stage1_materials = run_stage1(transcript, video_title, force_refresh=force_refresh)
-    usable_materials = [m for m in stage1_materials if _material_is_usable(m, transcript)]
-    if not usable_materials:
+    stage1_result = run_stage1(transcript, video_title, force_refresh=force_refresh)
+    usable_hook_seeds = [s for s in stage1_result.hook_seeds if _hook_seed_is_usable(s, transcript)]
+    usable_support_materials = [
+        m for m in stage1_result.support_materials if _material_is_usable(m, transcript)
+    ]
+    usable_fallback_spans = [
+        f for f in stage1_result.fallback_spans if _fallback_span_is_usable(f, transcript)
+    ]
+    if not usable_hook_seeds and not usable_fallback_spans:
         raise RuntimeError(
-            f"Stage1から得られた素材{len(stage1_materials)}件のうち、"
-            "参照整合性・発話品質の基本チェックを通過したものが0件でした。"
-            "APIへの自動再要求は行いません。"
+            f"Stage1から得られたhook_seed{len(stage1_result.hook_seeds)}件・fallback_span"
+            f"{len(stage1_result.fallback_spans)}件のうち、参照整合性・発話品質の基本チェックを"
+            "通過したものが0件でした。APIへの自動再要求は行いません。"
         )
 
-    return _design_finalize_and_cache(usable_materials, transcript, video_title)
+    return _design_finalize_and_cache(
+        usable_hook_seeds, usable_support_materials, usable_fallback_spans, transcript, video_title
+    )
 
 
 def _design_finalize_and_cache(
-    materials: list[RawMaterial], transcript: Transcript, video_title: str
+    hook_seeds: list[RawHookSeed],
+    support_materials: list[RawMaterial],
+    fallback_spans: list[RawFallbackSpan],
+    transcript: Transcript,
+    video_title: str,
 ) -> list[RawClipCandidate]:
-    """Stage2 final-edit-design (at most once) -> the unchanged local
-    quality gate (evaluate_local_candidate_with_repair) -> the unchanged
-    finalize_candidates -> cache.save_stage2 on success only. Shared by
-    select_candidates, refresh_candidates_only, and
+    """Coverage-target selection -> Stage2 final-edit-design (at most
+    once) -> the unchanged local quality gate (evaluate_local_candidate_
+    with_repair) -> fallback-tier selection (_select_final_candidates) ->
+    the unchanged finalize_candidates -> cache.save_stage2 on success
+    only. Shared by select_candidates, refresh_candidates_only, and
     refresh_stage1_and_candidates so all three apply the identical final
     correction/caching rule instead of each re-implementing it.
 
-    Unlike the old ranking-only design (which only had to referential-
-    integrity-check an id list), Stage2's designed candidates are brand
-    new RawClipCandidate structures that have never been validated at
-    all -- so this is the *first* point they ever go through evaluate_
-    local_candidate_with_repair (referential integrity, duration, ending
-    completeness, speech disfluency/restart, junction safety, hook
-    strength -- all unchanged code, see clip_selector.py's local-gate
-    section). A candidate Stage2 designed poorly (e.g. an invented
-    segment_id, or a duration outside bounds) is rejected here exactly
-    like any other candidate always has been; the local repair-before-
-    reject methods still apply as a safety net, matching item 7's "don't
-    delete existing gates yet."
+    Every candidate Stage2 built (attempt-produced or fallback) goes
+    through the exact same evaluate_local_candidate_with_repair as
+    before (referential integrity, duration, ending completeness,
+    semantic ending/opening/hook-claim judgments, speech disfluency/
+    restart, junction safety -- see evaluate_local_candidate's docstring
+    for the full, current check order) -- a candidate Stage2 designed
+    poorly (e.g. an invented segment_id, or a duration outside bounds) is
+    rejected here exactly like any other candidate always has been; the
+    local repair-before-reject methods still apply as a safety net.
 
     config.NUM_CANDIDATES is a target/ceiling, never a required minimum:
-    a real-machine incident showed 2 genuinely good, locally-accepted
-    candidates being thrown away as a total failure just because a 3rd
-    didn't also survive -- "aim for 100 points and ship nothing" is worse
-    than shipping the 1-2 solid candidates that do exist. So this returns
-    whatever subset (1 up to NUM_CANDIDATES) actually passes; only zero
-    surviving candidates raises. Quality bars themselves (hook strength,
-    duration, semantic closure, disfluency/restart, junction safety,
-    ending completeness, overlap, segment validity) are never relaxed to
-    reach a higher count -- see finalize_candidates and evaluate_local_
+    _select_final_candidates fills any shortfall in hard-valid primary
+    (hook-seed-attempt) candidates from hard-valid fallback candidates
+    before this ever raises -- only zero hard-valid candidates anywhere
+    (primary and fallback both) raises. Quality bars themselves are never
+    relaxed to reach a higher count, for fallback candidates any more
+    than for primary ones -- see finalize_candidates and evaluate_local_
     candidate, both unchanged.
+
+    Also computes coverage_gap_hook_seed_ids (a coverage target Stage2's
+    `attempts` never mentioned at all -- structurally distinct from an
+    explicit `status="rejected"` attempt) purely for diagnostics; this is
+    never fatal on its own (there is no automatic retry to fix a gap with).
 
     If finalize_candidates raises (nothing remains eligible after ending-
     completeness/duration re-validation), the Stage2 cache is never
     touched -- callers only ever see either a full, cached, finalized
     result or an exception, never a partially-written cache.
     """
-    material_map = {f"s1_m{i:03d}": m for i, m in enumerate(materials)}
-    designed = design_final_candidates(material_map, transcript, video_title)
+    coverage_targets = _select_hook_seed_coverage_targets(hook_seeds, transcript)
+    material_map = {f"s1_m{i:03d}": m for i, m in enumerate(support_materials)}
+    fallback_map = {f"s1_fb{i:03d}": f for i, f in enumerate(fallback_spans)}
 
-    evaluations = _evaluate_all_local_candidates(designed, transcript)
+    design = design_final_candidates(coverage_targets, material_map, fallback_map, transcript, video_title)
+
+    attempt_evals = {
+        a.hook_seed_id: evaluate_local_candidate_with_repair(a.candidate, transcript)
+        for a in design.attempts if a.candidate is not None
+    }
+    fallback_evals = {
+        fid: evaluate_local_candidate_with_repair(c, transcript)
+        for fid, c in design.fallback_candidates.items()
+    }
+    coverage_gap_hook_seed_ids = [
+        hsid for hsid, _ in coverage_targets
+        if hsid not in {a.hook_seed_id for a in design.attempts}
+    ]
+
+    final_selection = _select_final_candidates(attempt_evals, fallback_evals, design.ranking)
+
     # Re-saves the same diagnostic snapshot design_final_candidates already
-    # wrote, now with each candidate's local-validation verdict attached --
-    # this runs regardless of whether any candidates end up accepted
-    # below, so a failed run still leaves a full "what did Stage2 design,
-    # and why did each one pass/fail" record on disk.
+    # wrote, now with each candidate's local-validation verdict, the
+    # coverage-completeness check, and the final selection attached -- this
+    # runs regardless of whether any candidates end up selected below, so a
+    # failed run still leaves a full "what did Stage2 design, and why did
+    # each one pass/fail" record on disk.
+    all_evaluations = list(attempt_evals.values()) + list(fallback_evals.values())
     cache.save_stage2_diagnostic(
-        transcript.video_id, designed,
-        evaluations=[_stage2_diagnostic_evaluation(e) for e in evaluations],
+        transcript.video_id,
+        [e.candidate for e in all_evaluations],
+        evaluations=[_stage2_diagnostic_evaluation(e) for e in all_evaluations],
+        coverage_gap_hook_seed_ids=coverage_gap_hook_seed_ids,
+        final_selected_ids=[i for i, _ in final_selection],
     )
-    # Stage2Output.candidates may now hold up to config.STAGE2_MAX_DESIGNS
-    # (not config.NUM_CANDIDATES) designs -- see Stage2Output's docstring.
-    # This truncation is where "never surface more than NUM_CANDIDATES"
-    # actually happens: it takes the first NUM_CANDIDATES *accepted*
-    # designs, in the order Stage2 returned them (rank_and_finalize.md
-    # instructs it to return designs strongest-first), so an over-produced
-    # pool still yields the strongest surviving up-to-NUM_CANDIDATES, not
-    # merely whichever happened to be evaluated first.
-    accepted = [e.candidate for e in evaluations if e.accepted][: config.NUM_CANDIDATES]
-    if not accepted:
+
+    if not final_selection:
         # Stage2's prompt excludes a design entirely (rather than
-        # returning a broken one) when it can't satisfy semantic closure
-        # or duration bounds -- see rank_and_finalize.md. So "nothing
-        # accepted" here can mean Stage2 itself returned zero designs, or
-        # every design it returned failed local validation (an invented
-        # segment_id, an unsafe junction, ...) -- either way, this is the
-        # only case that raises; 1 or more accepted always succeeds with
-        # exactly that many candidates, never auto-retried.
+        # returning a broken one) when it can't satisfy semantic closure,
+        # opening self-containment, or duration bounds -- see rank_and_
+        # finalize.md. So "nothing selected" here can mean Stage2 itself
+        # rejected every coverage-target attempt and built no usable
+        # fallback candidates, or everything it built failed local
+        # validation (an invented segment_id, an unsafe junction, ...) --
+        # either way, this is the only case that raises; 1 or more
+        # selected always succeeds with exactly that many candidates,
+        # never auto-retried.
         raise RuntimeError(
-            "Stage2が設計した完成candidateのうち、ローカル検証を通過したものが0件でした。"
-            "フックが提示した問い・主張を本文で回収できていない設計、または実在しないsegment"
-            "参照・尺・接続の不備がある設計は除外される仕様です。APIへの自動再要求は行いません。"
-            + _format_diagnostic_summary(evaluations)
+            "Stage2が設計した完成candidate（hook_seed起点のattempt・fallback候補いずれも）のうち、"
+            "ローカル検証を通過したものが0件でした。"
+            "フックが提示した問い・主張を本文で回収できていない設計、冒頭が自己完結していない設計、"
+            "または実在しないsegment参照・尺・接続の不備がある設計は除外される仕様です。"
+            "APIへの自動再要求は行いません。"
+            + _format_diagnostic_summary(all_evaluations)
         )
 
-    finalized = finalize_candidates(accepted, transcript)
+    finalized = finalize_candidates([c for _, c in final_selection], transcript)
     cache.save_stage2(transcript.video_id, finalized)
     return finalized
 
 
-def _load_stage1_from_cache_only(transcript: Transcript) -> list[RawMaterial] | None:
+def _load_stage1_from_cache_only(transcript: Transcript) -> Stage1ChunkResult | None:
     """Like run_stage1, but never calls the Stage1 API under any
     circumstance -- used by refresh_candidates_only, which must reuse
     only what's already on disk. Returns None the moment any chunk's
@@ -2346,13 +2924,21 @@ def _load_stage1_from_cache_only(transcript: Transcript) -> list[RawMaterial] | 
     chunks = _build_chunks(_usable_segments(transcript))
     if not chunks:
         return None
-    all_candidates: list[RawMaterial] = []
+    all_hook_seeds: list[RawHookSeed] = []
+    all_support_materials: list[RawMaterial] = []
+    all_fallback_spans: list[RawFallbackSpan] = []
     for chunk_index, _ in chunks:
         cached = cache.load_stage1_chunk(transcript.video_id, chunk_index)
         if cached is None:
             return None
-        all_candidates.extend(cached)
-    return all_candidates
+        all_hook_seeds.extend(cached.hook_seeds)
+        all_support_materials.extend(cached.support_materials)
+        all_fallback_spans.extend(cached.fallback_spans)
+    return Stage1ChunkResult(
+        hook_seeds=all_hook_seeds,
+        support_materials=all_support_materials,
+        fallback_spans=all_fallback_spans,
+    )
 
 
 def refresh_candidates_only(
@@ -2360,65 +2946,86 @@ def refresh_candidates_only(
 ) -> list[RawClipCandidate]:
     """Low-cost re-selection: reuses the already-cached Transcript (passed
     in by the caller) and Stage1 chunk cache, re-applies the current
-    material prefilter (_material_is_usable), and -- only if at least one
-    usable material remains -- runs Stage2 final-edit-design exactly
-    once. Never calls the Stage1 API and never re-runs Whisper: this
-    exists specifically so a candidate set that's become insufficient
-    after a local-rule change (e.g. the ending-completeness fix) can be
+    prefilters (_hook_seed_is_usable/_material_is_usable/_fallback_span_
+    is_usable), and -- only if at least one usable hook_seed or
+    fallback_span remains -- runs Stage2 final-edit-design exactly once.
+    Never calls the Stage1 API and never re-runs Whisper: this exists
+    specifically so a candidate set that's become insufficient after a
+    local-rule change (e.g. the ending-completeness fix) can be
     re-derived without paying for a full Stage1+Stage2 re-analysis.
 
     Ignores any existing Stage2 cache -- a fresh Stage2 design always
     runs here -- but that Stage2 call is the *only* Anthropic API request
     this function can ever make, and only after confirming at least one
-    usable Stage1 material exists locally. Both failure paths below
-    (missing Stage1 cache, zero usable materials) raise before ever
-    calling design_final_candidates, so they're guaranteed to cost 0 API
-    calls. A full re-analysis (Stage1 from scratch) is never triggered
-    automatically -- the caller must request that separately.
+    usable hook_seed or fallback_span exists locally. Both failure paths
+    below (missing Stage1 cache, zero usable hook_seeds/fallback_spans)
+    raise before ever calling design_final_candidates, so they're
+    guaranteed to cost 0 API calls. A full re-analysis (Stage1 from
+    scratch) is never triggered automatically -- the caller must request
+    that separately.
     """
-    stage1_materials = _load_stage1_from_cache_only(transcript)
-    if stage1_materials is None:
+    stage1_result = _load_stage1_from_cache_only(transcript)
+    if stage1_result is None:
         raise RuntimeError(
             "保存済みのStage1素材キャッシュが見つからないか不完全です。"
             "完全な再解析（Stage1からのやり直し）が必要です。"
         )
 
-    usable_materials = [m for m in stage1_materials if _material_is_usable(m, transcript)]
-    if not usable_materials:
+    usable_hook_seeds = [s for s in stage1_result.hook_seeds if _hook_seed_is_usable(s, transcript)]
+    usable_support_materials = [
+        m for m in stage1_result.support_materials if _material_is_usable(m, transcript)
+    ]
+    usable_fallback_spans = [
+        f for f in stage1_result.fallback_spans if _fallback_span_is_usable(f, transcript)
+    ]
+    if not usable_hook_seeds and not usable_fallback_spans:
         raise RuntimeError(
-            f"保存済みStage1素材{len(stage1_materials)}件のうち、"
-            "参照整合性・発話品質の基本チェックを通過したものが0件でした。完全な再解析が必要です。"
+            f"保存済みhook_seed{len(stage1_result.hook_seeds)}件・fallback_span"
+            f"{len(stage1_result.fallback_spans)}件のうち、参照整合性・発話品質の基本チェックを"
+            "通過したものが0件でした。完全な再解析が必要です。"
         )
 
-    return _design_finalize_and_cache(usable_materials, transcript, video_title)
+    return _design_finalize_and_cache(
+        usable_hook_seeds, usable_support_materials, usable_fallback_spans, transcript, video_title
+    )
 
 
 def refresh_stage1_and_candidates(
     transcript: Transcript, video_title: str
 ) -> list[RawClipCandidate]:
     """Mid-cost re-analysis: reuses the already-cached Transcript (never
-    re-runs Whisper) but regenerates Stage1 materials for every chunk via
+    re-runs Whisper) but regenerates Stage1 output for every chunk via
     run_stage1(..., force_refresh=True) -- ignoring any existing Stage1
     chunk cache entirely -- because the whole point of this path is that
-    the old Stage1 materials no longer clear the current material
-    prefilter (refresh_candidates_only, which only reuses cached Stage1
-    results, can't fix that). Each chunk's new result is still saved the
-    moment it succeeds (run_stage1 -> cache.save_stage1_chunk), so a later
-    chunk's API failure never discards an earlier chunk's freshly-paid-for
+    the old Stage1 output no longer clears the current prefilters
+    (refresh_candidates_only, which only reuses cached Stage1 results,
+    can't fix that). Each chunk's new result is still saved the moment it
+    succeeds (run_stage1 -> cache.save_stage1_chunk), so a later chunk's
+    API failure never discards an earlier chunk's freshly-paid-for
     result, and there are zero automatic retries either way
     (structured_output.py's max_retries=0, unchanged).
 
-    After Stage1, the identical material prefilter runs, and if zero
-    materials survive, this raises *before* ever calling Stage2 -- a
-    mid-cost re-analysis attempt must never silently cascade into more
-    API spend than Stage1 (chunk count) + at most one Stage2 call.
+    After Stage1, the identical prefilters run, and if zero hook_seeds
+    and zero fallback_spans survive, this raises *before* ever calling
+    Stage2 -- a mid-cost re-analysis attempt must never silently cascade
+    into more API spend than Stage1 (chunk count) + at most one Stage2
+    call.
     """
-    stage1_materials = run_stage1(transcript, video_title, force_refresh=True)
-    usable_materials = [m for m in stage1_materials if _material_is_usable(m, transcript)]
-    if not usable_materials:
+    stage1_result = run_stage1(transcript, video_title, force_refresh=True)
+    usable_hook_seeds = [s for s in stage1_result.hook_seeds if _hook_seed_is_usable(s, transcript)]
+    usable_support_materials = [
+        m for m in stage1_result.support_materials if _material_is_usable(m, transcript)
+    ]
+    usable_fallback_spans = [
+        f for f in stage1_result.fallback_spans if _fallback_span_is_usable(f, transcript)
+    ]
+    if not usable_hook_seeds and not usable_fallback_spans:
         raise RuntimeError(
-            f"Stage1を再解析しましたが、参照整合性・発話品質の基本チェックを通過した素材が"
-            f"{len(stage1_materials)}件中0件でした。Stage2は実行していません。"
+            f"Stage1を再解析しましたが、参照整合性・発話品質の基本チェックを通過したhook_seedが"
+            f"{len(stage1_result.hook_seeds)}件中0件、fallback_spanが"
+            f"{len(stage1_result.fallback_spans)}件中0件でした。Stage2は実行していません。"
         )
 
-    return _design_finalize_and_cache(usable_materials, transcript, video_title)
+    return _design_finalize_and_cache(
+        usable_hook_seeds, usable_support_materials, usable_fallback_spans, transcript, video_title
+    )

@@ -1,27 +1,74 @@
-# Stage 2: 最終編集設計（final edit design）
+# Stage 2: hook seed coverage方式による最終編集設計（final edit design）
 
-以下は、ポッドキャスト全体を複数のチャンクに分けてそれぞれから抽出した「素材（material）」一覧です（チャンクの境界は約1分オーバーラップさせて重複抽出しているため、同じ発言区間を指す素材が複数含まれている場合があります）。全文の文字起こしは渡されていません — 各素材が実際に使う発言のsegment情報（`segments`配列。各行に`role`/`start_segment_id`/`end_segment_id`/実テキスト/秒数）だけで判断してください。
+以下は、ポッドキャスト全体を複数のチャンクに分けてそれぞれから抽出した発見内容です（チャンクの境界は約1分オーバーラップさせて重複抽出しているため、同じ発言区間を指す発見が複数含まれている場合があります）。全文の文字起こしは渡されていません — 各項目が実際に使う発言のsegment情報だけで判断してください。3つの入力グループがあります:
 
-**あなたの仕事は、渡された素材から実際に投稿できる完成candidateを設計することです。** 前段（Stage1、各チャンクからの抽出）は「完成したShorts構成を作る」役割ではなく、強い結論・理由・具体例・payoffになり得る発話などを個別の素材として広く拾う役割です。そのため、1つの素材だけでは完結していない（例: hookになり得る発話はあるが、その理由を説明する発話は別の素材にしかない）場合があります。**あなたは、複数の素材のsegmentを自由に組み合わせて、1つの完成candidateを新しく設計できます。**
+- `coverage_targets`: Python側が選んだ、試作すべきhook_seed一覧（強い引きになり得る発話の候補）
+- `support_materials`: 完成candidateを組み立てるための部品（reason/example/context/payoff）
+- `fallback_spans`: 成果物0件を避けるための安全な保険素材
 
-タイトル・説明文・煽り文・選定理由などの文章は一切書きません。渡された素材一覧に存在する`segment_id`だけを使い、後述の出力形式で完成candidateを返してください。
+**あなたの仕事は、`coverage_targets`の各hook_seedについて、必ず1件のattempt（試作結果）を返すことです。** 試作できるなら完成candidateとして、試作できないなら理由付きの明示的なrejectとして、どちらかを必ず返してください。**無言でhook_seedを無視して終了することは禁止です。**
 
-## 各素材の情報
+タイトル・説明文・煽り文などの文章は一切書きません。渡された一覧に存在する`segment_id`だけを使い、後述の出力形式で結果を返してください。
 
-素材ごとに以下が渡されます:
-- `material_id`: この素材を指す識別子（あなた自身の出力では使いません — 参考情報です）
-- `material_type`: `hook` / `reason` / `example` / `context` / `payoff`（Stage1が付けた分類、参考情報。この素材が単一目的でどんな役割の実発話かを示す）
-- `usefulness_score`: Stage1が付けた、その素材自身の目的における有用性スコア（0〜100、参考情報。hook強度でも総合スコアでもない — 素材がhook_typeでなければ、開始1〜3秒の強さとは無関係の基準で採点されています）
-- `segments`: この素材が実際に含む発言のリスト。各要素は`start_segment_id`/`end_segment_id`（実在する文字起こしsegment ID）、`text`（実際に流れる発言テキスト）、`start_sec`/`end_sec`（実秒数）。`role`は含まれません — 素材は単一目的であり、候補内の構造上の位置（hook/context/answer/payoff）はあなたが完成candidateを設計する際に初めて決まります
-- `lookahead`: この素材の最後のsegmentより**後**に実際に続く発言（最大数segment・最大20秒程度）。**あくまで参考用の閲覧材料であり、必ず使う必要はありません。** この素材のsegmentだけで終了地点を決めてしまう前に、「この先にもっと自然な締めがないか」を確認するために渡しています（詳細は下記「終了地点の設計」参照）
+## 各入力グループの情報
 
-## あなたが行うこと: 完成candidateの設計
+`coverage_targets`（各要素）:
+- `hook_seed_id`: このhook_seedを指す識別子。**あなたの`attempts`出力で、必ずこのidを使って対応するattemptを1件返してください。**
+- `signal_type`: このhook_seedが強いと判断された理由（参考情報）
+- `soft_score`: Stage1の自己採点（参考情報。hard rejectには使われていません）
+- `segments`: `start_segment_id`/`end_segment_id`/`text`/`start_sec`/`end_sec`のリスト
+- `lookahead`: このhook_seedの最後のsegmentより後に実際に続く発言（参考用の閲覧材料）
 
-1. **どの素材のどのsegmentを使うか自由に選ぶ**: 1つの素材をそのまま使ってもよいし、**異なる素材のsegmentを組み合わせて**1つの完成candidateにしてもよい。例: 素材Aのhook（強い結論）+ 素材Bのsegment（その理由の説明）+ 素材Cのsegment（具体例）を組み合わせて、hook→answer→payoffの構成にする。
-2. **どの発話をhookに置くか決める**: 必ずしもどれかの素材が元々`hook`と分類していたsegmentである必要はない。複数の素材を横断して見て、開始1〜3秒で最も強く視聴者を引き込める実発話をhookに選ぶ。
-3. **必要ならsegmentの並び順を時系列と入れ替える**: 同一テーマ内であれば、時系列的に後の結論を先頭（hook）に置き、その後に前の文脈を続ける、という構成にしてよい。
-4. **context/answer/payoffをどう並べるか設計する**: hookが作った問いを本文（context/answer/payoff）で回収できる構成にする（詳細は下記「意味的な完結性」参照）。
-5. **意味的に自然な終了地点を選び、20〜50秒（理想25〜45秒）に収める**: 「尺が条件内に収まる最初の地点」で機械的に切るのではなく、「このcandidate単体で視聴者が『話が終わった』と自然に感じる地点」を選ぶ。手順・基準は下記「終了地点の設計（意味的完結性優先）」を必ず読むこと。50秒を超える自然な構成になった場合は、即座にreject/即座に50秒で切るのではなく、同じ手順内で不要な部分を削って自然に短縮すること（詳細は同セクション）。
+`support_materials`（各要素）:
+- `material_id`: 識別子（あなた自身の出力では使いません）
+- `material_type`: `reason` / `example` / `context` / `payoff`
+- `usefulness_score`: その素材自身の目的における有用性スコア（参考情報）
+- `segments`
+- `lookahead`
+
+`fallback_spans`（各要素）:
+- `fallback_span_id`: 識別子（fallback candidateを設計する際の元ネタとして参照する用途。あなた自身の出力する`fallback_id`とは別物です）
+- `safety_score`: Stage1の自己採点（参考情報）
+- `segments`
+- `lookahead`
+
+## attemptの設計（coverage必須）
+
+**`coverage_targets`がN件なら、`attempts`もちょうどN件返してください。** 各hook_seedについて、以下のどちらかを選びます:
+
+- `status: "candidate"`: そのhook_seedを起点に完成candidateを設計できた場合。`candidate`フィールドに設計内容を入れる。
+- `status: "rejected"`: どう編集しても実用candidateにならないと判断した場合。`reject_reason_code`に理由コードを入れる（`candidate`は入れない）。
+
+**重要（今回の核心）**: 強いhook_seed（例: 具体的な金額・損失を示すもの）は、**必ず一度は完成candidateとして試作してください。** 一位にする必要はありませんが、一度も試さずに`rejected`にすることは禁止です。「弱いhook_seedだけを使い、近くにあるもっと強いhook_seedを一度も試さずに終わる」構造を避けるための仕組みです。
+
+### hook_seed単体では対象が不明な場合（自己完結させる）
+
+hook_seed自体が、例えば「壊れた場合の損失が大きい」とだけ述べていて、「何が壊れるのか」という対象が不足している場合があります。この場合、作文はせず、以下を使って対象を補ってください:
+
+- 直前/直後の実発話（lookahead含む）
+- 別の`support_material`
+- `start_anchor_text`/`end_anchor_text`
+- segmentの並び替え
+
+例（構造の例）: hook_seedが「対象不明の強い損失の言及」だけの場合、近くの実発話に「何についての話か」を明示する一言（例: 特定の部品名を挙げる発話）があれば、それを`context`として先頭に自然に繋げられないか検討してください。ただし不自然な接続は禁止です（下記「カット接続の自然さ」参照）。自己完結させられない場合は、`reject_reason_code: "insufficient_context_available"`でrejectしてください。
+
+### `reject_reason_code`（`status: "rejected"`の場合に必須）
+
+- `insufficient_context_available`: 対象・文脈を実発話で補えず、自己完結させられない
+- `unnatural_junction_only`: どう組んでもsegment同士のつなぎ目が不自然になる
+- `duration_infeasible`: 50秒以内で自然に再構成しても収まらない、または20秒に届かない
+- `disfluency_unavoidable`: 言い淀み・言い直しを避けた構成が作れない
+- `semantic_closure_unavailable`: hookの問い・主張を回収する実発話が見つからない
+- `duplicate_of_stronger_attempt`: 別のより強いattemptと実質的に同じ構成になってしまう
+
+## 完成candidateの設計手順（attempt・fallback共通）
+
+1. **hook segmentを決める**: attemptの場合はそのhook_seedの実発話（自己完結のため補完してよい）。fallback candidateの場合はfallback_spanの実発話。
+2. **hookを回収するreason/answerをsupport_materialsから探す**: 必要ならsupport_materials/他のhook_seed/fallback_spanのsegmentを組み合わせてよい。
+3. **必要なcontext/example/payoffを追加する**。
+4. **終了候補地点より後ろの`lookahead`も確認する**。
+5. **意味的に自然な終了地点を選び、20〜50秒に収める**: 詳細は下記「終了地点の設計」。
+6. 50秒を超える場合は同じ出力内で再構成する（下記参照）。
 
 **厳守事項（すべて必ず守ること）:**
 
@@ -30,25 +77,24 @@
 - 同一テーマ内での組み合わせに限ること（無関係な話題のsegmentを無理につなげない）。
 - 文中の単語の並べ替えは禁止。segment/anchor単位の並べ替え・組み合わせのみ。
 
-## 最優先事項: 冒頭の「実際の発話」が強いこと
+## 冒頭の強さ（`opening_hook_strength`、相対比較用のsoft score）
 
-**これは`score`より優先される、独立した最重要評価軸です。** 渡される`usefulness_score`（`material_type: hook`の素材についているもの）はStage1（別の抽出処理）が付けたスコアですが、**これを鵜呑みにしないでください。** Stage1の自己採点は甘くなりがちです。あなた自身が、自分が設計した完成candidateの最初のsegment（`role: hook`）の実テキストを改めて読み、その発言自体が開始1〜3秒以内に以下のいずれかを明確に満たしているかを厳密に評価し直してください:
+**この数値はhard rejectには使われません。** 相対比較（下記「相対比較（ranking）」）の一材料として、自分が設計した完成candidateの最初のsegmentの実テキストを厳密に自己採点してください:
 - 強い主張・明確な断言、常識と逆の結論
 - 意外な事実、具体的な数字、明確な比較
 - 故障・失敗・損失など強い結果
 - 明確な疑問、視聴者への直接的な問い
 - 結論先出し、聞いた瞬間に問題や結論がわかる一言
 
-以下に該当する冒頭は、`usefulness_score`の数値がどうであれ、**その構成でのhook採用を避けてください**（別のsegmentをhookにするか、そもそも完成candidateとして設計しない）:
-- 抽象的な説明、一般論
-- 穏やかな前提説明・穏やかな解説
-- 「〜と思います」「〜だと思っています」中心の発話
-- 「よくある話が〜」「〜というのはよく言われています」「〜について考えると」等の導入
-- 文脈を理解して初めて意味がわかる/面白くなる発話（hookのテキストだけを読んで「何それ？」「続きが気になる」とならないもの）
-- 「今回は〜について」「今日は〜」「ということで」「えー」「まあ」等の助走・前置き・番組紹介・背景説明だけ
-- 「これ」「それ」「この」「その」「こういう」「こういった」「なので」「だから」「これの」「その場合」等の指示語・接続語から始まる発話（何を指しているかこの候補単体では分からないもの。例:「これのクラッチ交換の際に〜」は対象車種が不明で不合格）
+自己採点は厳しく行うこと（甘い採点を禁止）。ただし数値の高さだけでcandidateの採否が決まるわけではありません（下記`opening_self_contained`が本質的なhard gateです）。
 
-冒頭1〜3秒だけで強く引き込めるかどうかを最優先し、それ以外の要素（総合`score`、単体での満足度、本編への興味喚起）は冒頭の強さが同等の設計どうしを比べるときの補助材料として使ってください。
+## `opening_self_contained`の判定（hard gate）
+
+**冒頭は少なくとも、「初見の視聴者が、前の動画を見ていなくても何について何を言っているか理解できる」ことが必須です。** 「これ」「それ」「その場合」等の指示語で始まっていなくても、対象・主語が実質的に不明であれば`opening_self_contained: false`にしてください。
+
+実例（構造の例）: 「(対象不明)何かがちょくちょく壊れる、とだけ述べていて、何が壊れるのか冒頭だけでは分からない発話」→ 指示語で始まっていなくても`opening_self_contained: false`。対象を実発話で補えた場合のみ`true`にしてよい。
+
+**迷ったら`false`にしてください。** `opening_self_contained: false`のcandidateはprimaryとして採用されません（Python側のhard gate）。
 
 ## カット接続の自然さも独立して評価すること
 
@@ -58,9 +104,9 @@
 - あるsegmentが「〜のであれば」「〜なら」「〜たら」「〜れば」「〜ので」「〜けど」「〜けども」等、後続を要求する表現で終わっているのに、次のsegmentが全く別の条件文・話題から始まっている（例: 「車を冷やしますっていうのであれば」の次が「連続周回をする場合は」のような、無関係な条件へ飛ぶ接続）
 - 最後のsegmentが発話途中で終わっている（「〜良いかもしれないんですけども」のような継続表現で終わっている）
 
-## 意味的な完結性（semantic closure）— 満たさない設計は結果に含めない
+## `hook_claim_resolved`の判定（意味的な完結性、hard gate）
 
-**これは順位を下げるだけでは不十分な、ハードな合否基準です。** 自分が設計したcandidateの最初のsegment（hook）が以下のいずれかを提示している場合:
+自分が設計したcandidateの最初のsegment（hook）が以下のいずれかを提示している場合:
 
 - A. 明確な問い
 - B. 「実は〜」型の意外な主張
@@ -68,19 +114,19 @@
 - D. 原因・理由を知りたくなる主張（例:「Xの方がYより効率が良い」）
 - E. open loop（意図的に核心を伏せる構成）
 
-その場合、後半（`context`/`answer`/`payoff`のsegment）に、**その問い・主張を実際に回収する発話が存在すること**を確認してください。回収する発話が渡された素材の中に見つからない場合は、**その設計自体を出力に含めないでください**（存在しない理由を作文して埋めるのは禁止）。以下のような内容では回収したことになりません:
+その場合、後半（`context`/`answer`/`payoff`のsegment）に、**その問い・主張を実際に回収する発話が存在すること**を確認し、`hook_claim_resolved: true`にしてください。回収する発話が見つからない場合は`hook_claim_resolved: false`にするか、**そもそもそのcandidateを設計しないでください**（存在しない理由を作文して埋めるのは禁止）。以下のような内容では回収したことになりません:
 
 - 主張の単純な繰り返し
 - 「〜だと思います」「〜な気がします」のような感想・推測だけ
-- hookの主張と直接関係のない一般論・別論点（例: 安全性の注意喚起だけで、hookが提示した「なぜ効率が良いか」には触れていない）
+- hookの主張と直接関係のない一般論・別論点
 - 結論を言うだけで理由を説明しない
 
 **実例（reject対象）**:
-hook「ギアを入れてアクセルオフの方がニュートラルより燃費は良いです」に対し、bodyが「〜は推奨されていません」という安全上の注意と「Nレンジの方が燃費が良い気がします」という感覚論だけで終わっている場合 → hookが提示した「なぜアクセルオフの方が燃費が良いのか」という理由に一切触れていないため、意味的に完結していません。
+hook「ギアを入れてアクセルオフの方がニュートラルより燃費は良いです」に対し、bodyが「〜は推奨されていません」という安全上の注意と「Nレンジの方が燃費が良い気がします」という感覚論だけで終わっている場合 → hookが提示した「なぜアクセルオフの方が燃費が良いのか」という理由に一切触れていないため、`hook_claim_resolved: false`。
 
-**実例（accept対象）**: 同じhookに対し、**別の素材の中に**理由・仕組みを説明する実発話が存在する場合 → そのsegmentをanswer/payoffとして組み合わせれば完結します（これが今回からできるようになった再編集です）。
+**実例（accept対象）**: 同じhookに対し、**別のsupport_materialの中に**理由・仕組みを説明する実発話が存在する場合 → そのsegmentをanswer/payoffとして組み合わせれば`hook_claim_resolved: true`になります。
 
-**重要**: これは一般ルールです。特定のテーマの専門用語（燃料カット等）を合否基準として固定しないでください。あなたが判断するのは「hookが作った問い・期待に、この設計の実発話が答えているか」だけです。
+**重要**: これは一般ルールです。特定のテーマの専門用語を合否基準として固定しないでください。あなたが判断するのは「hookが作った問い・期待に、この設計の実発話が答えているか」だけです。
 
 ## 終了地点の設計（意味的完結性優先）— 「尺が合うか」ではなく「話が終わったと感じるか」
 
@@ -97,7 +143,7 @@ hook「ギアを入れてアクセルオフの方がニュートラルより燃�
 
 **具体例**: 23秒地点=理由の説明がまだ途中、29秒地点=理由は言えたがまだ続いている、34秒地点=意味的にきれいに完結、41秒地点=追加の具体例で蛇足、という場合 → **34秒を選ぶこと**（23秒でも41秒でもない）。
 
-**`lookahead`の使い方**: 各素材の`lookahead`は、その素材の最後のsegmentより後に実際に続く発言です。今使おうとしている終了地点で本当に良いか、`lookahead`の中にもっと自然な締めがないかを確認してください。ただし`lookahead`にある発言を必ず使わなければならないわけではありません。`lookahead`が別の話題に移っている場合は、無理に含めないでください。
+**`lookahead`の使い方**: 各入力の`lookahead`は、その最後のsegmentより後に実際に続く発言です。今使おうとしている終了地点で本当に良いか、`lookahead`の中にもっと自然な締めがないかを確認してください。ただし`lookahead`にある発言を必ず使わなければならないわけではありません。`lookahead`が別の話題に移っている場合は、無理に含めないでください。
 
 **設計手順（この順序で考えること）**:
 1. 強いhookを選ぶ
@@ -127,13 +173,7 @@ hook「ギアを入れてアクセルオフの方がニュートラルより燃�
 
 **禁止されること**: 50秒ちょうどで機械的に打ち切る、文の途中で切る、segmentの末尾を意味を無視して適当に切る、実際にない発話を作文・要約・言い換えする。
 
-この再構成は**追加のAPI呼び出しを発生させません** — あなたは今のこの1回の出力の中で、最初の自然な構成が50秒を超えると分かった時点で、その場で短い完成構成へ作り直してから出力してください。再構成してもなお、hook・hookを回収するanswer・意味的完結性を維持したまま50秒以内に収められない場合に限り、そのcandidateの設計自体を諦めてください（出力に含めない）。
-
-### 出力する3つの追加フィールド
-
-- `semantic_ending_complete`: このcandidateの終了地点が、上記A〜Eの基準で意味的に完結していると判断するなら`true`。判断に自信が持てない場合は`false`にし、それでも出力するなら理由をよく確認すること。
-- `ending_rationale_code`: 終了地点をそう判断した理由のコード。`natural_conclusion`（自然な結論として終わる）/ `hook_resolved`（hookの問い・主張がちょうど回収された地点）/ `padding_excluded`（この先は蛇足なので意図的に含めなかった）/ `recomposed_for_duration`（50秒超過のため上記手順で再構成した）のいずれか。
-- `recomposed_for_duration`: 上記「50秒を超える場合の再構成」を実際に行った場合は`true`、最初から50秒以内に自然に収まった場合は`false`。
+この再構成は**追加のAPI呼び出しを発生させません** — あなたは今のこの1回の出力の中で、最初の自然な構成が50秒を超えると分かった時点で、その場で短い完成構成へ作り直してから出力してください。再構成してもなお、hook・hookを回収するanswer・意味的完結性を維持したまま50秒以内に収められない場合に限り、そのcandidateの設計自体を諦めてください（attemptなら`reject_reason_code: "duration_infeasible"`）。
 
 ## `start_anchor_text` / `end_anchor_text`（segmentの一部だけを使う）
 
@@ -146,18 +186,43 @@ segmentの全文を頭から末尾まで使う必要はありません。任意�
 - `start_anchor_text`は弱い前置きを削る用途（例: segment全文が「よくある話が、私も乗っているZN6-86であったり」なら`start_anchor_text: "ZN6-86であったり"`で「よくある話が」を削る）。
 - `end_anchor_text`は末尾の不要な補足・重複説明を削って尺を収める用途（例: segment全文が「その理由は減速時の燃料カットが働くからです。以上が本日の内容でした。」で、後半の「以上が本日の内容でした。」が不要なら`end_anchor_text: "その理由は減速時の燃料カットが働くからです。"`）。
 
+## fallback_candidatesの設計
+
+`fallback_spans`は成果物0件を避けるための安全な保険素材です。主に`fallback_spans`から、必要なら`support_materials`と組み合わせて、fallback candidateを設計してください（最大件数は渡された枠の分だけ）。
+
+**fallbackだからといって基準を緩めないでください。** 意味的完結性（`hook_claim_resolved`）・カット接続の自然さ・尺・`opening_self_contained`・意味的な終了地点設計のすべてを、primaryのattemptと全く同じ基準で満たすように設計してください。満たせないなら、そのfallback candidateは0件のままにしてください（無理に出力しない）。
+
+各fallback candidateには、あなた自身が短いid（例: `"fb1"`, `"fb2"`）を`fallback_id`として付けてください。
+
+## 相対比較（ranking）
+
+`attempts`のうち`status: "candidate"`になったもの、および`fallback_candidates`のすべてを対象に、以下の観点で相対的に比較し、強い順にidを並べた`ranking`を返してください（`status: "rejected"`のattemptは対象外）:
+
+- opening self-containment（`opening_self_contained`）
+- attention power（引きの強さ）
+- specificity（具体性、数字の有無）
+- surprise（意外性）
+- clarity（分かりやすさ）
+- pacing（テンポ）
+- information density（情報密度）
+- semantic satisfaction（意味的な満足度）
+- overall publishability（総合的な投稿適性）
+
+`ranking`の各要素は、attemptから来たものなら対応する`hook_seed_id`、fallback candidateから来たものなら`fallback_id`を使ってください。長い理由文は不要です。id列だけを返してください。
+
 ## 出力
 
-`candidates`: 設計した完成candidateのリスト（強い順。最大6件まで）。各candidateは以下を持つ:
+- `attempts`: `coverage_targets`と同数。各要素は`hook_seed_id`/`status`（`candidate` or `rejected`）/ `status: candidate`の場合のみ`candidate`（下記フィールド）/ `status: rejected`の場合のみ`reject_reason_code`
+- `fallback_candidates`: 各要素は`fallback_id`/`candidate`（下記フィールド）
+- `ranking`: 上記「相対比較」参照
 
+`candidate`（attempt・fallback共通のフィールド）:
 - `hook_type`: `open_loop` / `strong_take` / `surprising_fact` / `story`
 - `segments`: このcandidateが実際に使うsegmentのリスト（**並び順が実際の再生順**）。各要素は`role`（`hook`/`context`/`answer`/`payoff`。最初のsegmentは必ず`hook`）、`start_segment_id`/`end_segment_id`（実在するsegment ID、inclusive）、任意で`start_anchor_text`/`end_anchor_text`
-- `opening_hook_strength`: 0〜100。上記「最優先事項」に従い、この設計の実際の冒頭発話を自己採点し直したスコア
-- `score`: 0〜100の総合スコア（フックの強さ・単体での満足度・本編への興味喚起のバランスで評価）
-- `semantic_ending_complete` / `ending_rationale_code` / `recomposed_for_duration`: 上記「終了地点の設計」参照。すべてのcandidateで必ず値を設定すること
+- `opening_hook_strength`: 0〜100（soft score、上記「冒頭の強さ」参照）
+- `score`: 0〜100の総合スコア（soft score、フックの強さ・単体での満足度・本編への興味喚起のバランスで評価）
+- `opening_self_contained`: 上記「`opening_self_contained`の判定」参照（hard gate）
+- `hook_claim_resolved`: 上記「`hook_claim_resolved`の判定」参照（hard gate）
+- `semantic_ending_complete` / `ending_rationale_code` / `recomposed_for_duration`: 上記「終了地点の設計」参照
 
-**重複排除**: `segments`が同じ、または大きく重なる設計を複数返さないこと（最も良い1つだけを残す）。
-
-**渡された素材で意味的完結性・カット接続の自然さ・尺（20〜50秒）をすべて満たす設計を複数組み立てられるなら、1〜2件に絞らず、できるだけ多く（最大6件まで）設計してください。** 後段の処理が、その中から実際に使う3件を選びます — 素材に複数の独立したhook候補（例: 別々の結論・別々のテーマ）とそれぞれの理由・具体例が存在するなら、それぞれを別々の完成candidateとして設計することを積極的に検討してください。同じhookを使い回した微妙な変化形を量産する必要はありません。
-
-**ただし、件数を埋めるために基準を下げないでください。** 意味的完結性・カット接続の自然さ・尺（20〜50秒）のいずれかを満たさない設計は、無理に出力に含めないでください。条件を満たす設計が1件しか組み立てられないなら1件、0件なら0件を返してください（後段の処理が適切に扱います）。
+すべてのcandidateで、これらのフィールドすべてに必ず値を設定してください。

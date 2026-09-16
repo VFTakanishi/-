@@ -57,14 +57,16 @@ class _FakeClient:
 
 
 def test_call_returns_parsed_model_on_end_turn(monkeypatch):
-    valid_json = Stage1Output(materials=[]).model_dump_json()
+    valid_json = Stage1Output(hook_seeds=[], support_materials=[], fallback_spans=[]).model_dump_json()
     response = _FakeResponse(stop_reason="end_turn", content=[_FakeTextBlock(valid_json)])
     monkeypatch.setattr(structured_output, "_client", lambda: _FakeClient(response))
 
     result = structured_output.call(
         Stage1Output, stage="Stage1", system_prompt="sys", user_content="user", max_tokens=100
     )
-    assert result.materials == []
+    assert result.hook_seeds == []
+    assert result.support_materials == []
+    assert result.fallback_spans == []
 
 
 def test_call_raises_without_parsing_on_max_tokens(monkeypatch):
@@ -223,7 +225,7 @@ def test_stage1_request_body_has_no_unsupported_constraint_keys():
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         captured["request"] = request
-        return _message_response(text=json.dumps({"materials": []}))
+        return _message_response(text=json.dumps({"hook_seeds": [], "support_materials": [], "fallback_spans": []}))
 
     client = _client_with_mock_transport(handler)
     real_client = structured_output._client
@@ -236,7 +238,9 @@ def test_stage1_request_body_has_no_unsupported_constraint_keys():
     finally:
         structured_output._client = real_client
 
-    assert result.materials == []
+    assert result.hook_seeds == []
+    assert result.support_materials == []
+    assert result.fallback_spans == []
 
     body = json.loads(captured["request"].content)
     assert body["model"]
@@ -268,7 +272,7 @@ def test_stage2_request_body_has_no_unsupported_constraint_keys_and_no_tools():
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         captured["request"] = request
-        return _message_response(text=json.dumps({"candidates": []}))
+        return _message_response(text=json.dumps({"attempts": [], "fallback_candidates": [], "ranking": []}))
 
     client = _client_with_mock_transport(handler)
     real_client = structured_output._client
@@ -281,7 +285,9 @@ def test_stage2_request_body_has_no_unsupported_constraint_keys_and_no_tools():
     finally:
         structured_output._client = real_client
 
-    assert result.candidates == []
+    assert result.attempts == []
+    assert result.fallback_candidates == []
+    assert result.ranking == []
 
     body = json.loads(captured["request"].content)
     assert body["max_tokens"] == 512
@@ -310,7 +316,7 @@ def test_thinking_is_disabled_for_sonnet_5():
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         captured["request"] = request
-        return _message_response(text=json.dumps({"materials": []}))
+        return _message_response(text=json.dumps({"hook_seeds": [], "support_materials": [], "fallback_spans": []}))
 
     client = _client_with_mock_transport(handler)
     real_client = structured_output._client
@@ -329,52 +335,46 @@ def test_thinking_is_disabled_for_sonnet_5():
 
 def test_stage1_output_max_json_size_is_well_under_max_tokens():
     """Documents and guards the audit finding that motivated disabling
-    thinking: the worst-case Stage1Output JSON (config.STAGE1_MAX_
-    CANDIDATES_PER_CHUNK materials, 3 segments each, long enum values,
-    3-digit segment ids, a max-length start_anchor_text on every segment)
-    is far smaller than STAGE1_MAX_OUTPUT_TOKENS, so a
-    stop_reason="max_tokens" truncation is not explained by the final JSON
-    itself -- it pointed at something else consuming the token budget
-    (adaptive thinking).
+    thinking: the worst-case Stage1Output JSON (max hook_seeds/support_
+    materials/fallback_spans, long enum values, 3-digit segment ids, a
+    max-length start_anchor_text on every segment) is far smaller than
+    STAGE1_MAX_OUTPUT_TOKENS, so a stop_reason="max_tokens" truncation is
+    not explained by the final JSON itself -- it pointed at something else
+    consuming the token budget (adaptive thinking).
 
-    Re-audited when STAGE1_MAX_CANDIDATES_PER_CHUNK was raised 3 -> 6 (to
-    widen Stage1's search breadth after MIN_OPENING_HOOK_STRENGTH went up
-    to 80): worst case grew from ~820 to ~1624 chars (~234 -> ~464
-    estimated tokens). Re-audited again when Stage1SegmentOutput gained the
-    optional start_anchor_text field (max_length=60): worst case grew to
-    ~3118 chars (~891 estimated tokens) with every segment carrying a
-    max-length anchor -- still comfortably under half of
-    STAGE1_MAX_OUTPUT_TOKENS=2048, so the ceiling was left unchanged both
-    times. Re-audited again for the Stage1 material-contract fix (Stage1
-    now emits Stage1MaterialOutput -- material_type/segments/
-    usefulness_score -- instead of Stage1CandidateOutput): the per-item
-    payload is strictly smaller (no hook_type/opening_hook_strength/score),
-    so this only shrinks further; still guarded here to catch a future
-    regression.
+    Re-audited for the hook-seed-discovery redesign (Stage1Output's single
+    `materials` list became three independently-capped groups -- hook_
+    seeds/support_materials/fallback_spans): see tests/test_clip_selector.
+    py's own test_stage1_output_max_json_size_is_well_under_max_tokens for
+    the up-to-date worst-case construction across all three groups; this
+    test is kept as this module's own guard (against
+    STAGE1_MAX_OUTPUT_TOKENS specifically, in the module that owns the
+    thinking-disabled hypothesis) so a future regression is caught from
+    either angle.
     """
     from podcast_clipper import config
-    from podcast_clipper.clip_selector import Stage1MaterialOutput, Stage1MaterialSegmentOutput
-
-    material = Stage1MaterialOutput(
-        material_type="hook",
-        segments=[
-            Stage1MaterialSegmentOutput(
-                start_segment_id=123, end_segment_id=124,
-                start_anchor_text="あ" * 60,
-            ),
-            Stage1MaterialSegmentOutput(
-                start_segment_id=125, end_segment_id=126,
-                start_anchor_text="い" * 60,
-            ),
-            Stage1MaterialSegmentOutput(
-                start_segment_id=127, end_segment_id=128,
-                start_anchor_text="う" * 60,
-            ),
-        ],
-        usefulness_score=95,
+    from podcast_clipper.clip_selector import (
+        Stage1FallbackSpanOutput,
+        Stage1HookSeedOutput,
+        Stage1MaterialSegmentOutput,
+        Stage1SupportMaterialOutput,
     )
+
+    seg = Stage1MaterialSegmentOutput(start_segment_id=123, end_segment_id=124, start_anchor_text="あ" * 60)
+    hook_seeds = [
+        Stage1HookSeedOutput(signal_type="surprising_fact", segments=[seg, seg], soft_score=90)
+        for _ in range(config.STAGE1_MAX_HOOK_SEEDS_PER_CHUNK)
+    ]
+    support_materials = [
+        Stage1SupportMaterialOutput(material_type="context", segments=[seg, seg, seg], usefulness_score=90)
+        for _ in range(config.STAGE1_MAX_SUPPORT_MATERIALS_PER_CHUNK)
+    ]
+    fallback_spans = [
+        Stage1FallbackSpanOutput(segments=[seg, seg, seg], safety_score=90)
+        for _ in range(config.STAGE1_MAX_FALLBACK_SPANS_PER_CHUNK)
+    ]
     worst_case = Stage1Output(
-        materials=[material] * config.STAGE1_MAX_CANDIDATES_PER_CHUNK
+        hook_seeds=hook_seeds, support_materials=support_materials, fallback_spans=fallback_spans
     )
     text = worst_case.model_dump_json()
 
@@ -388,7 +388,7 @@ def test_stage1_output_max_json_size_is_well_under_max_tokens():
     assert estimated_tokens < config.STAGE1_MAX_OUTPUT_TOKENS / 2, (
         f"worst-case Stage1Output JSON is {char_count} chars (~{estimated_tokens:.0f} "
         f"estimated tokens) -- unexpectedly close to STAGE1_MAX_OUTPUT_TOKENS="
-        f"{config.STAGE1_MAX_OUTPUT_TOKENS}; the max_tokens=2048 incident may no "
+        f"{config.STAGE1_MAX_OUTPUT_TOKENS}; the max_tokens truncation incident may no "
         "longer be explained by non-JSON token consumption (e.g. thinking)."
     )
 
@@ -442,36 +442,45 @@ def test_pseudo_api_boundary_e2e_reaches_three_final_candidates(monkeypatch):
     transcript = _fixture_transcript()
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    monkeypatch.setattr(config, "MIN_OPENING_HOOK_STRENGTH", 60)
     monkeypatch.setattr(config, "CHUNK_MINUTES", 100.0)  # single chunk
     monkeypatch.setattr(config, "CHUNK_OVERLAP_MINUTES", 0.0)
 
     stage1_payload = json.dumps({
-        "materials": [
+        "hook_seeds": [
             {
-                "material_type": "hook",
+                "signal_type": "strong_claim",
                 "segments": [{"start_segment_id": i, "end_segment_id": i}],
-                "usefulness_score": 90,
+                "soft_score": 90,
             }
             for i in range(3)
-        ]
+        ],
+        "support_materials": [],
+        "fallback_spans": [],
     })
 
     call_log = []
 
+    def _candidate(i):
+        return {
+            "hook_type": "story",
+            "segments": [{"role": "hook", "start_segment_id": i, "end_segment_id": i}],
+            "opening_hook_strength": 90,
+            "score": 80,
+            "opening_self_contained": True,
+            "hook_claim_resolved": True,
+            "semantic_ending_complete": True,
+            "ending_rationale_code": "natural_conclusion",
+            "recomposed_for_duration": False,
+        }
+
+    hook_seed_ids = [f"s1_hookseed_{i:03d}" for i in range(3)]
     stage2_payload = json.dumps({
-        "candidates": [
-            {
-                "hook_type": "story",
-                "segments": [{"role": "hook", "start_segment_id": i, "end_segment_id": i}],
-                "opening_hook_strength": 90,
-                "score": 80,
-                "semantic_ending_complete": True,
-                "ending_rationale_code": "natural_conclusion",
-                "recomposed_for_duration": False,
-            }
-            for i in range(3)
-        ]
+        "attempts": [
+            {"hook_seed_id": hsid, "status": "candidate", "candidate": _candidate(i)}
+            for i, hsid in enumerate(hook_seed_ids)
+        ],
+        "fallback_candidates": [],
+        "ranking": hook_seed_ids,
     })
 
     def handler(request: httpx2.Request) -> httpx2.Response:

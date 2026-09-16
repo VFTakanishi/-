@@ -3,18 +3,25 @@ from pydantic import ValidationError
 
 from podcast_clipper import boundary, cache, clip_selector, config
 from podcast_clipper.clip_selector import (
-    Stage1MaterialOutput,
+    Stage1FallbackSpanOutput,
+    Stage1HookSeedOutput,
     Stage1MaterialSegmentOutput,
     Stage1Output,
+    Stage1SupportMaterialOutput,
+    Stage2AttemptOutput,
     Stage2CandidateOutput,
+    Stage2FallbackCandidateOutput,
     Stage2Output,
     Stage2SegmentOutput,
 )
 from podcast_clipper.models import (
     RawClipCandidate,
+    RawFallbackSpan,
+    RawHookSeed,
     RawMaterial,
     RawMaterialSegment,
     RawUsedSegment,
+    Stage1ChunkResult,
     Transcript,
     TranscriptSegment,
     TranscriptWord,
@@ -78,12 +85,13 @@ def test_usable_segments_excludes_only_when_explicitly_configured(monkeypatch):
     assert len(usable) < len(transcript.segments)
 
 
-def _raw_candidate(start_id, end_id, role="hook", opening_hook_strength=80, score=80):
+def _raw_candidate(start_id, end_id, role="hook", opening_hook_strength=80, score=80, **kwargs):
     return RawClipCandidate(
         hook_type="story",
         segments=[RawUsedSegment(role=role, start_segment_id=start_id, end_segment_id=end_id)],
         hook_text="h", opening_hook_strength=opening_hook_strength, title="", description="",
         score=score, reasoning="", caveats="",
+        **kwargs,
     )
 
 
@@ -92,6 +100,110 @@ def _raw_material(start_id, end_id, material_type="hook", usefulness_score=80):
         material_type=material_type,
         segments=[RawMaterialSegment(start_segment_id=start_id, end_segment_id=end_id)],
         usefulness_score=usefulness_score,
+    )
+
+
+def _raw_hook_seed(start_id, end_id, signal_type="money_or_number", soft_score=80):
+    return RawHookSeed(
+        signal_type=signal_type,
+        segments=[RawMaterialSegment(start_segment_id=start_id, end_segment_id=end_id)],
+        soft_score=soft_score,
+    )
+
+
+def _raw_fallback_span(start_id, end_id, safety_score=60):
+    return RawFallbackSpan(
+        segments=[RawMaterialSegment(start_segment_id=start_id, end_segment_id=end_id)],
+        safety_score=safety_score,
+    )
+
+
+def _valid_stage2_candidate_kwargs():
+    return {
+        "hook_type": "story",
+        "segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}],
+        "opening_hook_strength": 80,
+        "score": 80,
+        "opening_self_contained": True,
+        "hook_claim_resolved": True,
+        "semantic_ending_complete": True,
+        "ending_rationale_code": "natural_conclusion",
+        "recomposed_for_duration": False,
+    }
+
+
+def _valid_stage2_attempt_kwargs(hook_seed_id, status="candidate"):
+    if status == "candidate":
+        return {
+            "hook_seed_id": hook_seed_id,
+            "status": "candidate",
+            "candidate": Stage2CandidateOutput(**_valid_stage2_candidate_kwargs()),
+        }
+    return {
+        "hook_seed_id": hook_seed_id,
+        "status": "rejected",
+        "reject_reason_code": "insufficient_context_available",
+    }
+
+
+def _valid_stage2_fallback_candidate_kwargs(fallback_id="fb1"):
+    return {
+        "fallback_id": fallback_id,
+        "candidate": Stage2CandidateOutput(**_valid_stage2_candidate_kwargs()),
+    }
+
+
+def _stage2_output_single_attempt(hook_seed_id="s1_hookseed_000", candidate_overrides=None):
+    """Builds a Stage2Output with exactly one attempt (status=candidate)
+    for `hook_seed_id`, its candidate built from _valid_stage2_candidate_
+    kwargs() merged with `candidate_overrides` -- the common shape most
+    single-candidate design_final_candidates mocks need.
+    """
+    kwargs = {**_valid_stage2_candidate_kwargs(), **(candidate_overrides or {})}
+    return Stage2Output(
+        attempts=[
+            Stage2AttemptOutput(
+                hook_seed_id=hook_seed_id, status="candidate",
+                candidate=Stage2CandidateOutput(**kwargs),
+            )
+        ],
+        fallback_candidates=[], ranking=[hook_seed_id],
+    )
+
+
+def _stage2_design_result_single_candidate(candidate, hook_seed_id="s1_hookseed_000"):
+    """Builds a Stage2DesignResult (the return type of the real
+    design_final_candidates) with exactly one accepted attempt wrapping
+    `candidate` -- the common shape most _design_finalize_and_cache mocks
+    need."""
+    return clip_selector.Stage2DesignResult(
+        attempts=[
+            clip_selector.Stage2AttemptResult(hook_seed_id=hook_seed_id, status="candidate", candidate=candidate)
+        ],
+        fallback_candidates={}, ranking=[hook_seed_id],
+    )
+
+
+def _stage2_design_result_candidates(candidates, prefix="s1_hookseed_"):
+    """Same as _stage2_design_result_single_candidate but for several
+    candidates at once, each getting its own hook_seed_id and all ranked
+    in the given order."""
+    ids = [f"{prefix}{i:03d}" for i in range(len(candidates))]
+    return clip_selector.Stage2DesignResult(
+        attempts=[
+            clip_selector.Stage2AttemptResult(hook_seed_id=hsid, status="candidate", candidate=c)
+            for hsid, c in zip(ids, candidates)
+        ],
+        fallback_candidates={}, ranking=ids,
+    )
+
+
+def _stage2_output_rejected_attempt(hook_seed_id="s1_hookseed_000", reject_reason_code="insufficient_context_available"):
+    return Stage2Output(
+        attempts=[
+            Stage2AttemptOutput(hook_seed_id=hook_seed_id, status="rejected", reject_reason_code=reject_reason_code)
+        ],
+        fallback_candidates=[], ranking=[],
     )
 
 
@@ -119,50 +231,45 @@ def test_filter_local_quality_drops_out_of_range_duration(monkeypatch):
     assert kept == []
 
 
-def test_filter_local_quality_drops_weak_opening_hook_strength(monkeypatch):
-    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
-    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    monkeypatch.setattr(config, "MIN_OPENING_HOOK_STRENGTH", 60)
-    transcript = _long_transcript(minutes=1)
-    candidates = [_raw_candidate(0, 2, opening_hook_strength=10)]
-
-    kept = clip_selector._filter_local_quality(candidates, transcript)
-    assert kept == []
-
-
-def test_min_opening_hook_strength_default_is_80():
-    """Real-machine validation showed the old default of 60 let through
-    explanatory/abstract openings that read as a weak Shorts hook (see
-    prompts/extract_candidates.md's 70-79 band). Raised to 80 so only
-    openings scored as "clearly makes you want to keep watching" or
-    stronger clear the local filter.
+def test_min_opening_hook_strength_no_longer_exists_as_a_hard_gate():
+    """Hook-seed-discovery redesign: MIN_OPENING_HOOK_STRENGTH was retired
+    entirely (real-machine incident: Claude self-rated a context-
+    dependent, unusable opening at 80 and it sailed through, while a
+    genuinely usable candidate could be hard-rejected for scoring 78-79 --
+    a pure self-reported number was not a reliable pass/fail signal). Its
+    role is now served by the explicit semantic field opening_self_
+    contained (see test_filter_local_quality_G_low_hook_strength_still_
+    passes_when_self_contained / test_filter_local_quality_H_high_hook_
+    strength_still_rejected_when_not_self_contained below).
     """
-    assert config.MIN_OPENING_HOOK_STRENGTH == 80
+    assert not hasattr(config, "MIN_OPENING_HOOK_STRENGTH")
 
 
-def test_filter_local_quality_drops_opening_hook_strength_of_79(monkeypatch):
-    """79 sits in the prompt's 70-79 ("explanatory/abstract, weak hook")
-    band and must be rejected under the default threshold."""
+def test_filter_local_quality_G_low_hook_strength_still_passes_when_self_contained(monkeypatch):
+    """A candidate scoring low (78) on the now-soft opening_hook_strength
+    self-rating is still ACCEPTED as long as it's self-contained, fluent,
+    and semantically complete -- proves the numeric threshold no longer
+    gates accept/reject on its own."""
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
-    candidates = [_raw_candidate(0, 2, opening_hook_strength=79)]
-
-    kept = clip_selector._filter_local_quality(candidates, transcript)
-    assert kept == []
-
-
-def test_filter_local_quality_passes_opening_hook_strength_of_80(monkeypatch):
-    """80 is the minimum score the prompt calls "clearly makes you want to
-    keep watching" and must clear the local filter when other conditions
-    (duration, natural opening text) are satisfied."""
-    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
-    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    transcript = _long_transcript(minutes=1)
-    candidates = [_raw_candidate(0, 2, opening_hook_strength=80)]
+    candidates = [_raw_candidate(0, 2, opening_hook_strength=78, opening_self_contained=True)]
 
     kept = clip_selector._filter_local_quality(candidates, transcript)
     assert len(kept) == 1
+
+
+def test_filter_local_quality_H_high_hook_strength_still_rejected_when_not_self_contained(monkeypatch):
+    """A candidate scoring high (95) on opening_hook_strength is still
+    REJECTED when opening_self_contained is False -- proves the semantic
+    field, not the number, is what actually gates."""
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    candidates = [_raw_candidate(0, 2, opening_hook_strength=95, opening_self_contained=False)]
+
+    kept = clip_selector._filter_local_quality(candidates, transcript)
+    assert kept == []
 
 
 def test_filter_local_quality_drops_literal_weak_opening_text(monkeypatch):
@@ -216,31 +323,32 @@ def test_extract_candidates_prompt_has_90_80_70_scoring_bands():
 
 
 def test_extract_candidates_prompt_does_not_rate_abstract_explanation_as_strong_hook():
-    """Pins that the real-machine-observed weak opening ("弱点を直すとか改善す
-    ると次の弱点というのが生まれてくるので...") is explicitly called out as an
-    example that must NOT be scored as a strong hook, so this specific
-    real-world failure can't silently regress if the prompt is edited
-    again later.
-    """
+    """Hook-seed-discovery redesign: explanatory/abstract openings
+    ("だと思っています" etc.) are still called out as weak, but are no
+    longer schema-enforced as a hard hook_seed exclusion -- they may
+    still be extracted (recall priority) as long as it's understood they
+    are weak."""
     text = _extract_candidates_prompt_text()
-    assert "弱点を直すとか改善すると" in text
     assert "だと思っています" in text or "と思っています" in text
+    assert "弱いと分かった上で出す" in text
 
 
-def test_rank_and_finalize_prompt_independently_evaluates_stage1_hook_score():
-    """Stage2 must not blindly trust Stage1's opening_hook_strength -- it
-    has to re-evaluate the actual first utterance itself."""
+def test_rank_and_finalize_prompt_no_longer_hard_gates_on_hook_strength():
+    """Hook-seed-discovery redesign: opening_hook_strength is soft/
+    diagnostic-only now (feeds Stage2's own ranking, never a Python
+    accept/reject decision) -- see config.py's retired
+    MIN_OPENING_HOOK_STRENGTH."""
     text = _rank_and_finalize_prompt_text()
-    assert "鵜呑みにしないでください" in text or "鵜呑み" in text
+    assert "この数値はhard rejectには使われません" in text
 
 
-# --- prompt content: Stage1 widened to recall-oriented search (max 6) -----
+# --- prompt content: Stage1 widened to recall-oriented discovery ----------
 
 
-def test_extract_candidates_prompt_allows_up_to_six_candidates():
+def test_extract_candidates_prompt_allows_up_to_six_hook_seeds():
     text = _extract_candidates_prompt_text()
-    assert "最大6件" in text
-    assert "最大3件" not in text
+    assert "STAGE1_MAX_HOOK_SEEDS_PER_CHUNK" not in text  # never leak Python constant names
+    assert config.STAGE1_MAX_HOOK_SEEDS_PER_CHUNK == 6
 
 
 def test_extract_candidates_prompt_requires_scanning_whole_chunk():
@@ -253,13 +361,13 @@ def test_extract_candidates_prompt_requires_scanning_whole_chunk():
 
 def test_extract_candidates_prompt_forbids_using_up_slots_on_the_first_half():
     text = _extract_candidates_prompt_text()
-    assert "前半で見つかった素材だけで枠を使い切り" in text
+    assert "前半で見つかったものだけで枠を使い切り" in text
     assert "後半" in text
 
 
 def test_extract_candidates_prompt_forbids_padding_weak_candidates_to_fill_six():
     text = _extract_candidates_prompt_text()
-    assert "件数を埋める必要はありません" in text
+    assert "件数を埋めるために水増しする必要はありません" in text
 
 
 def test_extract_candidates_prompt_forbids_near_duplicate_candidates():
@@ -275,13 +383,14 @@ def test_extract_candidates_prompt_states_stage1_is_recall_not_final_selection()
     assert "完成したShorts候補を組み立てる係ではありません" in text
 
 
-def test_extract_candidates_prompt_allows_single_purpose_material():
-    """Stage1/Stage2 redesign: a material no longer needs to bundle a
-    hook+reason+example into one candidate to be useful -- a standalone
-    hook-only material (segments of length 1) is explicitly allowed."""
+def test_extract_candidates_prompt_allows_single_purpose_hook_seeds_and_materials():
+    """Hook-seed-discovery redesign: hook_seeds/support_materials/
+    fallback_spans are three genuinely independent output groups -- a
+    hook_seed never needs an accompanying reason/example in the same
+    chunk to be useful."""
     text = _extract_candidates_prompt_text()
-    assert "素材は完成したShorts構成である必要はありません" in text
-    assert "hookになり得る発話" in text
+    assert "3つの独立したグループに分かれます" in text
+    assert "`hook_seeds`" in text and "`support_materials`" in text and "`fallback_spans`" in text
 
 
 def test_extract_candidates_prompt_does_not_force_duration_target():
@@ -292,19 +401,15 @@ def test_extract_candidates_prompt_does_not_force_duration_target():
     assert "尺の最終調整は後段のStage2の責務です" in text
 
 
-def test_rank_and_finalize_prompt_encourages_designing_more_than_the_final_three():
-    """Real-machine incident fix: Stage2 previously designed only 2
-    candidates when 3 were required, despite ample unused material --
-    Stage2Output.candidates' ceiling was widened to STAGE2_MAX_DESIGNS(6),
-    and the prompt must actively encourage using that headroom (multiple
-    independent hooks each with their own reason/example) rather than
-    stopping at a small number, while still never lowering the
-    semantic-closure/junction/duration bar to hit a count.
-    """
+def test_rank_and_finalize_prompt_requires_one_attempt_per_coverage_target():
+    """Hook-seed-discovery redesign (the core fix): Stage2 must never
+    silently skip a coverage-target hook_seed -- exactly one attempt per
+    target, and a strong hook_seed must always be tried at least once
+    even if it doesn't end up ranked first."""
     text = _rank_and_finalize_prompt_text()
-    assert "最大6件まで" in text
-    assert "できるだけ多く" in text
-    assert "それぞれを別々の完成candidateとして設計する" in text
+    assert "ちょうどN件返してください" in text
+    assert "無言でhook_seedを無視して終了することは禁止です" in text
+    assert "必ず一度は完成candidateとして試作してください" in text
 
 
 # --- prompt content: junction safety (cut-point naturalness) --------------
@@ -334,11 +439,11 @@ def test_rank_and_finalize_prompt_documents_junction_safety():
 
 
 def test_rank_and_finalize_prompt_allows_recombining_across_materials():
-    """The core Stage1/Stage2 redesign: Stage2 may build a final candidate
-    out of segments drawn from *different* materials, not just pick or
-    exclude a whole Stage1 candidate as-is."""
+    """Stage2 may build a final candidate out of segments drawn from
+    *different* support_materials/hook_seeds/fallback_spans, not just a
+    single input as-is."""
     text = _rank_and_finalize_prompt_text()
-    assert "異なる素材のsegmentを組み合わせて" in text
+    assert "support_materials/他のhook_seed/fallback_spanのsegmentを組み合わせてよい" in text
 
 
 def test_rank_and_finalize_prompt_forbids_fabricated_segment_ids():
@@ -350,7 +455,7 @@ def test_rank_and_finalize_prompt_forbids_fabricated_segment_ids():
 def test_rank_and_finalize_prompt_documents_duration_target():
     text = _rank_and_finalize_prompt_text()
     assert "20〜50秒" in text
-    assert "50秒を超える自然な構成になった場合は" in text
+    assert "すぐにreject/50秒地点で機械的に切る、のどちらも禁止です" in text
 
 
 def test_rank_and_finalize_prompt_documents_ending_design_selection_criteria():
@@ -402,10 +507,14 @@ def test_rank_and_finalize_prompt_documents_end_anchor_text():
     assert "word境界に一致する必要がある" in text
 
 
-def test_rank_and_finalize_prompt_never_lowers_the_bar_to_hit_a_count():
+def test_rank_and_finalize_prompt_never_lowers_the_bar_for_fallback():
+    """Hook-seed-discovery redesign: fallback candidates must clear the
+    exact same bar as primary attempts -- no leniency to avoid a
+    0-candidate result, and it's fine for fallback_candidates to stay
+    empty rather than pad with junk."""
     text = _rank_and_finalize_prompt_text()
-    assert "件数を埋めるために基準を下げないでください" in text
-    assert "0件なら0件を返してください" in text
+    assert "fallbackだからといって基準を緩めないでください" in text
+    assert "そのfallback candidateは0件のままにしてください" in text
 
 
 # --- prompt content: start_anchor_text trim + segment reordering ----------
@@ -434,31 +543,44 @@ def test_extract_candidates_prompt_no_longer_reorders_within_stage1():
     assert "候補内でのsegmentの再利用" not in text
 
 
-def test_extract_candidates_prompt_scores_hook_usefulness_post_trim():
-    """usefulness_score for a hook material must be scored against what
-    actually plays first after anchor trim, not the raw untrimmed
-    segment text."""
+def test_extract_candidates_prompt_scores_hook_seed_soft_score_strictly():
+    """soft_score self-scoring must still be done strictly (never lenient
+    self-grading), even though it's explicitly non-gating."""
     text = _extract_candidates_prompt_text()
-    assert "トリム後のテキスト" in text
+    assert "自己採点は厳しく行うこと（甘い採点を禁止）" in text
 
 
-def test_extract_candidates_prompt_scopes_hook_criteria_to_hook_material_type():
-    """The root-cause fix: the strong-opening criteria/reject list must be
-    explicitly scoped to material_type: hook only, and reason/example/
-    context/payoff materials must have their own, lighter quality bar --
-    otherwise a reason material like the fuel-cut example would be
-    rejected by hook-strength rules before ever reaching Stage2."""
+def test_extract_candidates_prompt_scopes_hook_criteria_to_hook_seed_only():
+    """The root-cause fix (now expressed via separate output groups
+    rather than a material_type scoping sentence): hook-strength/opening
+    criteria apply only to hook_seeds; support_materials have their own,
+    much lighter quality bar (self-contained + not disfluent + useful),
+    independent of hook-opening strength -- otherwise a reason material
+    like the fuel-cut example would be rejected by hook-strength rules
+    before ever reaching Stage2."""
     text = _extract_candidates_prompt_text()
-    assert "この基準は`material_type: hook`の素材にのみ適用されます" in text
-    assert "reason/example/context/payoff素材の基準" in text
-    assert "穏やかな説明調であること自体、あるいはhookとしては弱いことは、これらのmaterial_typeでは不合格理由にしないでください" in text
+    assert "## `hook_seed`の基準" in text
+    assert "## `support_material`の基準" in text
+    assert "穏やかな説明調であること自体、あるいはhookとしては弱いことは、`support_material`では不合格理由にしないでください" in text
 
 
 def test_extract_candidates_prompt_documents_material_type_enum():
+    # "hook" moved entirely to hook_seed/signal_type -- support_material's
+    # material_type is now only reason/example/context/payoff.
     text = _extract_candidates_prompt_text()
-    for material_type in ("hook", "reason", "example", "context", "payoff"):
+    for material_type in ("reason", "example", "context", "payoff"):
         assert f"`{material_type}`" in text
     assert "material_type" in text
+
+
+def test_extract_candidates_prompt_documents_signal_type_enum():
+    text = _extract_candidates_prompt_text()
+    for signal_type in (
+        "money_or_number", "failure_or_loss", "surprising_fact", "strong_claim",
+        "comparison", "direct_question", "strong_conclusion", "story_turn", "other",
+    ):
+        assert f"`{signal_type}`" in text
+    assert "signal_type" in text
 
 
 def test_extract_candidates_prompt_includes_real_machine_examples():
@@ -1139,15 +1261,20 @@ def test_filter_local_quality_extends_internal_junction_before_rejecting(monkeyp
 # API 0, without changing which candidates pass or fail) ------------------
 
 
-def test_evaluate_local_candidate_A_hook_strength_below_80(monkeypatch):
+def test_evaluate_local_candidate_A_opening_not_self_contained(monkeypatch):
+    # Replaces the retired hook_strength_below_80 hard gate: a low
+    # opening_hook_strength self-rating no longer rejects on its own (see
+    # test_filter_local_quality_G_low_hook_strength_still_passes_when_
+    # self_contained); opening_self_contained=False is what actually
+    # gates now.
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
-    raw = _raw_candidate(0, 2, opening_hook_strength=79)
+    raw = _raw_candidate(0, 2, opening_hook_strength=79, opening_self_contained=False)
 
     result = clip_selector.evaluate_local_candidate(raw, transcript)
     assert result.accepted is False
-    assert result.reason == "hook_strength_below_80"
+    assert result.reason == "opening_not_self_contained"
 
 
 def test_evaluate_local_candidate_B_duration_too_short(monkeypatch):
@@ -1332,7 +1459,8 @@ def test_evaluate_local_candidate_I_matches_filter_local_quality_exactly(monkeyp
             segments=[RawUsedSegment(role="hook", start_segment_id=1, end_segment_id=1)],
             hook_text="h", opening_hook_strength=79, title="", description="",
             score=79, reasoning="", caveats="",
-        ),  # hook_strength_below_80
+            opening_self_contained=False,
+        ),  # opening_not_self_contained
         RawClipCandidate(
             hook_type="strong_take",
             segments=[RawUsedSegment(role="hook", start_segment_id=1, end_segment_id=1)],
@@ -1352,20 +1480,28 @@ def test_evaluate_local_candidate_I_matches_filter_local_quality_exactly(monkeyp
 def test_refresh_stage1_and_candidates_J_error_includes_diagnostic_summary(monkeypatch):
     # J: the exact real-machine failure path -- diagnostic counts and
     # per-candidate detail must be embedded in the RuntimeError text
-    # (which becomes job.error, already rendered to the user). Weak hook
-    # strength is no longer screened at the material-prefilter stage (only
-    # the final local gate on Stage2's designed output still checks it --
-    # see evaluate_local_candidate's hook_strength_below_80), so this
-    # simulates Stage2 designing its final candidate straight from the
-    # weak material unchanged.
+    # (which becomes job.error, already rendered to the user). Simulates
+    # Stage2 designing a candidate for the one coverage-target hook_seed
+    # that fails the local hard gate (opening_not_self_contained).
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
-    materials = [_raw_material(0, 0)]
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: materials)
+    stage1_result = Stage1ChunkResult(
+        hook_seeds=[_raw_hook_seed(0, 0)], support_materials=[], fallback_spans=[],
+    )
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: stage1_result)
+    design_result = clip_selector.Stage2DesignResult(
+        attempts=[
+            clip_selector.Stage2AttemptResult(
+                hook_seed_id="s1_hookseed_000", status="candidate",
+                candidate=_raw_candidate(0, 0, opening_self_contained=False),
+            )
+        ],
+        fallback_candidates={}, ranking=["s1_hookseed_000"],
+    )
     monkeypatch.setattr(
         clip_selector, "design_final_candidates",
-        lambda materials, t, title: [_raw_candidate(0, 0, opening_hook_strength=50)],
+        lambda coverage_targets, support_materials, fallback_spans, t, title: design_result,
     )
 
     with pytest.raises(RuntimeError) as exc_info:
@@ -1374,7 +1510,7 @@ def test_refresh_stage1_and_candidates_J_error_includes_diagnostic_summary(monke
     message = str(exc_info.value)
     assert "【診断】" in message
     assert "評価対象候補: 1件" in message
-    assert "hook強度不足" in message
+    assert "冒頭が自己完結していない" in message
 
 
 def test_diagnose_local_filter_K_makes_zero_api_calls(monkeypatch):
@@ -1383,7 +1519,10 @@ def test_diagnose_local_filter_K_makes_zero_api_calls(monkeypatch):
     # run_stage1/extract_candidates_for_chunk -- diagnose_local_filter
     # must never reach either.
     transcript = _long_transcript(minutes=1)
-    cache.save_stage1_chunk(transcript.video_id, 0, [_raw_material(0, 0, usefulness_score=90)])
+    cache.save_stage1_chunk(
+        transcript.video_id, 0,
+        Stage1ChunkResult(hook_seeds=[], support_materials=[_raw_material(0, 0, usefulness_score=90)], fallback_spans=[]),
+    )
 
     def _forbidden(*a, **k):
         raise AssertionError("diagnose_local_filter must never call the Stage1 API")
@@ -1406,15 +1545,13 @@ def test_diagnose_local_filter_L_raises_clearly_without_cache():
         clip_selector.diagnose_local_filter(transcript)
 
 
-def test_candidate_schema_version_still_13():
-    # Semantic-ending-design round: Stage2CandidateOutput gained three new
-    # required fields (semantic_ending_complete/ending_rationale_code/
-    # recomposed_for_duration) and rank_and_finalize.md's ending-design
-    # instructions changed materially -- a genuine Structured Outputs
-    # schema change plus a meaningfully-behavior-changing prompt change on
-    # the Stage2 side, so the version was bumped once more (12->13); it
-    # must not drift further within this round.
-    assert config.CANDIDATE_SCHEMA_VERSION == 13
+def test_candidate_schema_version_still_14():
+    # Hook-seed-discovery redesign: both Stage1Output (materials list ->
+    # hook_seeds/support_materials/fallback_spans) and Stage2Output
+    # (candidates list -> attempts/fallback_candidates/ranking) changed
+    # shape, plus both prompts changed materially -- version bumped once
+    # more (13->14); it must not drift further within this round.
+    assert config.CANDIDATE_SCHEMA_VERSION == 14
 
 
 # --- repair-before-reject: real-machine incident (4/4 Stage1 candidates
@@ -2876,12 +3013,17 @@ def test_select_candidates_fresh_path_saves_finalized_candidates_to_cache(monkey
     transcript = _transcript_with_gap(
         0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
     )
-    material = _raw_material(0, 1)
+    hook_seed = _raw_hook_seed(0, 1)
     candidate = _raw_candidate(0, 1, opening_hook_strength=90)
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: [material] * 4)
+    monkeypatch.setattr(
+        clip_selector, "run_stage1",
+        lambda *a, **k: Stage1ChunkResult(hook_seeds=[hook_seed], support_materials=[], fallback_spans=[]),
+    )
     monkeypatch.setattr(
         clip_selector, "design_final_candidates",
-        lambda materials, t, title: [candidate for _ in materials],
+        lambda coverage_targets, materials, fallback_spans, t, title: _stage2_design_result_single_candidate(
+            candidate, hook_seed_id=coverage_targets[0][0]
+        ),
     )
 
     result = clip_selector.select_candidates(transcript, "タイトル")
@@ -2946,20 +3088,31 @@ def test_select_candidates_applies_the_same_duration_rule_on_fresh_and_cached_pa
     transcript = _transcript_with_gap(
         0.3, ["冒頭の発言です。", "それが起きた理由としては、こういうことが考えられるので", "そのあたりも確認する必要があります。"]
     )
-    material = _raw_material(0, 1)
-    candidate = _raw_candidate(0, 1, opening_hook_strength=90)
+    hook_seeds = [_raw_hook_seed(0, 0), _raw_hook_seed(1, 1), _raw_hook_seed(2, 2)]
+    # Distinct start_anchor_text per candidate so _select_final_candidates'
+    # exact-segment-sequence dedup does not collapse these 3 attempts (all
+    # spanning the same segments 0-1) into 1 -- the point of this test is
+    # 3 independently-designed candidates all extending identically.
+    candidates = [_raw_candidate(0, 1, opening_hook_strength=90) for _ in range(3)]
+    for c, anchor in zip(candidates, ["冒頭の発言です", "それが起きた理由", None]):
+        c.segments[0].start_anchor_text = anchor
 
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: [material] * 4)
+    monkeypatch.setattr(
+        clip_selector, "run_stage1",
+        lambda *a, **k: Stage1ChunkResult(hook_seeds=hook_seeds, support_materials=[], fallback_spans=[]),
+    )
     monkeypatch.setattr(
         clip_selector, "design_final_candidates",
-        lambda materials, t, title: [candidate for _ in materials],
+        lambda coverage_targets, materials, fallback_spans, t, title: _stage2_design_result_candidates(
+            candidates
+        ),
     )
     fresh_result = clip_selector.select_candidates(transcript, "タイトル")
 
     cache_transcript = Transcript(
         video_id=transcript.video_id + "-cache", language="ja", segments=transcript.segments
     )
-    cache.save_stage2(cache_transcript.video_id, [candidate] * 3)
+    cache.save_stage2(cache_transcript.video_id, [candidates[0]] * 3)
     cached_result = clip_selector.select_candidates(cache_transcript, "タイトル")
 
     assert len(fresh_result) == 3
@@ -3077,14 +3230,15 @@ def test_material_is_usable_rejects_speech_restart_reason_material():
     assert clip_selector._material_is_usable(material, transcript) is False
 
 
-def test_stage1_stage2_recombine_hook_material_with_weak_hook_reason_material(monkeypatch):
-    # Item 7 -- the single most important test for this round's fix
-    # ("これが通らなければ今回の再設計は成立していない"): chunk A has only a hook
-    # material ("Xの方がYより燃費が良い"); chunk B has a material that would be
-    # weak as a Shorts hook but is an important reason explanation
-    # ("減速時には一定条件で燃料噴射が止まるためです"). Both must survive Stage1's
-    # material prefilter regardless of the reason material's weak-hook
-    # shape, and Stage2 must be able to combine them into one
+def test_stage1_stage2_recombine_hook_seed_with_reason_material(monkeypatch):
+    # Item 7 (carried into the hook-seed-discovery redesign) -- the single
+    # most important cross-chunk recombination test: chunk A has only a
+    # hook_seed ("Xの方がYより燃費が良い"); chunk B has a support_material
+    # that would be weak as a Shorts hook but is an important reason
+    # explanation ("減速時には一定条件で燃料噴射が止まるためです"). Both must
+    # survive Stage1's lightweight prefilter regardless of the reason
+    # material's weak-hook shape, and Stage2 must be able to combine them
+    # (via one attempt on the hook_seed's coverage target) into one
     # semantically-complete finished candidate that clears the unchanged
     # local hard gates.
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
@@ -3097,38 +3251,49 @@ def test_stage1_stage2_recombine_hook_material_with_weak_hook_reason_material(mo
             _segment(1, start=100.0, text="減速時には一定条件で燃料噴射が止まるためです。"),
         ],
     )
-    # chunk A: a hook material only (no reason material in this chunk).
-    hook_material = _raw_material(0, 0, material_type="hook", usefulness_score=90)
+    # chunk A: a hook_seed only (no reason material in this chunk).
+    hook_seed = _raw_hook_seed(0, 0, signal_type="comparison", soft_score=90)
     # chunk B: weak as a Shorts hook (calm technical explanation, no
     # strong opening) but a real, important reason -- must still be
-    # fetched by Stage1, since the material prefilter never judges hook
+    # fetched by Stage1, since the lightweight prefilter never judges hook
     # strength.
     reason_material = _raw_material(1, 1, material_type="reason", usefulness_score=55)
 
-    # Both survive the lightweight material prefilter -- confirms the
-    # weak-as-hook material is never rejected before ever reaching Stage2,
-    # which is exactly the bug this round fixes.
-    assert clip_selector._material_is_usable(hook_material, transcript) is True
+    # Both survive the lightweight prefilter -- confirms the weak-as-hook
+    # material is never rejected before ever reaching Stage2, which is
+    # exactly the bug this round fixes.
+    assert clip_selector._hook_seed_is_usable(hook_seed, transcript) is True
     assert clip_selector._material_is_usable(reason_material, transcript) is True
 
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: [hook_material, reason_material])
+    stage1_result = Stage1ChunkResult(
+        hook_seeds=[hook_seed], support_materials=[reason_material], fallback_spans=[],
+    )
+    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: stage1_result)
 
-    def _fake_design(materials, t, title):
-        # Stage2 combines the hook material's segment with the reason
-        # material's segment -- drawn from two different materials --
-        # into one semantically-complete finished candidate.
-        assert len(materials) == 2
-        return [
-            RawClipCandidate(
-                hook_type="strong_take",
-                segments=[
-                    RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
-                    RawUsedSegment(role="answer", start_segment_id=1, end_segment_id=1),
-                ],
-                hook_text="h", opening_hook_strength=90, title="", description="",
-                score=90, reasoning="", caveats="",
-            )
-        ]
+    def _fake_design(coverage_targets, support_materials, fallback_spans, t, title):
+        # Stage2 combines the hook_seed's segment with the reason
+        # material's segment -- drawn from two different inputs -- into
+        # one semantically-complete finished candidate.
+        assert len(coverage_targets) == 1
+        assert len(support_materials) == 1
+        hook_seed_id = coverage_targets[0][0]
+        candidate = RawClipCandidate(
+            hook_type="strong_take",
+            segments=[
+                RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+                RawUsedSegment(role="answer", start_segment_id=1, end_segment_id=1),
+            ],
+            hook_text="h", opening_hook_strength=90, title="", description="",
+            score=90, reasoning="", caveats="",
+        )
+        return clip_selector.Stage2DesignResult(
+            attempts=[
+                clip_selector.Stage2AttemptResult(
+                    hook_seed_id=hook_seed_id, status="candidate", candidate=candidate,
+                )
+            ],
+            fallback_candidates={}, ranking=[hook_seed_id],
+        )
 
     monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
 
@@ -3139,31 +3304,23 @@ def test_stage1_stage2_recombine_hook_material_with_weak_hook_reason_material(mo
 
 
 def test_design_final_candidates_reassigns_reason_material_segment_to_hook_role(monkeypatch):
-    # H: a reason material's segment doesn't need to become the finished
+    # H: a support_material's segment doesn't need to become the finished
     # candidate's hook, but it CAN be -- Stage2, not the material's own
     # material_type, decides the final role. Confirms the conversion
     # doesn't carry any material-side "role" forward (RawMaterial has
     # none), it only uses whatever role Stage2's own output specifies.
     transcript = _long_transcript(minutes=1)
-    materials = {"s1_m000": _raw_material(0, 0, material_type="reason", usefulness_score=40)}
-    output = Stage2Output(
-        candidates=[
-            Stage2CandidateOutput(
-                hook_type="strong_take",
-                segments=[Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=0)],
-                opening_hook_strength=85,
-                score=85,
-                semantic_ending_complete=True,
-                ending_rationale_code="natural_conclusion",
-                recomposed_for_duration=False,
-            )
-        ]
+    coverage_targets = [("s1_hookseed_000", _raw_hook_seed(0, 0))]
+    support_materials = {"s1_m000": _raw_material(0, 0, material_type="reason", usefulness_score=40)}
+    output = _stage2_output_single_attempt(
+        "s1_hookseed_000",
+        {"segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}]},
     )
     monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
 
-    designed = clip_selector.design_final_candidates(materials, transcript, "タイトル")
+    design = clip_selector.design_final_candidates(coverage_targets, support_materials, {}, transcript, "タイトル")
 
-    assert designed[0].segments[0].role == "hook"
+    assert design.attempts[0].candidate.segments[0].role == "hook"
 
 
 # --- Stage2 final-edit-design: end-to-end through the unchanged local ----
@@ -3190,24 +3347,27 @@ def test_design_finalize_A_recombines_three_materials_into_one_complete_candidat
     )
     materials = [_raw_material(0, 0), _raw_material(1, 1), _raw_material(2, 2)]
 
-    def _fake_design(m, t, title):
-        return [
-            RawClipCandidate(
-                hook_type="strong_take",
-                segments=[
-                    RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
-                    RawUsedSegment(role="answer", start_segment_id=1, end_segment_id=1),
-                    RawUsedSegment(role="payoff", start_segment_id=2, end_segment_id=2),
-                ],
-                hook_text="h", opening_hook_strength=90, title="", description="",
-                score=90, reasoning="", caveats="",
-            )
-        ]
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="answer", start_segment_id=1, end_segment_id=1),
+            RawUsedSegment(role="payoff", start_segment_id=2, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    design_result = _stage2_design_result_single_candidate(candidate)
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda coverage_targets, support_materials, fallback_spans, t, title: design_result,
+    )
+    monkeypatch.setattr(
+        clip_selector, "run_stage1",
+        lambda *a, **k: Stage1ChunkResult(hook_seeds=[_raw_hook_seed(0, 0)], support_materials=materials, fallback_spans=[]),
+    )
 
-    monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: materials)
-
-    result = clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+    result = clip_selector._design_finalize_and_cache([_raw_hook_seed(0, 0)], materials, [], transcript, "タイトル")
     assert len(result) == 1
     assert [s.start_segment_id for s in result[0].segments] == [0, 1, 2]
 
@@ -3239,20 +3399,19 @@ def test_design_finalize_C_accepts_stage2_shortened_selection_from_long_material
         ],
     )
     long_material = _raw_material(1, 1)
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    design_result = _stage2_design_result_single_candidate(candidate)
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda coverage_targets, support_materials, fallback_spans, t, title: design_result,
+    )
 
-    def _fake_design(m, t, title):
-        return [
-            RawClipCandidate(
-                hook_type="strong_take",
-                segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)],
-                hook_text="h", opening_hook_strength=90, title="", description="",
-                score=90, reasoning="", caveats="",
-            )
-        ]
-
-    monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
-
-    result = clip_selector._design_finalize_and_cache([long_material], transcript, "タイトル")
+    result = clip_selector._design_finalize_and_cache([_raw_hook_seed(0, 0)], [long_material], [], transcript, "タイトル")
     assert len(result) == 1
     assert result[0].segments[0].end_segment_id == 0
 
@@ -3266,14 +3425,15 @@ def test_design_finalize_G_rejects_fabricated_segment_id(monkeypatch):
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
     materials = [_raw_material(0, 0)]
-
-    def _fake_design(m, t, title):
-        return [_raw_candidate(9999, 9999)]  # fabricated segment_id
-
-    monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
+    hook_seeds = [_raw_hook_seed(0, 0)]
+    design_result = _stage2_design_result_single_candidate(_raw_candidate(9999, 9999))  # fabricated segment_id
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda coverage_targets, support_materials, fallback_spans, t, title: design_result,
+    )
 
     with pytest.raises(RuntimeError, match="ローカル検証を通過したものが0件"):
-        clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+        clip_selector._design_finalize_and_cache(hook_seeds, materials, [], transcript, "タイトル")
 
 
 def test_design_finalize_I_rejects_out_of_bounds_duration(monkeypatch):
@@ -3285,14 +3445,15 @@ def test_design_finalize_I_rejects_out_of_bounds_duration(monkeypatch):
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
     transcript = _long_transcript(minutes=1)
     materials = [_raw_material(0, 0)]
-
-    def _fake_design(m, t, title):
-        return [_raw_candidate(0, 0)]  # a single 2-second segment -- far under 20s
-
-    monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
+    hook_seeds = [_raw_hook_seed(0, 0)]
+    design_result = _stage2_design_result_single_candidate(_raw_candidate(0, 0))  # a single 2-second segment -- far under 20s
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda coverage_targets, support_materials, fallback_spans, t, title: design_result,
+    )
 
     with pytest.raises(RuntimeError, match="ローカル検証を通過したものが0件"):
-        clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+        clip_selector._design_finalize_and_cache(hook_seeds, materials, [], transcript, "タイトル")
 
 
 def test_design_finalize_J_rejects_unsafe_junction(monkeypatch):
@@ -3310,24 +3471,24 @@ def test_design_finalize_J_rejects_unsafe_junction(monkeypatch):
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _unfixable_bad_junction_transcript()
     materials = [_raw_material(0, 0)]
-
-    def _fake_design(m, t, title):
-        return [
-            RawClipCandidate(
-                hook_type="strong_take",
-                segments=[
-                    RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
-                    RawUsedSegment(role="context", start_segment_id=2, end_segment_id=2),
-                ],
-                hook_text="h", opening_hook_strength=90, title="", description="",
-                score=90, reasoning="", caveats="",
-            )
-        ]  # segment 0 (unfinished) -> unrelated distant segment 2, skipping segment 1
-
-    monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
+    hook_seeds = [_raw_hook_seed(0, 0)]
+    candidate = RawClipCandidate(
+        hook_type="strong_take",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=2, end_segment_id=2),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )  # segment 0 (unfinished) -> unrelated distant segment 2, skipping segment 1
+    design_result = _stage2_design_result_single_candidate(candidate)
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda coverage_targets, support_materials, fallback_spans, t, title: design_result,
+    )
 
     with pytest.raises(RuntimeError, match="ローカル検証を通過したものが0件"):
-        clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+        clip_selector._design_finalize_and_cache(hook_seeds, materials, [], transcript, "タイトル")
 
 
 # --- stage2 diagnostic: raw Stage2 output survives a failed run ----------
@@ -3348,14 +3509,19 @@ def test_design_finalize_A_succeeds_with_one_candidate_and_still_saves_diagnosti
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
     materials = [_raw_material(0, 2), _raw_material(0, 2)]
+    hook_seeds = [_raw_hook_seed(0, 2), _raw_hook_seed(0, 2)]
     two_designs = [
         _raw_candidate(0, 2, opening_hook_strength=90),
-        _raw_candidate(0, 2, opening_hook_strength=78),  # will fail hook_strength_below_80
+        _raw_candidate(0, 2, opening_hook_strength=78, opening_self_contained=False),  # will fail
     ]
+    design_result = _stage2_design_result_candidates(two_designs)
 
-    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda m, t, title: two_designs)
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda coverage_targets, support_materials, fallback_spans, t, title: design_result,
+    )
 
-    result = clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+    result = clip_selector._design_finalize_and_cache(hook_seeds, materials, [], transcript, "タイトル")
     assert len(result) == 1
 
     # stage2_result.json (the production cache) now holds the 1 successful
@@ -3372,7 +3538,7 @@ def test_design_finalize_A_succeeds_with_one_candidate_and_still_saves_diagnosti
     assert len(diagnostic["evaluations"]) == 2
     accepted_flags = [e["accepted"] for e in diagnostic["evaluations"]]
     assert accepted_flags == [True, False]
-    assert diagnostic["evaluations"][1]["reason"] == "hook_strength_below_80"
+    assert diagnostic["evaluations"][1]["reason"] == "opening_not_self_contained"
 
 
 def test_design_finalize_B_succeeds_with_two_candidates_and_records_all_three_in_diagnostic(monkeypatch):
@@ -3386,15 +3552,22 @@ def test_design_finalize_B_succeeds_with_two_candidates_and_records_all_three_in
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
     materials = [_raw_material(0, 2), _raw_material(0, 2), _raw_material(0, 2)]
+    hook_seeds = [_raw_hook_seed(0, 0), _raw_hook_seed(1, 1), _raw_hook_seed(2, 2)]
+    # Distinct segment ranges so the exact-segment-sequence dedup in
+    # _select_final_candidates does not collapse the 2 valid designs into 1.
     three_designs = [
-        _raw_candidate(0, 2, opening_hook_strength=90),
-        _raw_candidate(0, 2, opening_hook_strength=90),
+        _raw_candidate(0, 0, opening_hook_strength=90),
+        _raw_candidate(0, 1, opening_hook_strength=90),
         _raw_candidate(9999, 9999, opening_hook_strength=90),  # fabricated segment_id
     ]
+    design_result = _stage2_design_result_candidates(three_designs)
 
-    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda m, t, title: three_designs)
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda coverage_targets, support_materials, fallback_spans, t, title: design_result,
+    )
 
-    result = clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+    result = clip_selector._design_finalize_and_cache(hook_seeds, materials, [], transcript, "タイトル")
     assert len(result) == 2
 
     saved = cache.load_stage2(transcript.video_id)
@@ -3417,11 +3590,22 @@ def test_design_finalize_C_success_path_still_writes_diagnostic_separately(monke
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
     materials = [_raw_material(0, 2) for _ in range(3)]
-    three_designs = [_raw_candidate(0, 2, opening_hook_strength=90) for _ in range(3)]
+    hook_seeds = [_raw_hook_seed(0, 0), _raw_hook_seed(1, 1), _raw_hook_seed(2, 2)]
+    # Distinct segment ranges so the exact-segment-sequence dedup in
+    # _select_final_candidates does not collapse the 3 designs into 1.
+    three_designs = [
+        _raw_candidate(0, 0, opening_hook_strength=90),
+        _raw_candidate(0, 1, opening_hook_strength=90),
+        _raw_candidate(0, 2, opening_hook_strength=90),
+    ]
+    design_result = _stage2_design_result_candidates(three_designs)
 
-    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda m, t, title: three_designs)
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda coverage_targets, support_materials, fallback_spans, t, title: design_result,
+    )
 
-    result = clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+    result = clip_selector._design_finalize_and_cache(hook_seeds, materials, [], transcript, "タイトル")
     assert len(result) == 3
 
     final_cache = cache.load_stage2(transcript.video_id)
@@ -3445,11 +3629,25 @@ def test_design_finalize_takes_top_num_candidates_when_stage2_overproduces(monke
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
     materials = [_raw_material(0, 2) for _ in range(5)]
-    five_designs = [_raw_candidate(0, 2, opening_hook_strength=90, score=s) for s in (95, 90, 85, 80, 75)]
+    hook_seeds = [
+        _raw_hook_seed(0, 0), _raw_hook_seed(0, 1), _raw_hook_seed(0, 2),
+        _raw_hook_seed(1, 1), _raw_hook_seed(1, 2),
+    ]
+    # Distinct segment ranges (limited to the 3-segment transcript) so the
+    # exact-segment-sequence dedup in _select_final_candidates does not
+    # collapse these 5 designs down to 1.
+    five_designs = [
+        _raw_candidate(rng[0], rng[1], opening_hook_strength=90, score=s)
+        for rng, s in zip([(0, 0), (0, 1), (0, 2), (1, 1), (1, 2)], (95, 90, 85, 80, 75))
+    ]
+    design_result = _stage2_design_result_candidates(five_designs)
 
-    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda m, t, title: five_designs)
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda coverage_targets, support_materials, fallback_spans, t, title: design_result,
+    )
 
-    result = clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+    result = clip_selector._design_finalize_and_cache(hook_seeds, materials, [], transcript, "タイトル")
 
     assert len(result) == config.NUM_CANDIDATES == 3
     assert [c.score for c in result] == [95, 90, 85]
@@ -3469,17 +3667,28 @@ def test_design_finalize_D_takes_top_three_when_five_designed_four_accepted(monk
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
     materials = [_raw_material(0, 2) for _ in range(5)]
-    five_designs = [
-        _raw_candidate(0, 2, opening_hook_strength=90, score=95),
-        _raw_candidate(0, 2, opening_hook_strength=90, score=90),
-        _raw_candidate(9999, 9999, opening_hook_strength=90, score=88),  # fabricated -> rejected
-        _raw_candidate(0, 2, opening_hook_strength=90, score=85),
-        _raw_candidate(0, 2, opening_hook_strength=90, score=80),
+    hook_seeds = [
+        _raw_hook_seed(0, 0), _raw_hook_seed(0, 1), _raw_hook_seed(0, 2),
+        _raw_hook_seed(1, 1), _raw_hook_seed(1, 2),
     ]
+    # Distinct segment ranges (limited to the 3-segment transcript) so the
+    # exact-segment-sequence dedup in _select_final_candidates does not
+    # collapse the 4 valid designs down to fewer than 4.
+    five_designs = [
+        _raw_candidate(0, 0, opening_hook_strength=90, score=95),
+        _raw_candidate(0, 1, opening_hook_strength=90, score=90),
+        _raw_candidate(9999, 9999, opening_hook_strength=90, score=88),  # fabricated -> rejected
+        _raw_candidate(1, 1, opening_hook_strength=90, score=85),
+        _raw_candidate(1, 2, opening_hook_strength=90, score=80),
+    ]
+    design_result = _stage2_design_result_candidates(five_designs)
 
-    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda m, t, title: five_designs)
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda coverage_targets, support_materials, fallback_spans, t, title: design_result,
+    )
 
-    result = clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+    result = clip_selector._design_finalize_and_cache(hook_seeds, materials, [], transcript, "タイトル")
 
     assert len(result) == config.NUM_CANDIDATES == 3
     assert [c.score for c in result] == [95, 90, 85]
@@ -3500,15 +3709,20 @@ def test_design_finalize_F_raises_when_two_designed_zero_accepted(monkeypatch):
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
     materials = [_raw_material(0, 2), _raw_material(0, 2)]
+    hook_seeds = [_raw_hook_seed(0, 2), _raw_hook_seed(0, 2)]
     two_bad_designs = [
         _raw_candidate(9999, 9999, opening_hook_strength=90),
         _raw_candidate(8888, 8888, opening_hook_strength=90),
     ]
+    design_result = _stage2_design_result_candidates(two_bad_designs)
 
-    monkeypatch.setattr(clip_selector, "design_final_candidates", lambda m, t, title: two_bad_designs)
+    monkeypatch.setattr(
+        clip_selector, "design_final_candidates",
+        lambda coverage_targets, support_materials, fallback_spans, t, title: design_result,
+    )
 
     with pytest.raises(RuntimeError, match="ローカル検証を通過したものが0件"):
-        clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+        clip_selector._design_finalize_and_cache(hook_seeds, materials, [], transcript, "タイトル")
 
     assert cache.load_stage2(transcript.video_id) is None
     diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
@@ -3516,29 +3730,60 @@ def test_design_finalize_F_raises_when_two_designed_zero_accepted(monkeypatch):
     assert all(not e["accepted"] for e in diagnostic["evaluations"])
 
 
-def test_design_final_candidates_saves_raw_diagnostic_before_dedup(monkeypatch):
-    # The first diagnostic write happens inside design_final_candidates
-    # itself, right after Stage2's Structured Output is parsed -- before
-    # dedup and before local validation even runs -- so a crash anywhere
-    # downstream still leaves this record behind.
+def test_design_final_candidates_saves_raw_diagnostic_before_local_validation(monkeypatch):
+    # design_final_candidates saves a diagnostic snapshot of every
+    # attempt/fallback candidate it built, immediately after Stage2's
+    # Structured Output is parsed -- before local validation (or the
+    # dedup safety net in _select_final_candidates) ever runs -- so a
+    # crash anywhere downstream still leaves this record behind.
+    # design_final_candidates itself does NOT dedupe (that safety net now
+    # lives in _select_final_candidates, applied after local validation).
     transcript = _long_transcript(minutes=1)
-    materials = {"s1_m000": _raw_material(0, 2)}
+    coverage_targets = [("s1_hookseed_000", _raw_hook_seed(0, 2)), ("s1_hookseed_001", _raw_hook_seed(0, 2))]
     same_segment = Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=2)
     output = Stage2Output(
-        candidates=[
-            Stage2CandidateOutput(**{**_valid_stage2_candidate_kwargs(), "segments": [same_segment]}),
-            Stage2CandidateOutput(**{**_valid_stage2_candidate_kwargs(), "segments": [same_segment]}),
-        ]
+        attempts=[
+            Stage2AttemptOutput(
+                hook_seed_id="s1_hookseed_000", status="candidate",
+                candidate=Stage2CandidateOutput(**{**_valid_stage2_candidate_kwargs(), "segments": [same_segment]}),
+            ),
+            Stage2AttemptOutput(
+                hook_seed_id="s1_hookseed_001", status="candidate",
+                candidate=Stage2CandidateOutput(**{**_valid_stage2_candidate_kwargs(), "segments": [same_segment]}),
+            ),
+        ],
+        fallback_candidates=[], ranking=["s1_hookseed_000", "s1_hookseed_001"],
     )
     monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
 
-    designed = clip_selector.design_final_candidates(materials, transcript, "タイトル")
-    assert len(designed) == 1  # deduped in the return value
+    design = clip_selector.design_final_candidates(coverage_targets, {}, {}, transcript, "タイトル")
+    assert len(design.attempts) == 2  # not deduped at this point
 
-    # But the diagnostic snapshot, written before dedup, keeps both.
     diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
     assert len(diagnostic["candidates"]) == 2
     assert "evaluations" not in diagnostic  # not yet evaluated at this point
+
+
+def test_select_final_candidates_dedupes_identical_segment_sequences(monkeypatch):
+    # The safety-net dedup that replaced the old standalone
+    # _dedupe_by_segment_sequence: two different hook_seed_ids whose
+    # designed candidates have byte-identical segment sequences collapse
+    # to one in the final selection -- rank order decides which survives.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _long_transcript(minutes=1)
+    candidate_a = _raw_candidate(0, 2, score=90)
+    candidate_b = _raw_candidate(0, 2, score=90)  # identical segment sequence to candidate_a
+    attempt_evals = {
+        "s1_hookseed_000": clip_selector.evaluate_local_candidate(candidate_a, transcript),
+        "s1_hookseed_001": clip_selector.evaluate_local_candidate(candidate_b, transcript),
+    }
+    ranking = ["s1_hookseed_000", "s1_hookseed_001"]
+
+    result = clip_selector._select_final_candidates(attempt_evals, {}, ranking)
+
+    assert len(result) == 1
+    assert result[0][0] == "s1_hookseed_000"
 
 
 def test_stage2_diagnostic_is_never_read_by_the_production_selection_path(monkeypatch):
@@ -3563,7 +3808,12 @@ def test_select_candidates_raises_without_calling_stage2_when_no_usable_material
         video_id="vidNoUsableMaterial", language="ja",
         segments=[_segment(0, start=0.0, text="ちょっと表現が難しいんですけども、要するにこうです。")],
     )
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: [_raw_material(0, 0)])
+    monkeypatch.setattr(
+        clip_selector, "run_stage1",
+        lambda *a, **k: Stage1ChunkResult(
+            hook_seeds=[_raw_hook_seed(0, 0)], support_materials=[], fallback_spans=[]
+        ),
+    )
     monkeypatch.setattr(
         clip_selector, "design_final_candidates",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("Stage2 must not be called")),
@@ -3581,11 +3831,16 @@ def test_select_candidates_succeeds_with_one_candidate_when_stage2_designs_only_
     transcript = _long_transcript(minutes=1)
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    materials = [_raw_material(0, 2), _raw_material(0, 2), _raw_material(0, 2)]
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: materials)
+    hook_seeds = [_raw_hook_seed(0, 2), _raw_hook_seed(0, 2), _raw_hook_seed(0, 2)]
+    monkeypatch.setattr(
+        clip_selector, "run_stage1",
+        lambda *a, **k: Stage1ChunkResult(hook_seeds=hook_seeds, support_materials=[], fallback_spans=[]),
+    )
     monkeypatch.setattr(
         clip_selector, "design_final_candidates",
-        lambda materials, t, title: [_raw_candidate(0, 2) for _ in range(1)],
+        lambda coverage_targets, materials, fallback_spans, t, title: _stage2_design_result_single_candidate(
+            _raw_candidate(0, 2)
+        ),
     )
 
     result = clip_selector.select_candidates(transcript, "タイトル")
@@ -3603,11 +3858,16 @@ def test_select_candidates_succeeds_with_two_candidates_when_only_two_pass_seman
     transcript = _long_transcript(minutes=1)
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    materials = [_raw_material(0, 2), _raw_material(0, 2), _raw_material(0, 2)]
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: materials)
+    hook_seeds = [_raw_hook_seed(0, 2), _raw_hook_seed(0, 2), _raw_hook_seed(0, 2)]
+    monkeypatch.setattr(
+        clip_selector, "run_stage1",
+        lambda *a, **k: Stage1ChunkResult(hook_seeds=hook_seeds, support_materials=[], fallback_spans=[]),
+    )
     monkeypatch.setattr(
         clip_selector, "design_final_candidates",
-        lambda materials, t, title: [_raw_candidate(0, 2) for _ in range(2)],
+        lambda coverage_targets, materials, fallback_spans, t, title: _stage2_design_result_candidates(
+            [_raw_candidate(0, 0), _raw_candidate(0, 1)]
+        ),
     )
 
     result = clip_selector.select_candidates(transcript, "タイトル")
@@ -3622,11 +3882,16 @@ def test_select_candidates_happy_path(monkeypatch):
     transcript = _long_transcript(minutes=1)
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    materials = [_raw_material(0, 2, usefulness_score=s) for s in (10, 20, 30, 40)]
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: materials)
+    hook_seeds = [_raw_hook_seed(0, 2, soft_score=s) for s in (10, 20, 30, 40)]
+    monkeypatch.setattr(
+        clip_selector, "run_stage1",
+        lambda *a, **k: Stage1ChunkResult(hook_seeds=hook_seeds, support_materials=[], fallback_spans=[]),
+    )
     monkeypatch.setattr(
         clip_selector, "design_final_candidates",
-        lambda materials, t, title: [_raw_candidate(0, 2) for _ in range(len(materials))],
+        lambda coverage_targets, materials, fallback_spans, t, title: _stage2_design_result_candidates(
+            [_raw_candidate(0, 0), _raw_candidate(0, 1), _raw_candidate(0, 2)]
+        ),
     )
 
     result = clip_selector.select_candidates(transcript, "タイトル")
@@ -3640,20 +3905,25 @@ def test_select_candidates_accepts_when_stage2_excludes_one_closure_failing_cand
     # result must contain exactly config.NUM_CANDIDATES candidates (never
     # padded back up with the excluded one), reached via exactly one
     # Stage2 call -- zero additional Anthropic API calls.
-    transcript = _long_transcript(minutes=1)
+    transcript = _long_transcript(minutes=2)
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    materials = [_raw_material(0, 2, usefulness_score=s) for s in (10, 20, 30, 40)]
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: materials)
+    hook_seeds = [_raw_hook_seed(0, 0), _raw_hook_seed(1, 1), _raw_hook_seed(2, 2), _raw_hook_seed(3, 3)]
+    monkeypatch.setattr(
+        clip_selector, "run_stage1",
+        lambda *a, **k: Stage1ChunkResult(hook_seeds=hook_seeds, support_materials=[], fallback_spans=[]),
+    )
 
     call_count = {"n": 0}
 
-    def _fake_design(materials, t, title):
+    def _fake_design(coverage_targets, materials, fallback_spans, t, title):
         call_count["n"] += 1
-        # Simulate Stage2 omitting one design entirely for failing semantic
+        # Simulate Stage2 omitting one attempt entirely for failing semantic
         # closure -- the remaining 3 of 4 are returned, never padded back.
-        assert len(materials) == 4
-        return [_raw_candidate(0, 2) for _ in range(3)]
+        assert len(coverage_targets) == 4
+        return _stage2_design_result_candidates(
+            [_raw_candidate(0, 0), _raw_candidate(1, 1), _raw_candidate(2, 2)]
+        )
 
     monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
 
@@ -3681,26 +3951,41 @@ def test_select_candidates_caches_and_skips_recompute(monkeypatch):
 # --- segment_id ranges + a few scores, never display text) --------------
 
 
-def test_stage1_material_output_field_set_excludes_finished_candidate_properties():
+def test_stage1_support_material_output_field_set_excludes_finished_candidate_properties():
     # Stage1 structurally cannot produce hook_type/opening_hook_strength/
     # score/hook_text/title/description/reasoning/caveats any more -- those
     # all describe a *finished* candidate design, which only Stage2
-    # produces (see Stage2CandidateOutput). A material's own fields are
-    # material_type/segments/usefulness_score only.
-    fields = set(Stage1MaterialOutput.model_fields)
+    # produces (see Stage2CandidateOutput). A support material's own
+    # fields are material_type/segments/usefulness_score only.
+    fields = set(Stage1SupportMaterialOutput.model_fields)
     assert fields == {"material_type", "segments", "usefulness_score"}
     assert "hook_type" not in fields
     assert "opening_hook_strength" not in fields
     assert "score" not in fields
     assert "hook_text" not in fields
-    assert "title" not in fields
-    assert "description" not in fields
-    assert "reasoning" not in fields
-    assert "caveats" not in fields
+
+
+def test_stage1_support_material_output_excludes_hook_material_type():
+    # "hook" was moved to hook_seeds/signal_type entirely -- support
+    # materials are only ever reason/example/context/payoff now.
+    with pytest.raises(ValidationError):
+        Stage1SupportMaterialOutput(
+            material_type="hook",
+            segments=[Stage1MaterialSegmentOutput(start_segment_id=0, end_segment_id=0)],
+            usefulness_score=80,
+        )
+
+
+def test_stage1_hook_seed_output_field_set():
+    assert set(Stage1HookSeedOutput.model_fields) == {"signal_type", "segments", "soft_score"}
+
+
+def test_stage1_fallback_span_output_field_set():
+    assert set(Stage1FallbackSpanOutput.model_fields) == {"segments", "safety_score"}
 
 
 def test_stage1_material_segment_output_has_no_role():
-    # A material is single-purpose -- it has no internal structural
+    # None of Stage1's three output groups have an internal structural
     # position (hook/context/answer/payoff) the way a finished candidate's
     # segments do. That's only ever decided by Stage2 (Stage2SegmentOutput
     # still has `role`).
@@ -3712,54 +3997,112 @@ def test_stage1_material_segment_output_has_no_role():
 def test_stage2_candidate_output_field_set_is_the_only_place_finished_properties_exist():
     # Stage2's candidate/segment schemas are the only place hook_type/
     # opening_hook_strength/score/role/end_anchor_text exist -- Stage1's
-    # material schema deliberately has none of these.
+    # schemas deliberately have none of these.
     assert set(Stage2CandidateOutput.model_fields) == {
         "hook_type", "segments", "opening_hook_strength", "score",
+        "opening_self_contained", "hook_claim_resolved",
         "semantic_ending_complete", "ending_rationale_code", "recomposed_for_duration",
     }
     assert set(Stage2SegmentOutput.model_fields) == {
         "role", "start_segment_id", "end_segment_id", "start_anchor_text", "end_anchor_text",
     }
-    assert set(Stage2Output.model_fields) == {"candidates"}
-
-
-def _valid_stage2_candidate_kwargs():
-    return {
-        "hook_type": "story",
-        "segments": [{"role": "hook", "start_segment_id": 0, "end_segment_id": 0}],
-        "opening_hook_strength": 80,
-        "score": 80,
-        "semantic_ending_complete": True,
-        "ending_rationale_code": "natural_conclusion",
-        "recomposed_for_duration": False,
+    assert set(Stage2AttemptOutput.model_fields) == {
+        "hook_seed_id", "status", "candidate", "reject_reason_code",
     }
+    assert set(Stage2FallbackCandidateOutput.model_fields) == {"fallback_id", "candidate"}
+    assert set(Stage2Output.model_fields) == {"attempts", "fallback_candidates", "ranking"}
 
 
-def test_stage2_output_accepts_up_to_stage2_max_designs_not_num_candidates():
-    """The real-machine fix: Stage2Output's ceiling is STAGE2_MAX_DESIGNS
-    (6), deliberately wider than NUM_CANDIDATES (3) -- Stage2 designed
-    only 2 candidates once when 3 were required despite ample unused
-    material, so the schema itself must not cap Stage2 at exactly
-    NUM_CANDIDATES and leave it no room to over-produce.
+def test_stage2_attempt_output_requires_candidate_when_status_is_candidate():
+    with pytest.raises(ValidationError):
+        Stage2AttemptOutput(hook_seed_id="s1_hookseed_000", status="candidate")
+
+
+def test_stage2_attempt_output_forbids_candidate_when_status_is_rejected():
+    with pytest.raises(ValidationError):
+        Stage2AttemptOutput(
+            hook_seed_id="s1_hookseed_000", status="rejected",
+            candidate=Stage2CandidateOutput(**_valid_stage2_candidate_kwargs()),
+            reject_reason_code="insufficient_context_available",
+        )
+
+
+def test_stage2_attempt_output_requires_reject_reason_code_when_status_is_rejected():
+    with pytest.raises(ValidationError):
+        Stage2AttemptOutput(hook_seed_id="s1_hookseed_000", status="rejected")
+
+
+def test_stage2_attempt_output_forbids_reject_reason_code_when_status_is_candidate():
+    with pytest.raises(ValidationError):
+        Stage2AttemptOutput(
+            hook_seed_id="s1_hookseed_000", status="candidate",
+            candidate=Stage2CandidateOutput(**_valid_stage2_candidate_kwargs()),
+            reject_reason_code="insufficient_context_available",
+        )
+
+
+def test_stage2_attempt_output_accepts_valid_candidate_and_rejected_shapes():
+    Stage2AttemptOutput(**_valid_stage2_attempt_kwargs("s1_hookseed_000", status="candidate"))
+    Stage2AttemptOutput(**_valid_stage2_attempt_kwargs("s1_hookseed_000", status="rejected"))
+
+
+def test_stage2_output_accepts_up_to_stage2_max_coverage_targets():
+    """coverage-target redesign: Stage2Output.attempts is capped at
+    config.STAGE2_MAX_COVERAGE_TARGETS -- matching the number of coverage
+    targets Python will ever actually send (see
+    _select_hook_seed_coverage_targets), not an independent design ceiling.
     """
-    assert config.STAGE2_MAX_DESIGNS == 6
-    assert config.STAGE2_MAX_DESIGNS > config.NUM_CANDIDATES
-    for n in range(config.NUM_CANDIDATES + 1, config.STAGE2_MAX_DESIGNS + 1):
-        out = Stage2Output(candidates=[Stage2CandidateOutput(**_valid_stage2_candidate_kwargs()) for _ in range(n)])
-        assert len(out.candidates) == n
+    assert config.STAGE2_MAX_COVERAGE_TARGETS == 8
+    for n in range(1, config.STAGE2_MAX_COVERAGE_TARGETS + 1):
+        out = Stage2Output(
+            attempts=[
+                Stage2AttemptOutput(**_valid_stage2_attempt_kwargs(f"s1_hookseed_{i:03d}"))
+                for i in range(n)
+            ],
+            fallback_candidates=[], ranking=[],
+        )
+        assert len(out.attempts) == n
     with pytest.raises(ValidationError):
         Stage2Output(
-            candidates=[Stage2CandidateOutput(**_valid_stage2_candidate_kwargs()) for _ in range(config.STAGE2_MAX_DESIGNS + 1)]
+            attempts=[
+                Stage2AttemptOutput(**_valid_stage2_attempt_kwargs(f"s1_hookseed_{i:03d}"))
+                for i in range(config.STAGE2_MAX_COVERAGE_TARGETS + 1)
+            ],
+            fallback_candidates=[], ranking=[],
+        )
+
+
+def test_stage2_output_accepts_up_to_stage2_max_fallback_candidates():
+    assert config.STAGE2_MAX_FALLBACK_CANDIDATES == config.NUM_CANDIDATES
+    for n in range(1, config.STAGE2_MAX_FALLBACK_CANDIDATES + 1):
+        out = Stage2Output(
+            attempts=[],
+            fallback_candidates=[
+                Stage2FallbackCandidateOutput(**_valid_stage2_fallback_candidate_kwargs(f"fb{i}"))
+                for i in range(n)
+            ],
+            ranking=[],
+        )
+        assert len(out.fallback_candidates) == n
+    with pytest.raises(ValidationError):
+        Stage2Output(
+            attempts=[],
+            fallback_candidates=[
+                Stage2FallbackCandidateOutput(**_valid_stage2_fallback_candidate_kwargs(f"fb{i}"))
+                for i in range(config.STAGE2_MAX_FALLBACK_CANDIDATES + 1)
+            ],
+            ranking=[],
         )
 
 
 def test_stage2_output_max_json_size_is_well_under_max_tokens():
-    """Mirrors test_stage1_output_max_json_size_is_well_under_max_tokens:
-    guards against the worst-case Stage2Output JSON (STAGE2_MAX_DESIGNS
-    candidates, 3 segments each, long enum values, 3-digit segment ids, a
-    max-length anchor on both ends of every segment) approaching
-    STAGE2_MAX_OUTPUT_TOKENS closely enough to risk the same
-    stop_reason="max_tokens" truncation this codebase has hit before.
+    """Guards against the worst-case Stage2Output JSON (STAGE2_MAX_
+    COVERAGE_TARGETS attempts + STAGE2_MAX_FALLBACK_CANDIDATES fallback
+    candidates, each with a full 3-segment candidate, long enum values,
+    3-digit segment ids, a max-length anchor on both ends of every
+    segment, plus a ranking list) approaching STAGE2_MAX_OUTPUT_TOKENS
+    closely enough to risk the same stop_reason="max_tokens" truncation
+    this codebase has hit before.
     """
     candidate = Stage2CandidateOutput(
         hook_type="surprising_fact",
@@ -3779,11 +4122,22 @@ def test_stage2_output_max_json_size_is_well_under_max_tokens():
         ],
         opening_hook_strength=95,
         score=92,
+        opening_self_contained=True,
+        hook_claim_resolved=True,
         semantic_ending_complete=True,
         ending_rationale_code="recomposed_for_duration",
         recomposed_for_duration=True,
     )
-    worst_case = Stage2Output(candidates=[candidate] * config.STAGE2_MAX_DESIGNS)
+    attempts = [
+        Stage2AttemptOutput(hook_seed_id=f"s1_hookseed_{i:03d}", status="candidate", candidate=candidate)
+        for i in range(config.STAGE2_MAX_COVERAGE_TARGETS)
+    ]
+    fallback_candidates = [
+        Stage2FallbackCandidateOutput(fallback_id=f"fb{i}", candidate=candidate)
+        for i in range(config.STAGE2_MAX_FALLBACK_CANDIDATES)
+    ]
+    ranking = [a.hook_seed_id for a in attempts] + [f.fallback_id for f in fallback_candidates]
+    worst_case = Stage2Output(attempts=attempts, fallback_candidates=fallback_candidates, ranking=ranking)
     text = worst_case.model_dump_json()
 
     char_count = len(text)
@@ -3800,65 +4154,184 @@ def _valid_material_segment_kwargs():
     return {"start_segment_id": 0, "end_segment_id": 0}
 
 
-def _valid_material_kwargs():
+def _valid_support_material_kwargs():
     return {
-        "material_type": "hook", "segments": [_valid_material_segment_kwargs()],
+        "material_type": "reason", "segments": [_valid_material_segment_kwargs()],
         "usefulness_score": 80,
     }
 
 
-def test_stage1_output_accepts_zero_to_six_materials():
-    """Stage1's per-chunk cap was widened 3 -> config.STAGE1_MAX_CANDIDATES_
-    PER_CHUNK (6): Stage1's job is recall (cast a wide net of materials
-    across every material_type), not picking the final best-3 -- that
-    narrowing still happens via the material prefilter + Stage2's final
-    edit design, not by capping Stage1's search breadth.
+def _valid_hook_seed_kwargs():
+    return {
+        "signal_type": "money_or_number", "segments": [_valid_material_segment_kwargs()],
+        "soft_score": 80,
+    }
+
+
+def _valid_fallback_span_kwargs():
+    return {"segments": [_valid_material_segment_kwargs()], "safety_score": 60}
+
+
+def test_stage1_output_accepts_zero_to_max_hook_seeds_support_materials_fallback_spans():
+    """Stage1's per-chunk output is now three independently-capped groups
+    (hook_seeds/support_materials/fallback_spans), not one shared list --
+    each caps out at its own config constant.
     """
-    assert config.STAGE1_MAX_CANDIDATES_PER_CHUNK == 6
-    assert Stage1Output(materials=[]).materials == []
-    for n in range(1, 7):
-        out = Stage1Output(materials=[Stage1MaterialOutput(**_valid_material_kwargs()) for _ in range(n)])
-        assert len(out.materials) == n
+    assert config.STAGE1_MAX_HOOK_SEEDS_PER_CHUNK == 6
+    assert config.STAGE1_MAX_SUPPORT_MATERIALS_PER_CHUNK == 6
+    assert config.STAGE1_MAX_FALLBACK_SPANS_PER_CHUNK == 2
+
+    empty = Stage1Output(hook_seeds=[], support_materials=[], fallback_spans=[])
+    assert empty.hook_seeds == [] and empty.support_materials == [] and empty.fallback_spans == []
+
+    for n in range(1, config.STAGE1_MAX_HOOK_SEEDS_PER_CHUNK + 1):
+        out = Stage1Output(
+            hook_seeds=[Stage1HookSeedOutput(**_valid_hook_seed_kwargs()) for _ in range(n)],
+            support_materials=[], fallback_spans=[],
+        )
+        assert len(out.hook_seeds) == n
     with pytest.raises(ValidationError):
-        Stage1Output(materials=[Stage1MaterialOutput(**_valid_material_kwargs()) for _ in range(7)])
+        Stage1Output(
+            hook_seeds=[
+                Stage1HookSeedOutput(**_valid_hook_seed_kwargs())
+                for _ in range(config.STAGE1_MAX_HOOK_SEEDS_PER_CHUNK + 1)
+            ],
+            support_materials=[], fallback_spans=[],
+        )
+
+    for n in range(1, config.STAGE1_MAX_SUPPORT_MATERIALS_PER_CHUNK + 1):
+        out = Stage1Output(
+            hook_seeds=[],
+            support_materials=[Stage1SupportMaterialOutput(**_valid_support_material_kwargs()) for _ in range(n)],
+            fallback_spans=[],
+        )
+        assert len(out.support_materials) == n
+    with pytest.raises(ValidationError):
+        Stage1Output(
+            hook_seeds=[], fallback_spans=[],
+            support_materials=[
+                Stage1SupportMaterialOutput(**_valid_support_material_kwargs())
+                for _ in range(config.STAGE1_MAX_SUPPORT_MATERIALS_PER_CHUNK + 1)
+            ],
+        )
+
+    for n in range(1, config.STAGE1_MAX_FALLBACK_SPANS_PER_CHUNK + 1):
+        out = Stage1Output(
+            hook_seeds=[], support_materials=[],
+            fallback_spans=[Stage1FallbackSpanOutput(**_valid_fallback_span_kwargs()) for _ in range(n)],
+        )
+        assert len(out.fallback_spans) == n
+    with pytest.raises(ValidationError):
+        Stage1Output(
+            hook_seeds=[], support_materials=[],
+            fallback_spans=[
+                Stage1FallbackSpanOutput(**_valid_fallback_span_kwargs())
+                for _ in range(config.STAGE1_MAX_FALLBACK_SPANS_PER_CHUNK + 1)
+            ],
+        )
 
 
-def test_stage1_material_output_segments_length_bounds():
+def test_stage1_output_max_json_size_is_well_under_max_tokens():
+    """Worst-case Stage1Output JSON: max hook_seeds (2 segments each) +
+    max support_materials (3 segments each) + max fallback_spans (3
+    segments each), long enum values, a max-length anchor on every
+    segment -- must stay comfortably under half of STAGE1_MAX_OUTPUT_
+    TOKENS to avoid the stop_reason="max_tokens" truncation risk this
+    codebase has hit before.
+    """
+    seg = {"start_segment_id": 123, "end_segment_id": 124, "start_anchor_text": "あ" * 60}
+    hook_seeds = [
+        Stage1HookSeedOutput(signal_type="surprising_fact", segments=[seg, seg], soft_score=90)
+        for _ in range(config.STAGE1_MAX_HOOK_SEEDS_PER_CHUNK)
+    ]
+    support_materials = [
+        Stage1SupportMaterialOutput(material_type="context", segments=[seg, seg, seg], usefulness_score=90)
+        for _ in range(config.STAGE1_MAX_SUPPORT_MATERIALS_PER_CHUNK)
+    ]
+    fallback_spans = [
+        Stage1FallbackSpanOutput(segments=[seg, seg, seg], safety_score=90)
+        for _ in range(config.STAGE1_MAX_FALLBACK_SPANS_PER_CHUNK)
+    ]
+    worst_case = Stage1Output(
+        hook_seeds=hook_seeds, support_materials=support_materials, fallback_spans=fallback_spans
+    )
+    text = worst_case.model_dump_json()
+
+    char_count = len(text)
+    estimated_tokens = char_count / 3.5
+
+    assert estimated_tokens < config.STAGE1_MAX_OUTPUT_TOKENS / 2, (
+        f"worst-case Stage1Output JSON is {char_count} chars (~{estimated_tokens:.0f} "
+        f"estimated tokens) -- unexpectedly close to STAGE1_MAX_OUTPUT_TOKENS="
+        f"{config.STAGE1_MAX_OUTPUT_TOKENS}."
+    )
+
+
+def test_stage1_hook_seed_output_segments_length_bounds():
+    for n in (1, 2):
+        kwargs = _valid_hook_seed_kwargs()
+        kwargs["segments"] = [_valid_material_segment_kwargs() for _ in range(n)]
+        Stage1HookSeedOutput(**kwargs)
+    for n in (0, 3):
+        kwargs = _valid_hook_seed_kwargs()
+        kwargs["segments"] = [_valid_material_segment_kwargs() for _ in range(n)]
+        with pytest.raises(ValidationError):
+            Stage1HookSeedOutput(**kwargs)
+
+
+def test_stage1_support_material_output_segments_length_bounds():
     for n in (1, 2, 3):
-        kwargs = _valid_material_kwargs()
+        kwargs = _valid_support_material_kwargs()
         kwargs["segments"] = [_valid_material_segment_kwargs() for _ in range(n)]
-        Stage1MaterialOutput(**kwargs)
+        Stage1SupportMaterialOutput(**kwargs)
     for n in (0, 4):
-        kwargs = _valid_material_kwargs()
+        kwargs = _valid_support_material_kwargs()
         kwargs["segments"] = [_valid_material_segment_kwargs() for _ in range(n)]
         with pytest.raises(ValidationError):
-            Stage1MaterialOutput(**kwargs)
+            Stage1SupportMaterialOutput(**kwargs)
 
 
-def test_stage1_material_output_usefulness_score_bounds():
+def test_stage1_support_material_output_usefulness_score_bounds():
     for value in (0, 100):
-        kwargs = _valid_material_kwargs()
+        kwargs = _valid_support_material_kwargs()
         kwargs["usefulness_score"] = value
-        Stage1MaterialOutput(**kwargs)
+        Stage1SupportMaterialOutput(**kwargs)
     for value in (-1, 101):
-        kwargs = _valid_material_kwargs()
+        kwargs = _valid_support_material_kwargs()
         kwargs["usefulness_score"] = value
         with pytest.raises(ValidationError):
-            Stage1MaterialOutput(**kwargs)
+            Stage1SupportMaterialOutput(**kwargs)
 
 
-def test_stage1_material_output_rejects_invalid_material_type():
-    kwargs = _valid_material_kwargs()
+def test_stage1_support_material_output_rejects_invalid_material_type():
+    kwargs = _valid_support_material_kwargs()
     kwargs["material_type"] = "not_a_real_material_type"
     with pytest.raises(ValidationError):
-        Stage1MaterialOutput(**kwargs)
+        Stage1SupportMaterialOutput(**kwargs)
 
 
-@pytest.mark.parametrize("material_type", ["hook", "reason", "example", "context", "payoff"])
-def test_stage1_material_output_accepts_every_material_type(material_type):
-    kwargs = _valid_material_kwargs()
+@pytest.mark.parametrize("material_type", ["reason", "example", "context", "payoff"])
+def test_stage1_support_material_output_accepts_every_material_type(material_type):
+    kwargs = _valid_support_material_kwargs()
     kwargs["material_type"] = material_type
-    Stage1MaterialOutput(**kwargs)
+    Stage1SupportMaterialOutput(**kwargs)
+
+
+@pytest.mark.parametrize("signal_type", [
+    "money_or_number", "failure_or_loss", "surprising_fact", "strong_claim",
+    "comparison", "direct_question", "strong_conclusion", "story_turn", "other",
+])
+def test_stage1_hook_seed_output_accepts_every_signal_type(signal_type):
+    kwargs = _valid_hook_seed_kwargs()
+    kwargs["signal_type"] = signal_type
+    Stage1HookSeedOutput(**kwargs)
+
+
+def test_stage1_hook_seed_output_rejects_invalid_signal_type():
+    kwargs = _valid_hook_seed_kwargs()
+    kwargs["signal_type"] = "not_a_real_signal_type"
+    with pytest.raises(ValidationError):
+        Stage1HookSeedOutput(**kwargs)
 
 
 def test_stage1_material_segment_output_rejects_wrongly_typed_segment_id():
@@ -3866,13 +4339,13 @@ def test_stage1_material_segment_output_rejects_wrongly_typed_segment_id():
         Stage1MaterialSegmentOutput(start_segment_id=["not", "an", "int"], end_segment_id=0)
 
 
-def test_stage1_material_output_rejects_unknown_fields():
+def test_stage1_support_material_output_rejects_unknown_fields():
     # extra="forbid" -> additionalProperties: false in the schema sent to
     # Claude, and the same strictness applies locally.
-    kwargs = _valid_material_kwargs()
+    kwargs = _valid_support_material_kwargs()
     kwargs["hook_type"] = "should not be accepted"
     with pytest.raises(ValidationError):
-        Stage1MaterialOutput(**kwargs)
+        Stage1SupportMaterialOutput(**kwargs)
 
 
 # --- _deterministic_hook_text (item M) ------------------------------------
@@ -3923,7 +4396,10 @@ def test_deterministic_hook_text_reflects_anchor_trim():
 
 
 def test_extract_candidates_for_chunk_converts_structured_output(monkeypatch):
-    output = Stage1Output(materials=[Stage1MaterialOutput(**_valid_material_kwargs())])
+    output = Stage1Output(
+        hook_seeds=[], support_materials=[Stage1SupportMaterialOutput(**_valid_support_material_kwargs())],
+        fallback_spans=[],
+    )
     monkeypatch.setattr(
         clip_selector.structured_output, "call",
         lambda schema_model, **kwargs: output,
@@ -3932,26 +4408,31 @@ def test_extract_candidates_for_chunk_converts_structured_output(monkeypatch):
     segments = [_segment(0, start=0.0, text="強い発言です")]
     result = clip_selector.extract_candidates_for_chunk(segments, "タイトル")
 
-    assert len(result) == 1
-    assert isinstance(result[0], RawMaterial)
-    assert result[0].material_type == "hook"
-    assert result[0].usefulness_score == 80
+    assert isinstance(result, Stage1ChunkResult)
+    assert result.hook_seeds == []
+    assert result.fallback_spans == []
+    assert len(result.support_materials) == 1
+    assert isinstance(result.support_materials[0], RawMaterial)
+    assert result.support_materials[0].material_type == "reason"
+    assert result.support_materials[0].usefulness_score == 80
     # A material has none of the finished-candidate display/scoring
     # properties -- those only ever exist on RawClipCandidate, produced
     # solely by Stage2's conversion (_raw_candidate_from_stage2_output).
-    assert not hasattr(result[0], "hook_text")
-    assert not hasattr(result[0], "title")
+    assert not hasattr(result.support_materials[0], "hook_text")
+    assert not hasattr(result.support_materials[0], "title")
 
 
 def test_extract_candidates_for_chunk_carries_anchor_text_through(monkeypatch):
     # The material conversion must preserve start_anchor_text verbatim --
     # boundary.py verifies/applies it later, at Stage2-design-conversion
     # and resolve time, exactly as it always has for Stage1 output.
-    kwargs = _valid_material_kwargs()
+    kwargs = _valid_support_material_kwargs()
     kwargs["segments"] = [
         {"start_segment_id": 0, "end_segment_id": 0, "start_anchor_text": "86は"}
     ]
-    output = Stage1Output(materials=[Stage1MaterialOutput(**kwargs)])
+    output = Stage1Output(
+        hook_seeds=[], support_materials=[Stage1SupportMaterialOutput(**kwargs)], fallback_spans=[],
+    )
     monkeypatch.setattr(
         clip_selector.structured_output, "call",
         lambda schema_model, **kwargs: output,
@@ -3972,41 +4453,45 @@ def test_extract_candidates_for_chunk_carries_anchor_text_through(monkeypatch):
     ]
     result = clip_selector.extract_candidates_for_chunk(chunk_segments, "タイトル")
 
-    material = result[0]
+    material = result.support_materials[0]
     assert material.segments[0].start_anchor_text == "86は"
 
 
 def test_design_final_candidates_converts_stage2_output_to_raw_candidates(monkeypatch):
     # Stage2 now designs final candidates directly (real segment_id
-    # references it may freely recombine), not an id ranking -- the
-    # conversion mirrors _raw_candidate_from_stage1_output exactly, plus
-    # end_anchor_text.
+    # references it may freely recombine) via an attempt-per-coverage-
+    # target -- the conversion mirrors _raw_candidate_from_stage1_output
+    # exactly, plus end_anchor_text.
     transcript = _long_transcript(minutes=1)
+    coverage_targets = [("s1_hookseed_000", _raw_hook_seed(0, 2))]
     materials = {"s1_m000": _raw_material(0, 2)}
     output = Stage2Output(
-        candidates=[
-            Stage2CandidateOutput(
-                hook_type="story",
-                segments=[
-                    Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=2)
-                ],
-                opening_hook_strength=85,
-                score=85,
-                semantic_ending_complete=True,
-                ending_rationale_code="natural_conclusion",
-                recomposed_for_duration=False,
+        attempts=[
+            Stage2AttemptOutput(
+                hook_seed_id="s1_hookseed_000", status="candidate",
+                candidate=Stage2CandidateOutput(
+                    **{
+                        **_valid_stage2_candidate_kwargs(),
+                        "hook_type": "story",
+                        "segments": [Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=2)],
+                        "opening_hook_strength": 85,
+                        "score": 85,
+                    }
+                ),
             )
-        ]
+        ],
+        fallback_candidates=[], ranking=["s1_hookseed_000"],
     )
     monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
 
-    designed = clip_selector.design_final_candidates(materials, transcript, "タイトル")
+    design = clip_selector.design_final_candidates(coverage_targets, materials, {}, transcript, "タイトル")
 
-    assert len(designed) == 1
-    assert designed[0].hook_type == "story"
-    assert designed[0].opening_hook_strength == 85
-    assert designed[0].score == 85
-    assert designed[0].segments == [
+    assert len(design.attempts) == 1
+    designed = design.attempts[0].candidate
+    assert designed.hook_type == "story"
+    assert designed.opening_hook_strength == 85
+    assert designed.score == 85
+    assert designed.segments == [
         RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=2)
     ]
 
@@ -4020,33 +4505,38 @@ def test_design_final_candidates_can_recombine_segments_across_materials(monkeyp
     # confirms a design combining ids 0 (from material A) and 2 (from
     # material B) round-trips correctly.
     transcript = _long_transcript(minutes=1)
+    coverage_targets = [("s1_hookseed_000", _raw_hook_seed(0, 0))]  # a strong standalone conclusion
     materials = {
-        "s1_m000": _raw_material(0, 0, material_type="hook"),  # a strong standalone conclusion
         "s1_m001": _raw_material(2, 2, material_type="reason"),  # a separate reason material
     }
     output = Stage2Output(
-        candidates=[
-            Stage2CandidateOutput(
-                hook_type="strong_take",
-                segments=[
-                    Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=0),
-                    Stage2SegmentOutput(role="answer", start_segment_id=2, end_segment_id=2),
-                ],
-                opening_hook_strength=90,
-                score=90,
-                semantic_ending_complete=True,
-                ending_rationale_code="natural_conclusion",
-                recomposed_for_duration=False,
+        attempts=[
+            Stage2AttemptOutput(
+                hook_seed_id="s1_hookseed_000", status="candidate",
+                candidate=Stage2CandidateOutput(
+                    **{
+                        **_valid_stage2_candidate_kwargs(),
+                        "hook_type": "strong_take",
+                        "segments": [
+                            Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=0),
+                            Stage2SegmentOutput(role="answer", start_segment_id=2, end_segment_id=2),
+                        ],
+                        "opening_hook_strength": 90,
+                        "score": 90,
+                    }
+                ),
             )
-        ]
+        ],
+        fallback_candidates=[], ranking=["s1_hookseed_000"],
     )
     monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
 
-    designed = clip_selector.design_final_candidates(materials, transcript, "タイトル")
+    design = clip_selector.design_final_candidates(coverage_targets, materials, {}, transcript, "タイトル")
 
-    assert len(designed) == 1
-    assert [s.start_segment_id for s in designed[0].segments] == [0, 2]
-    assert [s.role for s in designed[0].segments] == ["hook", "answer"]
+    assert len(design.attempts) == 1
+    designed = design.attempts[0].candidate
+    assert [s.start_segment_id for s in designed.segments] == [0, 2]
+    assert [s.role for s in designed.segments] == ["hook", "answer"]
 
 
 def test_design_final_candidates_carries_end_anchor_text_through(monkeypatch):
@@ -4055,31 +4545,36 @@ def test_design_final_candidates_carries_end_anchor_text_through(monkeypatch):
     # into RawUsedSegment (boundary.py already knows how to verify/apply
     # it, unchanged since the duration-repair round).
     transcript = _long_transcript(minutes=1)
-    materials = {"s1_m000": _raw_material(0, 2)}
+    coverage_targets = [("s1_hookseed_000", _raw_hook_seed(0, 2))]
     output = Stage2Output(
-        candidates=[
-            Stage2CandidateOutput(
-                hook_type="story",
-                segments=[
-                    Stage2SegmentOutput(
-                        role="hook", start_segment_id=0, end_segment_id=2,
-                        start_anchor_text="segment 0", end_anchor_text="segment 2",
-                    )
-                ],
-                opening_hook_strength=85,
-                score=85,
-                semantic_ending_complete=True,
-                ending_rationale_code="natural_conclusion",
-                recomposed_for_duration=False,
+        attempts=[
+            Stage2AttemptOutput(
+                hook_seed_id="s1_hookseed_000", status="candidate",
+                candidate=Stage2CandidateOutput(
+                    **{
+                        **_valid_stage2_candidate_kwargs(),
+                        "hook_type": "story",
+                        "segments": [
+                            Stage2SegmentOutput(
+                                role="hook", start_segment_id=0, end_segment_id=2,
+                                start_anchor_text="segment 0", end_anchor_text="segment 2",
+                            )
+                        ],
+                        "opening_hook_strength": 85,
+                        "score": 85,
+                    }
+                ),
             )
-        ]
+        ],
+        fallback_candidates=[], ranking=["s1_hookseed_000"],
     )
     monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
 
-    designed = clip_selector.design_final_candidates(materials, transcript, "タイトル")
+    design = clip_selector.design_final_candidates(coverage_targets, {}, {}, transcript, "タイトル")
 
-    assert designed[0].segments[0].start_anchor_text == "segment 0"
-    assert designed[0].segments[0].end_anchor_text == "segment 2"
+    designed = design.attempts[0].candidate
+    assert designed.segments[0].start_anchor_text == "segment 0"
+    assert designed.segments[0].end_anchor_text == "segment 2"
 
 
 def test_design_final_candidates_does_not_send_full_transcript(monkeypatch):
@@ -4088,37 +4583,28 @@ def test_design_final_candidates_does_not_send_full_transcript(monkeypatch):
     # appear in what gets sent to the API.
     transcript = _long_transcript(minutes=5)
     transcript.segments[-1].text = "この文言はどの候補にも含まれない特徴的な発言マーカーXYZ123"
+    coverage_targets = [("s1_hookseed_000", _raw_hook_seed(0, 2))]
     materials = {"s1_m000": _raw_material(0, 2)}
 
     captured = {}
 
     def _spy(schema_model, *, stage, system_prompt, user_content, max_tokens):
         captured["user_content"] = user_content
-        return Stage2Output(candidates=[])
+        return Stage2Output(attempts=[], fallback_candidates=[], ranking=[])
 
     monkeypatch.setattr(clip_selector.structured_output, "call", _spy)
-    clip_selector.design_final_candidates(materials, transcript, "タイトル")
+    clip_selector.design_final_candidates(coverage_targets, materials, {}, transcript, "タイトル")
 
     assert "マーカーXYZ123" not in captured["user_content"]
 
 
-def test_design_final_candidates_deduplicates_exact_repeat_designs(monkeypatch):
-    # New Python-side safety net (item 6's "duplicate" check): two
-    # byte-identical final designs collapse to one, even if Stage2's own
-    # prompt-level dedup instruction fails to catch it.
-    transcript = _long_transcript(minutes=1)
-    materials = {"s1_m000": _raw_material(0, 2)}
-    same_segment = Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=2)
-    output = Stage2Output(
-        candidates=[
-            Stage2CandidateOutput(**{**_valid_stage2_candidate_kwargs(), "segments": [same_segment]}),
-            Stage2CandidateOutput(**{**_valid_stage2_candidate_kwargs(), "segments": [same_segment]}),
-        ]
-    )
-    monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
-
-    designed = clip_selector.design_final_candidates(materials, transcript, "タイトル")
-    assert len(designed) == 1
+# NOTE: the exact-repeat-design dedup safety net now lives in
+# _select_final_candidates (see test_select_final_candidates_dedupes_
+# identical_segment_sequences), not in design_final_candidates itself --
+# see test_design_final_candidates_saves_raw_diagnostic_before_local_
+# validation, which proves design_final_candidates deliberately returns
+# every attempt Stage2 built, undeduped, so the diagnostic snapshot always
+# reflects Stage2's raw output.
 
 
 # --- semantic-ending-design round: lookahead exposure + Stage2's own -----
@@ -4210,25 +4696,29 @@ def test_design_final_candidates_stage2_can_reference_lookahead_segment_as_final
     # test that Stage2 *chooses well* -- only that the plumbing lets it
     # extend into lookahead content when it does choose to.
     transcript = _long_transcript(minutes=5)
-    materials = {"s1_m000": _raw_material(0, 0)}
+    coverage_targets = [("s1_hookseed_000", _raw_hook_seed(0, 0))]
     output = Stage2Output(
-        candidates=[
-            Stage2CandidateOutput(
-                **{
-                    **_valid_stage2_candidate_kwargs(),
-                    "segments": [
-                        Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=0),
-                        Stage2SegmentOutput(role="answer", start_segment_id=1, end_segment_id=1),
-                    ],
-                }
+        attempts=[
+            Stage2AttemptOutput(
+                hook_seed_id="s1_hookseed_000", status="candidate",
+                candidate=Stage2CandidateOutput(
+                    **{
+                        **_valid_stage2_candidate_kwargs(),
+                        "segments": [
+                            Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=0),
+                            Stage2SegmentOutput(role="answer", start_segment_id=1, end_segment_id=1),
+                        ],
+                    }
+                ),
             )
-        ]
+        ],
+        fallback_candidates=[], ranking=["s1_hookseed_000"],
     )
     monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
 
-    designed = clip_selector.design_final_candidates(materials, transcript, "タイトル")
+    design = clip_selector.design_final_candidates(coverage_targets, {}, {}, transcript, "タイトル")
 
-    assert [s.start_segment_id for s in designed[0].segments] == [0, 1]
+    assert [s.start_segment_id for s in design.attempts[0].candidate.segments] == [0, 1]
 
 
 def test_design_final_candidates_saves_materials_lookahead_to_diagnostic(monkeypatch):
@@ -4236,15 +4726,15 @@ def test_design_final_candidates_saves_materials_lookahead_to_diagnostic(monkeyp
     # future mid-cutoff incident is debuggable -- what lookahead Stage2 had
     # available, not just what it ultimately chose.
     transcript = _long_transcript(minutes=5)
-    materials = {"s1_m000": _raw_material(0, 0)}
-    output = Stage2Output(candidates=[Stage2CandidateOutput(**_valid_stage2_candidate_kwargs())])
+    coverage_targets = [("s1_hookseed_000", _raw_hook_seed(0, 0))]
+    output = _stage2_output_single_attempt("s1_hookseed_000")
     monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
 
-    clip_selector.design_final_candidates(materials, transcript, "タイトル")
+    clip_selector.design_final_candidates(coverage_targets, {}, {}, transcript, "タイトル")
 
     diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
     assert "materials_lookahead" in diagnostic
-    assert diagnostic["materials_lookahead"]["s1_m000"][0]["segment_id"] == 1
+    assert diagnostic["materials_lookahead"]["s1_hookseed_000"][0]["segment_id"] == 1
 
 
 def test_design_finalize_and_cache_preserves_materials_lookahead_after_second_save(monkeypatch):
@@ -4255,17 +4745,16 @@ def test_design_finalize_and_cache_preserves_materials_lookahead_after_second_sa
     transcript = _long_transcript(minutes=5)
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    monkeypatch.setattr(config, "MIN_OPENING_HOOK_STRENGTH", 0)
-    materials = [_raw_material(0, 0)]
-    output = Stage2Output(candidates=[Stage2CandidateOutput(**_valid_stage2_candidate_kwargs())])
+    hook_seeds = [_raw_hook_seed(0, 0)]
+    output = _stage2_output_single_attempt("s1_hookseed_000")
     monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
 
-    clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+    clip_selector._design_finalize_and_cache(hook_seeds, [], [], transcript, "タイトル")
 
     diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
     assert "materials_lookahead" in diagnostic
     assert "evaluations" in diagnostic
-    assert diagnostic["materials_lookahead"]["s1_m000"][0]["segment_id"] == 1
+    assert diagnostic["materials_lookahead"]["s1_hookseed_000"][0]["segment_id"] == 1
 
 
 def test_stage2_diagnostic_evaluation_includes_ending_design_fields(monkeypatch):
@@ -4274,22 +4763,14 @@ def test_stage2_diagnostic_evaluation_includes_ending_design_fields(monkeypatch)
     transcript = _long_transcript(minutes=5)
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    monkeypatch.setattr(config, "MIN_OPENING_HOOK_STRENGTH", 0)
-    materials = [_raw_material(0, 0)]
-    output = Stage2Output(
-        candidates=[
-            Stage2CandidateOutput(
-                **{
-                    **_valid_stage2_candidate_kwargs(),
-                    "ending_rationale_code": "hook_resolved",
-                    "recomposed_for_duration": True,
-                }
-            )
-        ]
+    hook_seeds = [_raw_hook_seed(0, 0)]
+    output = _stage2_output_single_attempt(
+        "s1_hookseed_000",
+        candidate_overrides={"ending_rationale_code": "hook_resolved", "recomposed_for_duration": True},
     )
     monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
 
-    clip_selector._design_finalize_and_cache(materials, transcript, "タイトル")
+    clip_selector._design_finalize_and_cache(hook_seeds, [], [], transcript, "タイトル")
 
     diagnostic = cache.load_stage2_diagnostic(transcript.video_id)
     evaluation = diagnostic["evaluations"][0]
@@ -4317,36 +4798,50 @@ def test_raw_clip_candidate_defaults_semantic_ending_fields():
 
 
 def test_design_final_candidates_supports_omitting_a_closure_failing_design(monkeypatch):
-    # Item 12/K: Stage2Output needs no new field to express semantic-
-    # closure failure -- the prompt instructs Claude to simply omit the
-    # design (see rank_and_finalize.md's "意味的な完結性" section) rather
-    # than including a broken one, and the schema's min_length=0 already
-    # supports returning fewer designs than materials given, with no
-    # further changes.
+    # Item 12/K (revised for the hook-seed-coverage redesign): the old
+    # architecture let Stage2 express semantic-closure failure by simply
+    # omitting the design from its output (min_length=0 on the candidate
+    # list). The whole point of the coverage-target redesign is that this
+    # is no longer allowed -- a coverage target that fails semantic closure
+    # must come back as an explicit status="rejected" attempt (see
+    # Stage2AttemptOutput's model_validator and rank_and_finalize.md's
+    # anti-silent-skip instruction), never a silently missing id.
     transcript = _long_transcript(minutes=1)
-    materials = {
-        "s1_m000": _raw_material(0, 2),  # hook + real reason: passes closure
-        "s1_m001": _raw_material(0, 2),  # hook only, no reason: Stage2 omits this design
-    }
+    coverage_targets = [
+        ("s1_hookseed_000", _raw_hook_seed(0, 2)),  # hook + real reason: passes closure
+        ("s1_hookseed_001", _raw_hook_seed(0, 2)),  # hook only, no reason: Stage2 rejects this one
+    ]
     output = Stage2Output(
-        candidates=[
-            Stage2CandidateOutput(
-                hook_type="story",
-                segments=[Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=2)],
-                opening_hook_strength=85,
-                score=85,
-                semantic_ending_complete=True,
-                ending_rationale_code="natural_conclusion",
-                recomposed_for_duration=False,
-            )
-        ]
+        attempts=[
+            Stage2AttemptOutput(
+                hook_seed_id="s1_hookseed_000", status="candidate",
+                candidate=Stage2CandidateOutput(
+                    **{
+                        **_valid_stage2_candidate_kwargs(),
+                        "hook_type": "story",
+                        "segments": [Stage2SegmentOutput(role="hook", start_segment_id=0, end_segment_id=2)],
+                        "opening_hook_strength": 85,
+                        "score": 85,
+                    }
+                ),
+            ),
+            Stage2AttemptOutput(
+                hook_seed_id="s1_hookseed_001", status="rejected",
+                reject_reason_code="semantic_closure_unavailable",
+            ),
+        ],
+        fallback_candidates=[], ranking=["s1_hookseed_000"],
     )
     monkeypatch.setattr(clip_selector.structured_output, "call", lambda schema_model, **kwargs: output)
 
-    designed = clip_selector.design_final_candidates(materials, transcript, "タイトル")
+    design = clip_selector.design_final_candidates(coverage_targets, {}, {}, transcript, "タイトル")
 
-    assert len(designed) == 1
-    assert set(Stage2Output.model_fields) == {"candidates"}
+    assert len(design.attempts) == 2
+    accepted = [a for a in design.attempts if a.status == "candidate"]
+    rejected = [a for a in design.attempts if a.status == "rejected"]
+    assert len(accepted) == 1
+    assert len(rejected) == 1
+    assert rejected[0].reject_reason_code == "semantic_closure_unavailable"
 
 
 # --- opening trim: _opening_text/_looks_like_weak_opening must agree with
@@ -4424,14 +4919,17 @@ def test_select_candidates_calls_stage2_at_most_once(monkeypatch):
     transcript = _long_transcript(minutes=1)
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
-    materials = [_raw_material(0, 2) for _ in range(3)]
-    monkeypatch.setattr(clip_selector, "run_stage1", lambda *a, **k: materials)
+    hook_seeds = [_raw_hook_seed(0, 2) for _ in range(3)]
+    monkeypatch.setattr(
+        clip_selector, "run_stage1",
+        lambda *a, **k: Stage1ChunkResult(hook_seeds=hook_seeds, support_materials=[], fallback_spans=[]),
+    )
 
     call_count = {"n": 0}
 
-    def _fake_design(materials, t, title):
+    def _fake_design(coverage_targets, materials, fallback_spans, t, title):
         call_count["n"] += 1
-        return [_raw_candidate(0, 2) for _ in materials]
+        return _stage2_design_result_candidates([_raw_candidate(0, 2)])
 
     monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
     clip_selector.select_candidates(transcript, "タイトル")
@@ -4448,14 +4946,20 @@ def test_refresh_candidates_only_calls_stage2_exactly_once_with_enough_stage1_ca
     monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
     monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
     transcript = _long_transcript(minutes=1)
-    materials = [_raw_material(0, 2, usefulness_score=90) for _ in range(3)]
-    cache.save_stage1_chunk(transcript.video_id, 0, materials)
+    hook_seeds = [_raw_hook_seed(0, 0), _raw_hook_seed(0, 1), _raw_hook_seed(0, 2)]
+    cache.save_stage1_chunk(
+        transcript.video_id, 0,
+        Stage1ChunkResult(hook_seeds=hook_seeds, support_materials=[], fallback_spans=[]),
+    )
 
     call_count = {"n": 0}
 
-    def _fake_design(materials, t, title):
+    def _fake_design(coverage_targets, materials, fallback_spans, t, title):
         call_count["n"] += 1
-        return [_raw_candidate(0, 2, opening_hook_strength=90) for _ in materials]
+        return _stage2_design_result_candidates(
+            [_raw_candidate(0, 0, opening_hook_strength=90), _raw_candidate(0, 1, opening_hook_strength=90),
+             _raw_candidate(0, 2, opening_hook_strength=90)]
+        )
 
     monkeypatch.setattr(clip_selector, "design_final_candidates", _fake_design)
     monkeypatch.setattr(
@@ -4497,8 +5001,10 @@ def test_refresh_candidates_only_raises_without_stage2_call_when_no_usable_mater
         video_id="vidRefreshNoUsableMaterial", language="ja",
         segments=[_segment(0, start=0.0, text="ちょっと表現が難しいんですけども、要するにこうです。")],
     )
-    materials = [_raw_material(0, 0, usefulness_score=90) for _ in range(3)]
-    cache.save_stage1_chunk(transcript.video_id, 0, materials)
+    cache.save_stage1_chunk(
+        transcript.video_id, 0,
+        Stage1ChunkResult(hook_seeds=[_raw_hook_seed(0, 0)], support_materials=[], fallback_spans=[]),
+    )
 
     monkeypatch.setattr(
         clip_selector, "design_final_candidates",
@@ -4522,10 +5028,15 @@ def test_refresh_stage1_and_candidates_ignores_existing_stage1_cache(monkeypatch
     transcript = _long_transcript(minutes=1)
     # A stale cached chunk result -- refresh_stage1_and_candidates must
     # never reuse this, only what a fresh Stage1 call returns.
-    stale_bad = [_raw_material(0, 0, usefulness_score=10)]
+    stale_bad = Stage1ChunkResult(
+        hook_seeds=[_raw_hook_seed(0, 0, soft_score=10)], support_materials=[], fallback_spans=[],
+    )
     cache.save_stage1_chunk(transcript.video_id, 0, stale_bad)
 
-    fresh_good = [_raw_material(0, 2, usefulness_score=90) for _ in range(3)]
+    fresh_good = Stage1ChunkResult(
+        hook_seeds=[_raw_hook_seed(0, 0), _raw_hook_seed(0, 1), _raw_hook_seed(0, 2)],
+        support_materials=[], fallback_spans=[],
+    )
     call_count = {"n": 0}
 
     def _fake_extract(chunk_segments, video_title):
@@ -4535,7 +5046,10 @@ def test_refresh_stage1_and_candidates_ignores_existing_stage1_cache(monkeypatch
     monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", _fake_extract)
     monkeypatch.setattr(
         clip_selector, "design_final_candidates",
-        lambda materials, t, title: [_raw_candidate(0, 2, opening_hook_strength=90) for _ in materials],
+        lambda coverage_targets, materials, fallback_spans, t, title: _stage2_design_result_candidates(
+            [_raw_candidate(0, 0, opening_hook_strength=90), _raw_candidate(0, 1, opening_hook_strength=90),
+             _raw_candidate(0, 2, opening_hook_strength=90)]
+        ),
     )
 
     result = clip_selector.refresh_stage1_and_candidates(transcript, "タイトル")
@@ -4546,7 +5060,7 @@ def test_refresh_stage1_and_candidates_ignores_existing_stage1_cache(monkeypatch
     # regenerated, not reused from the existing (now-outdated) cache --
     # and the chunk cache on disk is overwritten with the new result.
     reloaded_chunk = cache.load_stage1_chunk(transcript.video_id, 0)
-    assert all(m.usefulness_score == 90 for m in reloaded_chunk)
+    assert all(s.soft_score == 80 for s in reloaded_chunk.hook_seeds)
     # The finalized Stage2 result is saved too.
     reloaded_stage2 = cache.load_stage2(transcript.video_id)
     assert len(reloaded_stage2) == 3
@@ -4559,7 +5073,7 @@ def test_refresh_stage1_and_candidates_keeps_earlier_chunk_success_on_later_fail
     chunks = clip_selector._build_chunks(clip_selector._usable_segments(transcript))
     assert len(chunks) >= 2  # sanity: this test needs at least 2 chunks
 
-    good = [_raw_material(0, 2, usefulness_score=90)]
+    good = Stage1ChunkResult(hook_seeds=[_raw_hook_seed(0, 0)], support_materials=[], fallback_spans=[])
     call_count = {"n": 0}
 
     def _fake_extract(chunk_segments, video_title):
@@ -4593,13 +5107,15 @@ def test_refresh_stage1_and_candidates_raises_without_stage2_call_when_no_usable
     # speech -- the only thing the material prefilter still screens for --
     # so Stage2 must never be reached (Anthropic API calls = 0 for this
     # failure).
-    bad_material = _raw_material(0, 0, usefulness_score=90)
+    bad_result = Stage1ChunkResult(
+        hook_seeds=[_raw_hook_seed(0, 0)], support_materials=[], fallback_spans=[],
+    )
     transcript.segments[0].text = "ちょっと表現が難しいんですけども、要するにこうです。"
     transcript.segments[0].words = [
         TranscriptWord(start=0.0, end=2.0, text="ちょっと表現が難しいんですけども、要するにこうです。")
     ]
 
-    monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", lambda *a, **k: [bad_material])
+    monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", lambda *a, **k: bad_result)
     monkeypatch.setattr(
         clip_selector, "design_final_candidates",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("Stage2 must not be called")),
@@ -4622,11 +5138,16 @@ def test_refresh_stage1_and_candidates_overwrites_stage2_cache_with_partial_succ
     old_stage2 = [_raw_candidate(0, 2, opening_hook_strength=90)] * 3
     cache.save_stage2(transcript.video_id, old_stage2)
 
-    fresh_materials = [_raw_material(0, 2, usefulness_score=90) for _ in range(3)]
-    monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", lambda *a, **k: fresh_materials)
+    fresh_result = Stage1ChunkResult(
+        hook_seeds=[_raw_hook_seed(0, 0), _raw_hook_seed(0, 1), _raw_hook_seed(0, 2)],
+        support_materials=[], fallback_spans=[],
+    )
+    monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", lambda *a, **k: fresh_result)
     monkeypatch.setattr(
         clip_selector, "design_final_candidates",
-        lambda materials, t, title: [_raw_candidate(0, 2, opening_hook_strength=90) for _ in range(2)],
+        lambda coverage_targets, materials, fallback_spans, t, title: _stage2_design_result_candidates(
+            [_raw_candidate(0, 0, opening_hook_strength=90), _raw_candidate(0, 1, opening_hook_strength=90)]
+        ),
     )
 
     result = clip_selector.refresh_stage1_and_candidates(transcript, "タイトル")
@@ -4647,14 +5168,18 @@ def test_refresh_stage1_and_candidates_does_not_overwrite_stage2_cache_when_noth
     old_stage2 = [_raw_candidate(0, 2, opening_hook_strength=90)] * 3
     cache.save_stage2(transcript.video_id, old_stage2)
 
-    fresh_materials = [_raw_material(0, 2, usefulness_score=90) for _ in range(3)]
-    monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", lambda *a, **k: fresh_materials)
+    fresh_result = Stage1ChunkResult(
+        hook_seeds=[_raw_hook_seed(0, 0), _raw_hook_seed(0, 1)], support_materials=[], fallback_spans=[],
+    )
+    monkeypatch.setattr(clip_selector, "extract_candidates_for_chunk", lambda *a, **k: fresh_result)
     # Every design Stage2 returns is fabricated (invalid_segment_reference)
     # -- zero survive local validation, so this must still raise before
     # ever calling cache.save_stage2, leaving the old cache exactly as it was.
     monkeypatch.setattr(
         clip_selector, "design_final_candidates",
-        lambda materials, t, title: [_raw_candidate(9999, 9999, opening_hook_strength=90) for _ in range(2)],
+        lambda coverage_targets, materials, fallback_spans, t, title: _stage2_design_result_candidates(
+            [_raw_candidate(9999, 9999, opening_hook_strength=90), _raw_candidate(9998, 9998, opening_hook_strength=90)]
+        ),
     )
 
     with pytest.raises(RuntimeError, match="ローカル検証を通過したものが0件"):

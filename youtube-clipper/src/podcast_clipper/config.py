@@ -30,41 +30,50 @@ OUTPUT_DIR = Path(os.environ.get("PODCAST_CLIPPER_OUTPUT_DIR", BASE_DIR / "outpu
 # overlap, segment validity) are never relaxed to reach a higher count.
 NUM_CANDIDATES = 3
 
-# Real-machine incident: Stage2 designed only 2 final candidates (both of
-# which passed local validation) when NUM_CANDIDATES=3 were required, even
-# though Stage1 had supplied plenty of still-unused hook/reason/example
-# material across chunks -- Stage2 simply stopped at 2 designs instead of
-# exploring further combinations. (This predates the NUM_CANDIDATES
-# minimum being dropped above -- at the time, that shortfall alone failed
-# the whole run.) Stage2Output.candidates' schema ceiling was previously
-# tied directly to NUM_CANDIDATES (max 3), which meant Stage2 could never
-# even attempt to over-produce so the local gate could pick the best
-# NUM_CANDIDATES of a larger pool. STAGE2_MAX_DESIGNS decouples "how many
-# designs Stage2 may propose before validation" from NUM_CANDIDATES ("how
-# many finalized candidates to aim for") -- Stage2 still has more
-# candidates to design against when Stage1 material supports it, even
-# though a shortfall below NUM_CANDIDATES is no longer itself a failure.
-STAGE2_MAX_DESIGNS = 6
+# Real-machine incident (predates the hook-seed-discovery redesign): Stage2
+# designed only 2 final candidates (both of which passed local validation)
+# when NUM_CANDIDATES=3 were required, even though Stage1 had supplied
+# plenty of still-unused material across chunks -- Stage2 simply stopped
+# short instead of exploring further combinations. The hook-seed-discovery
+# redesign replaces "Stage2 freely designs up to N candidates from a pooled
+# material list" with "Python selects up to STAGE2_MAX_COVERAGE_TARGETS
+# distinct hook seeds and Stage2 must return exactly one attempt (a real
+# candidate design, or an explicit reject) per target" -- so under-
+# production is now structurally impossible (a missing attempt is a
+# detectable coverage gap, not a silent shortfall) rather than merely
+# discouraged by prompt wording.
+#
+# STAGE2_MAX_COVERAGE_TARGETS is the user's own "roughly 6-8" -- picked at
+# the upper bound so a genuinely distinct 7th/8th strong hook seed is never
+# dropped purely by the cap (Python's own overlap-based dedup, not this
+# cap, is what keeps duplicate/near-duplicate seeds from ever reaching
+# Stage2 -- see _select_hook_seed_coverage_targets).
+STAGE2_MAX_COVERAGE_TARGETS = 8
 
-# Stage1's per-chunk candidate (material) cap. This is *search breadth*,
-# not the final candidate count: raising MIN_OPENING_HOOK_STRENGTH to 80
-# means Stage1 capping itself at 3 candidates/chunk can leave too few
-# survivors for Stage2 to design NUM_CANDIDATES final candidates from,
-# especially when only one or two utterances per chunk actually clear that
-# bar. Stage1's role is recall (cast a wide net of everything usable --
-# strong conclusions, reasons, examples, potential hooks/context, not
-# necessarily complete 20-50s constructs), not picking or assembling the
-# final best-3 -- that's Stage2's job (final edit design), applied to
-# materials pooled across every chunk, recombining across them freely.
-# Deliberately left at 6, not raised, for the Stage1/Stage2 responsibility
-# redesign: test_stage1_output_max_json_size_is_well_under_max_tokens
-# already showed the worst-case Stage1Output JSON grows close to half of
-# STAGE1_MAX_OUTPUT_TOKENS at 6; raising this without also raising that
-# ceiling would reopen the exact max_tokens-truncation risk that test
-# guards against, and this redesign doesn't need a wider per-chunk cap to
-# work (recall breadth comes from Stage1 no longer needing to bundle a
-# complete hook+reason+example into one candidate, not from more of them).
-STAGE1_MAX_CANDIDATES_PER_CHUNK = 6
+# Fallback candidates exist purely to guarantee a non-empty result when too
+# few primary attempts pass the hard gate -- the worst case that could ever
+# actually use one is "0 primary accepted, need all NUM_CANDIDATES from
+# fallback", so there is no reason to allow more than NUM_CANDIDATES of
+# them; capping here also keeps Stage2's fallback design work bounded
+# instead of open-ended.
+STAGE2_MAX_FALLBACK_CANDIDATES = NUM_CANDIDATES
+
+# Stage1's per-chunk output is now split into three groups (hook_seeds/
+# support_materials/fallback_spans -- see the hook-seed-discovery redesign)
+# rather than one shared "candidates" list, so a single combined cap no
+# longer describes it. Each cap below carries forward the same recall-
+# breadth reasoning the old STAGE1_MAX_CANDIDATES_PER_CHUNK(6) comment
+# gave: Stage1's role is recall (cast a wide net), never picking/assembling
+# the final best-N -- that's Stage2's job, applied to material pooled
+# across every chunk, recombining across it freely.
+STAGE1_MAX_HOOK_SEEDS_PER_CHUNK = 6
+STAGE1_MAX_SUPPORT_MATERIALS_PER_CHUNK = 6
+# Fallback spans are a 0-candidate safety net, not a primary source -- kept
+# deliberately small (never more than STAGE2_MAX_FALLBACK_CANDIDATES could
+# ever use) so the prompt has no room to pad with junk just to fill a slot
+# ("無理に埋めるためのfallback_spanを作らないこと" -- see
+# prompts/extract_candidates.md).
+STAGE1_MAX_FALLBACK_SPANS_PER_CHUNK = 2
 
 TARGET_DURATION_MIN_SEC = 25.0
 TARGET_DURATION_MAX_SEC = 45.0
@@ -77,17 +86,22 @@ MIN_SEGMENTS_PER_CANDIDATE = 1
 MAX_SEGMENTS_PER_CANDIDATE = 3
 DEFAULT_SEGMENTS_PER_CANDIDATE = 2
 
-# Below this, a candidate's *spoken* opening (the real transcript text of
-# its first/hook segment) is treated as too weak and triggers the same
-# feedback+retry pass as an out-of-range duration (see
-# clip_selector.select_candidates). Real-machine validation showed 60 let
-# through openings that are explanatory/abstract rather than an actual
-# scroll-stopping hook (see prompts/extract_candidates.md's 70-79 band), so
-# this is raised to 80: only openings the prompt would score as "clearly
-# makes you want to keep watching" or stronger pass. If fewer than
-# NUM_CANDIDATES clear this bar, that's a real quality shortfall -- do not
-# lower this threshold to force 3 candidates.
-MIN_OPENING_HOOK_STRENGTH = 80
+# MIN_OPENING_HOOK_STRENGTH (formerly a hard 80-point gate on Stage2's own
+# self-reported opening_hook_strength) was RETIRED in the hook-seed-
+# discovery redesign, not merely retuned. Real-machine incident: Stage2
+# self-rated a context-dependent, unusable opening ("ちょくちょく壊れちゃい
+# ます...") at 80 and it sailed through, while a genuinely usable candidate
+# elsewhere could be hard-rejected for scoring 78-79 -- a pure self-reported
+# number is not a reliable pass/fail signal (Claude grading its own
+# output). opening_hook_strength still exists on Stage2CandidateOutput but
+# is now soft/diagnostic-only, feeding Stage2's own relative `ranking`
+# rather than any Python accept/reject decision. The hard-gate role a
+# strong number was trying (and failing) to serve -- catching a hook that
+# LOOKS acceptable but isn't actually self-contained -- is now served by
+# the explicit semantic field RawClipCandidate.opening_self_contained
+# (Stage2's own bool judgment, informed by the same lookahead/lookback
+# material it already sees), hard-gated in evaluate_local_candidate. Do
+# not reintroduce a numeric hook-strength floor as a substitute.
 
 # Ending completeness: if a candidate's last segment looks cut off
 # mid-utterance, clip_selector extends into following transcript segments
@@ -129,34 +143,44 @@ STAGE2_LOOKAHEAD_MAX_SEC = 20.0
 # and treats a mismatch as a cache miss (falls back to a fresh Stage1/Stage2
 # run) rather than trying to deserialize old-shape data. The Whisper
 # transcript cache has no dependency on this and is unaffected.
-CANDIDATE_SCHEMA_VERSION = 13
+# Kept as a single shared version (not split per-stage) even though this
+# round changes both Stage1's and Stage2's schemas: a split would save no
+# recomputation this round (both caches must invalidate together
+# regardless), and would require auditing every one of test_cache.py's many
+# existing "schema vN is a miss" historical tests to determine which stage
+# each was really about. Revisit a STAGE1_SCHEMA_VERSION/
+# STAGE2_SCHEMA_VERSION split only if a future round changes just one
+# stage's prompt/schema in isolation -- Stage1 is the metered-per-chunk
+# stage, so an asymmetric change is what would actually make a split pay
+# for itself.
+CANDIDATE_SCHEMA_VERSION = 14
 
 CHUNK_MINUTES = 10.0
 CHUNK_OVERLAP_MINUTES = 1.0
 
 ANTHROPIC_MODEL = os.environ.get("PODCAST_CLIPPER_ANTHROPIC_MODEL", "claude-sonnet-5")
 
-# Ceilings for Stage1/Stage2 Structured Outputs responses. Stage1 now
-# generates material_type/segments/usefulness_score per material (a raw
-# ingredient, not a finished candidate); Stage2 generates hook_type/
-# segments/opening_hook_strength/score per finished candidate design (the
-# only place those finished-candidate properties are ever produced) --
-# everything else (hook_text/title/description/reasoning/caveats) is
-# filled in deterministically by the program, so the schemas are small and
-# these ceilings are sized to match, not left at a large shared default.
-# Each is a ceiling, not a fixed cost: a response that finishes naturally
-# does not consume all of it. STAGE2_MAX_OUTPUT_TOKENS raised 512->1024 for
-# the Stage2 redesign (its output now includes a full segments array with
-# anchors per candidate instead of a bare id list), then 1024->4096 when
-# Stage2Output.candidates' ceiling was decoupled from NUM_CANDIDATES(3) to
-# STAGE2_MAX_DESIGNS(6) -- see STAGE2_MAX_DESIGNS's docstring. Not a plain
-# doubling: each Stage2 segment carries *two* anchors (start_anchor_text
-# AND end_anchor_text, unlike Stage1's material segments which only ever
-# have one), so the worst case (6 candidates x 3 max-length-anchor
-# segments) came out to ~1307 estimated tokens -- see test_stage2_output_
-# max_json_size_is_well_under_max_tokens -- comfortably under half of 4096.
-STAGE1_MAX_OUTPUT_TOKENS = 2048
-STAGE2_MAX_OUTPUT_TOKENS = 4096
+# Ceilings for Stage1/Stage2 Structured Outputs responses. Stage1's output
+# is now split into three small groups (hook_seeds/support_materials/
+# fallback_spans, up to STAGE1_MAX_HOOK_SEEDS_PER_CHUNK(6)/
+# STAGE1_MAX_SUPPORT_MATERIALS_PER_CHUNK(6)/STAGE1_MAX_FALLBACK_SPANS_PER_
+# CHUNK(2) respectively -- up to 14 items total per chunk vs the old
+# single 6-item list), and hook_seeds deliberately carry no text/reasoning
+# field (Python resolves real text from segment_id via the transcript) to
+# keep the per-item cost small despite the higher item count. Stage2's
+# output is now attempts (up to STAGE2_MAX_COVERAGE_TARGETS(8), each
+# carrying a full Stage2CandidateOutput on the candidate path) +
+# fallback_candidates (up to STAGE2_MAX_FALLBACK_CANDIDATES(3), same
+# per-item shape) + a ranking id list -- materially larger than the old
+# single up-to-6-candidates list this replaces. Measured directly via
+# test_stage1_output_max_json_size_is_well_under_max_tokens/
+# test_stage2_output_max_json_size_is_well_under_max_tokens: worst-case
+# Stage1Output JSON came out to ~1578 estimated tokens, Stage2Output to
+# ~3227 -- both ceilings below were set so each stays comfortably (not
+# just barely) under half its ceiling; adjust both together if a future
+# schema change shifts that measurement.
+STAGE1_MAX_OUTPUT_TOKENS = 4096
+STAGE2_MAX_OUTPUT_TOKENS = 8192
 
 # hook_text is the candidate's real opening transcript text (never
 # AI-authored -- see clip_selector.py's _deterministic_hook_text), truncated
