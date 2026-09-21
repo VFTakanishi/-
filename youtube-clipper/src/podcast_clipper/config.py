@@ -83,7 +83,19 @@ DURATION_HARD_MIN_SEC = 20.0
 DURATION_HARD_MAX_SEC = 50.0
 
 MIN_SEGMENTS_PER_CANDIDATE = 1
-MAX_SEGMENTS_PER_CANDIDATE = 3
+# Segment count is a soft preference, never a quality signal on its own:
+# real-machine incident, Stage2 designed several 4-segment candidates
+# (needed to keep hook->answer->payoff natural) and the whole Stage2Output
+# failed schema validation because Stage2CandidateOutput.segments was
+# hard-capped at 3. 1-3 segments is still the preferred shape (simpler edits
+# read better and cost less to build), but a well-connected 4-6 segment
+# design must be accepted on its own merits -- junction naturalness/pacing/
+# semantic completeness, never the raw segment count -- rather than forcing
+# an artificial 3-segment merge or an outright reject. PREFERRED_MAX is
+# diagnostic-only (see clip_selector._stage2_diagnostic_evaluation's
+# high_segment_count field); MAX is the only hard (schema-level) ceiling.
+PREFERRED_MAX_SEGMENTS_PER_CANDIDATE = 3
+MAX_SEGMENTS_PER_CANDIDATE = 6
 DEFAULT_SEGMENTS_PER_CANDIDATE = 2
 
 # MIN_OPENING_HOOK_STRENGTH (formerly a hard 80-point gate on Stage2's own
@@ -143,17 +155,20 @@ STAGE2_LOOKAHEAD_MAX_SEC = 20.0
 # and treats a mismatch as a cache miss (falls back to a fresh Stage1/Stage2
 # run) rather than trying to deserialize old-shape data. The Whisper
 # transcript cache has no dependency on this and is unaffected.
-# Kept as a single shared version (not split per-stage) even though this
-# round changes both Stage1's and Stage2's schemas: a split would save no
-# recomputation this round (both caches must invalidate together
-# regardless), and would require auditing every one of test_cache.py's many
-# existing "schema vN is a miss" historical tests to determine which stage
-# each was really about. Revisit a STAGE1_SCHEMA_VERSION/
-# STAGE2_SCHEMA_VERSION split only if a future round changes just one
-# stage's prompt/schema in isolation -- Stage1 is the metered-per-chunk
-# stage, so an asymmetric change is what would actually make a split pay
-# for itself.
-CANDIDATE_SCHEMA_VERSION = 14
+# Kept as a single shared version (not split per-stage). v14->v15: only
+# Stage2's schema changed this round (Stage2CandidateOutput.segments'
+# max_length 3->6, see MAX_SEGMENTS_PER_CANDIDATE above) -- Stage1's own
+# contract is untouched, which is exactly the "asymmetric, one-stage-only"
+# case the note below once flagged as worth revisiting a split for. Audited
+# again anyway: splitting would still require rewriting every one of test_
+# cache.py's ~13 existing "schema vN is a miss" historical tests to track
+# which of two version numbers each historical payload used (most of them
+# predate the two-stage distinction entirely), for zero extra cache-
+# invalidation precision this round -- a same-version Stage1 cache miss
+# here costs nothing since Stage1 chunks are already cheap to regenerate
+# and nothing about Stage1's cached shape actually changed. Not worth it
+# yet; still shared.
+CANDIDATE_SCHEMA_VERSION = 15
 
 CHUNK_MINUTES = 10.0
 CHUNK_OVERLAP_MINUTES = 1.0
@@ -178,9 +193,16 @@ ANTHROPIC_MODEL = os.environ.get("PODCAST_CLIPPER_ANTHROPIC_MODEL", "claude-sonn
 # Stage1Output JSON came out to ~1578 estimated tokens, Stage2Output to
 # ~3227 -- both ceilings below were set so each stays comfortably (not
 # just barely) under half its ceiling; adjust both together if a future
-# schema change shifts that measurement.
+# schema change shifts that measurement. Re-measured for the segment-count
+# relaxation round (Stage2CandidateOutput.segments' max_length 3->6, see
+# MAX_SEGMENTS_PER_CANDIDATE below): worst-case Stage2Output JSON roughly
+# doubled to ~5365 estimated tokens (each candidate can now carry twice as
+# many segments), which no longer left comfortable half-ceiling headroom
+# under the old 8192 -- STAGE2_MAX_OUTPUT_TOKENS raised to 16384 so it
+# stays comfortably under half again. Stage1Output's shape is untouched
+# this round, so STAGE1_MAX_OUTPUT_TOKENS is unchanged.
 STAGE1_MAX_OUTPUT_TOKENS = 4096
-STAGE2_MAX_OUTPUT_TOKENS = 8192
+STAGE2_MAX_OUTPUT_TOKENS = 16384
 
 # hook_text is the candidate's real opening transcript text (never
 # AI-authored -- see clip_selector.py's _deterministic_hook_text), truncated

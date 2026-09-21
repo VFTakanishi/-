@@ -1545,13 +1545,12 @@ def test_diagnose_local_filter_L_raises_clearly_without_cache():
         clip_selector.diagnose_local_filter(transcript)
 
 
-def test_candidate_schema_version_still_14():
-    # Hook-seed-discovery redesign: both Stage1Output (materials list ->
-    # hook_seeds/support_materials/fallback_spans) and Stage2Output
-    # (candidates list -> attempts/fallback_candidates/ranking) changed
-    # shape, plus both prompts changed materially -- version bumped once
-    # more (13->14); it must not drift further within this round.
-    assert config.CANDIDATE_SCHEMA_VERSION == 14
+def test_candidate_schema_version_still_15():
+    # Segment-count relaxation round: Stage2CandidateOutput.segments' max_
+    # length went 3->6 (see config.MAX_SEGMENTS_PER_CANDIDATE's docstring)
+    # -- a genuine Stage2 schema change, so the version bumped once more
+    # (14->15); it must not drift further within this round.
+    assert config.CANDIDATE_SCHEMA_VERSION == 15
 
 
 # --- repair-before-reject: real-machine incident (4/4 Stage1 candidates
@@ -4013,6 +4012,278 @@ def test_stage2_candidate_output_field_set_is_the_only_place_finished_properties
     assert set(Stage2Output.model_fields) == {"attempts", "fallback_candidates", "ranking"}
 
 
+# --- segment count: 1-3 preferred, up to 6 allowed -------------------------
+# (real-machine incident: Stage2 designed several 4-segment candidates --
+# needed to keep hook->answer->payoff natural -- and the whole Stage2Output
+# failed schema validation outright because Stage2CandidateOutput.segments
+# was hard-capped at max_length=3. Segment count itself is never a quality
+# signal: 1-3 stays the preferred shape, but a well-connected 4-6 segment
+# design must be accepted on its own merits, and 7+ is never allowed. See
+# config.py's MAX_SEGMENTS_PER_CANDIDATE/PREFERRED_MAX_SEGMENTS_PER_
+# CANDIDATE docstring.)
+
+
+def _stage2_segment(i):
+    return Stage2SegmentOutput(role="context", start_segment_id=i, end_segment_id=i)
+
+
+def test_stage2_candidate_output_accepts_1_segment():
+    # A
+    kwargs = {**_valid_stage2_candidate_kwargs(), "segments": [_stage2_segment(0)]}
+    out = Stage2CandidateOutput(**kwargs)
+    assert len(out.segments) == 1
+
+
+def test_stage2_candidate_output_accepts_3_segments():
+    # B
+    kwargs = {**_valid_stage2_candidate_kwargs(), "segments": [_stage2_segment(i) for i in range(3)]}
+    out = Stage2CandidateOutput(**kwargs)
+    assert len(out.segments) == 3
+
+
+def test_stage2_candidate_output_accepts_4_segments():
+    # C: schema parse succeeds -- this used to be a hard ValidationError
+    # (max_length=3) that took down the entire Stage2Output response.
+    kwargs = {**_valid_stage2_candidate_kwargs(), "segments": [_stage2_segment(i) for i in range(4)]}
+    out = Stage2CandidateOutput(**kwargs)
+    assert len(out.segments) == 4
+
+
+def test_stage2_candidate_output_accepts_5_segments():
+    # D
+    kwargs = {**_valid_stage2_candidate_kwargs(), "segments": [_stage2_segment(i) for i in range(5)]}
+    out = Stage2CandidateOutput(**kwargs)
+    assert len(out.segments) == 5
+
+
+def test_stage2_candidate_output_accepts_6_segments():
+    # E
+    kwargs = {**_valid_stage2_candidate_kwargs(), "segments": [_stage2_segment(i) for i in range(6)]}
+    out = Stage2CandidateOutput(**kwargs)
+    assert len(out.segments) == 6
+
+
+def test_stage2_candidate_output_rejects_7_segments():
+    # F: 7+ is a hard schema-level ceiling, never allowed.
+    kwargs = {**_valid_stage2_candidate_kwargs(), "segments": [_stage2_segment(i) for i in range(7)]}
+    with pytest.raises(ValidationError):
+        Stage2CandidateOutput(**kwargs)
+
+
+def test_evaluate_local_candidate_accepts_4_segments_solely_for_junction_safety(monkeypatch):
+    # G: a 4-segment candidate must not be rejected merely for its count --
+    # only actual defects (unsafe junctions, disfluency, etc.) reject it.
+    # Every segment here ends with terminal punctuation and the transcript
+    # has clean natural breaks, so nothing else should trip the gate.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidSeg4", language="ja",
+        segments=[
+            _segment(i, start=i * 3.0, text=f"項目{i}の話をします。") for i in range(4)
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="context", start_segment_id=1, end_segment_id=1),
+            RawUsedSegment(role="answer", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="payoff", start_segment_id=3, end_segment_id=3),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    evaluation = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert evaluation.accepted is True
+    assert len(evaluation.candidate.segments) == 4
+
+
+def test_evaluate_local_candidate_accepts_6_segments_when_junctions_are_safe(monkeypatch):
+    # H is covered by the schema test above (7 segments rejected at the
+    # Structured Output boundary, before local validation even runs); this
+    # test is the local-validation counterpart -- 6 well-connected segments
+    # must pass exactly like a 1-3 segment candidate would.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidSeg6", language="ja",
+        segments=[
+            _segment(i, start=i * 3.0, text=f"項目{i}の話をします。") for i in range(6)
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0)]
+        + [RawUsedSegment(role="context", start_segment_id=i, end_segment_id=i) for i in range(1, 6)],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    evaluation = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert evaluation.accepted is True
+    assert len(evaluation.candidate.segments) == 6
+
+
+def test_evaluate_local_candidate_rejects_6_segments_with_an_unsafe_junction(monkeypatch):
+    # I: 6 segments does not grant a pass on junction safety -- an unsafe
+    # cut among them must still reject, exactly as it would with 2 segments.
+    # Uses a clean-terminal-punctuation transcript (_overlap_transcript_
+    # with_clean_endings) so the ending-completeness check never fires
+    # first, isolating the overlap check itself.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = _overlap_transcript_with_clean_endings()
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="context", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="answer", start_segment_id=2, end_segment_id=2),
+            RawUsedSegment(role="payoff", start_segment_id=0, end_segment_id=0),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    evaluation = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert evaluation.accepted is False
+    assert evaluation.reason == "overlap"
+
+
+def test_evaluate_local_candidate_rejects_2_segments_with_semantically_broken_junction():
+    # J: fewer segments does not grant a free pass either -- a 2-segment
+    # candidate whose first segment demands a continuation the second
+    # segment doesn't provide must still reject.
+    transcript = Transcript(
+        video_id="vidSeg2Bad", language="ja",
+        segments=[
+            _segment_with_words(0, 0.0, "冷やす", "のであれば", "こうしてください。"),
+            _segment_with_words(1, 5.0, "連続周回", "をする場合は", "注意が必要です。"),
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[
+            RawUsedSegment(role="hook", start_segment_id=0, end_segment_id=0),
+            RawUsedSegment(role="answer", start_segment_id=1, end_segment_id=1),
+        ],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    evaluation = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert evaluation.accepted is False
+
+
+def test_evaluate_local_candidate_4_to_6_segments_still_enforces_duration_bounds(monkeypatch):
+    # K: segment count relaxation does not loosen the 20-50s hard duration
+    # bounds -- a 4-segment candidate whose total exceeds them still rejects.
+    # Each segment is individually 15s long (4 * 15 = 60s > 50s hard max) --
+    # _candidate_duration sums each segment's own resolved duration, not
+    # just the gap between the first and last, so segments must each be
+    # long, not merely far apart.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 20.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 50.0)
+    transcript = Transcript(
+        video_id="vidSeg4Duration", language="ja",
+        segments=[
+            TranscriptSegment(
+                id=i, start=i * 15.0, end=i * 15.0 + 15.0, text=f"項目{i}の話をします。",
+                words=[TranscriptWord(start=i * 15.0, end=i * 15.0 + 15.0, text=f"項目{i}の話をします。")],
+            )
+            for i in range(4)
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[RawUsedSegment(role=r, start_segment_id=i, end_segment_id=i) for i, r in enumerate(
+            ["hook", "context", "answer", "payoff"]
+        )],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    evaluation = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert evaluation.accepted is False
+    assert evaluation.reason == "duration_too_long"
+
+
+def test_stage2_diagnostic_evaluation_flags_high_segment_count(monkeypatch):
+    # Diagnostic-only fields (item 10): segment_count/preferred_segment_
+    # range_met/high_segment_count must never affect accepted, only report.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidSegDiag", language="ja",
+        segments=[
+            _segment(i, start=i * 3.0, text=f"項目{i}の話をします。") for i in range(4)
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[RawUsedSegment(role=r, start_segment_id=i, end_segment_id=i) for i, r in enumerate(
+            ["hook", "context", "answer", "payoff"]
+        )],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    evaluation = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert evaluation.accepted is True
+    diagnostic = clip_selector._stage2_diagnostic_evaluation(evaluation)
+    assert diagnostic["segment_count"] == 4
+    assert diagnostic["preferred_segment_range_met"] is False
+    assert diagnostic["high_segment_count"] is True
+
+
+def test_stage2_diagnostic_evaluation_does_not_flag_3_segments_as_high_count(monkeypatch):
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidSegDiag3", language="ja",
+        segments=[
+            _segment(i, start=i * 3.0, text=f"項目{i}の話をします。") for i in range(3)
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[RawUsedSegment(role=r, start_segment_id=i, end_segment_id=i) for i, r in enumerate(
+            ["hook", "context", "answer"]
+        )],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    evaluation = clip_selector.evaluate_local_candidate(raw, transcript)
+    assert evaluation.accepted is True
+    diagnostic = clip_selector._stage2_diagnostic_evaluation(evaluation)
+    assert diagnostic["segment_count"] == 3
+    assert diagnostic["preferred_segment_range_met"] is True
+    assert diagnostic["high_segment_count"] is False
+
+
+def test_select_final_candidates_treats_fallback_4_to_6_segments_like_primary(monkeypatch):
+    # K (fallback side): fallback candidates go through the exact same
+    # segment-count rule as primary ones -- 4-6 segments is not restricted
+    # to 3 for fallback just because they're the safety net.
+    monkeypatch.setattr(config, "DURATION_HARD_MIN_SEC", 0.0)
+    monkeypatch.setattr(config, "DURATION_HARD_MAX_SEC", 100.0)
+    transcript = Transcript(
+        video_id="vidFallbackSeg", language="ja",
+        segments=[
+            _segment(i, start=i * 3.0, text=f"項目{i}の話をします。") for i in range(5)
+        ],
+    )
+    raw = RawClipCandidate(
+        hook_type="story",
+        segments=[RawUsedSegment(role="hook" if i == 0 else "context", start_segment_id=i, end_segment_id=i)
+                  for i in range(5)],
+        hook_text="h", opening_hook_strength=90, title="", description="",
+        score=90, reasoning="", caveats="",
+    )
+    evaluation = clip_selector.evaluate_local_candidate_with_repair(raw, transcript)
+    fallback_evals = {"fb0": evaluation}
+    final = clip_selector._select_final_candidates({}, fallback_evals, ["fb0"])
+    assert len(final) == 1
+    assert final[0][0] == "fb0"
+    assert len(final[0][1].segments) == 5
+
+
 def test_stage2_attempt_output_requires_candidate_when_status_is_candidate():
     with pytest.raises(ValidationError):
         Stage2AttemptOutput(hook_seed_id="s1_hookseed_000", status="candidate")
@@ -4098,27 +4369,27 @@ def test_stage2_output_accepts_up_to_stage2_max_fallback_candidates():
 def test_stage2_output_max_json_size_is_well_under_max_tokens():
     """Guards against the worst-case Stage2Output JSON (STAGE2_MAX_
     COVERAGE_TARGETS attempts + STAGE2_MAX_FALLBACK_CANDIDATES fallback
-    candidates, each with a full 3-segment candidate, long enum values,
-    3-digit segment ids, a max-length anchor on both ends of every
-    segment, plus a ranking list) approaching STAGE2_MAX_OUTPUT_TOKENS
-    closely enough to risk the same stop_reason="max_tokens" truncation
-    this codebase has hit before.
+    candidates, each with a full config.MAX_SEGMENTS_PER_CANDIDATE(6)-
+    segment candidate, long enum values, 3-digit segment ids, a max-length
+    anchor on both ends of every segment, plus a ranking list) approaching
+    STAGE2_MAX_OUTPUT_TOKENS closely enough to risk the same stop_reason=
+    "max_tokens" truncation this codebase has hit before.
+
+    Re-audited for the segment-count relaxation round (Stage2CandidateOutput
+    .segments' max_length went 3->6, see config.MAX_SEGMENTS_PER_CANDIDATE's
+    docstring): worst case grew accordingly since a single candidate can now
+    carry twice as many segments.
     """
+    roles = ["hook", "context", "context", "context", "answer", "payoff"]
+    kana = ["あ", "い", "う", "え", "お", "か"]
     candidate = Stage2CandidateOutput(
         hook_type="surprising_fact",
         segments=[
             Stage2SegmentOutput(
-                role="hook", start_segment_id=123, end_segment_id=124,
-                start_anchor_text="あ" * 60, end_anchor_text="い" * 60,
-            ),
-            Stage2SegmentOutput(
-                role="context", start_segment_id=125, end_segment_id=126,
-                start_anchor_text="う" * 60, end_anchor_text="え" * 60,
-            ),
-            Stage2SegmentOutput(
-                role="answer", start_segment_id=127, end_segment_id=128,
-                start_anchor_text="お" * 60, end_anchor_text="か" * 60,
-            ),
+                role=roles[i], start_segment_id=100 + 2 * i, end_segment_id=101 + 2 * i,
+                start_anchor_text=kana[i] * 60, end_anchor_text=kana[(i + 1) % 6] * 60,
+            )
+            for i in range(config.MAX_SEGMENTS_PER_CANDIDATE)
         ],
         opening_hook_strength=95,
         score=92,

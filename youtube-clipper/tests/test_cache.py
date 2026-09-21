@@ -314,7 +314,7 @@ def test_schema_v3_is_miss_and_current_version_is_hit():
     stage1 and stage2, while a cache written under the current schema
     version must hit normally.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 14
+    assert config.CANDIDATE_SCHEMA_VERSION == 15
 
     v3_stage2_payload = {
         "schema_version": 3,
@@ -361,7 +361,7 @@ def test_schema_v4_is_miss_after_hook_scoring_prompt_bump():
     written under version 4 must still be treated as a miss under the
     current (later-bumped) schema version too.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 14
+    assert config.CANDIDATE_SCHEMA_VERSION == 15
 
     v4_stage2_payload = {
         "schema_version": 4,
@@ -404,7 +404,7 @@ def test_schema_v5_is_miss_after_stage1_recall_widening():
     missing viable candidates the wider search would have found). A cache
     written under version 5 must be treated as a miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 14
+    assert config.CANDIDATE_SCHEMA_VERSION == 15
 
     v5_stage1_payload = {
         "schema_version": 5,
@@ -452,7 +452,7 @@ def test_schema_v6_is_miss_after_anchor_trim_and_reorder_support():
     caches to be recomputed. A cache written under version 6 must be
     treated as a miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 14
+    assert config.CANDIDATE_SCHEMA_VERSION == 15
 
     v6_stage1_payload = {
         "schema_version": 6,
@@ -501,7 +501,7 @@ def test_schema_v7_is_miss_after_junction_safety_support():
     recomputed. A cache written under version 7 must be treated as a
     miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 14
+    assert config.CANDIDATE_SCHEMA_VERSION == 15
 
     v7_stage1_payload = {
         "schema_version": 7,
@@ -553,7 +553,7 @@ def test_schema_v8_is_miss_after_restart_and_closure_support():
     be recomputed. A cache written under version 8 must be treated as a
     miss.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 14
+    assert config.CANDIDATE_SCHEMA_VERSION == 15
 
     v8_stage1_payload = {
         "schema_version": 8,
@@ -599,7 +599,7 @@ def test_schema_v9_is_miss_after_stage2_final_design_support():
     treated as a miss -- it holds candidates Stage2 only ever ranked/
     excluded, never validated against the new final-design local gate.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 14
+    assert config.CANDIDATE_SCHEMA_VERSION == 15
 
     v9_stage1_payload = {
         "schema_version": 9,
@@ -654,7 +654,7 @@ def test_schema_v10_is_miss_after_stage1_material_contract_support():
     scheme (established since v3->v4) invalidates both stages together, so
     a v10 cache must be a miss on both Stage1 and Stage2.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 14
+    assert config.CANDIDATE_SCHEMA_VERSION == 15
 
     v10_stage1_payload = {
         "schema_version": 10,
@@ -706,7 +706,7 @@ def test_schema_v11_is_miss_after_stage2_overproduction_support():
     CANDIDATE_SCHEMA_VERSION was bumped 11->12. A cache written under
     version 11 must be treated as a miss on both stage1 and stage2.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 14
+    assert config.CANDIDATE_SCHEMA_VERSION == 15
 
     v11_stage1_payload = {
         "schema_version": 11,
@@ -757,7 +757,7 @@ def test_schema_v12_is_miss_after_semantic_ending_support():
     but the single-version-for-both precedent is kept, matching every
     prior bump in this codebase).
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 14
+    assert config.CANDIDATE_SCHEMA_VERSION == 15
 
     v12_stage1_payload = {
         "schema_version": 12,
@@ -804,7 +804,7 @@ def test_schema_v13_is_miss_after_hook_seed_discovery_support():
     VERSION was bumped 13->14. A cache written under version 13 must be
     treated as a miss on both stage1 and stage2.
     """
-    assert config.CANDIDATE_SCHEMA_VERSION == 14
+    assert config.CANDIDATE_SCHEMA_VERSION == 15
 
     v13_stage1_payload = {
         "schema_version": 13,

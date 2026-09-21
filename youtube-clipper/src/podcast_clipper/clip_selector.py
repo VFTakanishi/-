@@ -230,7 +230,14 @@ class Stage2CandidateOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     hook_type: Literal["open_loop", "strong_take", "surprising_fact", "story"]
-    segments: list[Stage2SegmentOutput] = Field(min_length=1, max_length=3)
+    # 1-3 segments preferred; up to config.MAX_SEGMENTS_PER_CANDIDATE(6)
+    # allowed when a well-connected, natural design genuinely needs more
+    # parts -- segment count alone must never be a reject/accept criterion
+    # (see config.py's MAX_SEGMENTS_PER_CANDIDATE docstring and prompts/
+    # rank_and_finalize.md's segment-count section).
+    segments: list[Stage2SegmentOutput] = Field(
+        min_length=config.MIN_SEGMENTS_PER_CANDIDATE, max_length=config.MAX_SEGMENTS_PER_CANDIDATE
+    )
     opening_hook_strength: int = Field(ge=0, le=100)
     score: int = Field(ge=0, le=100)
     opening_self_contained: bool
@@ -1996,8 +2003,16 @@ def _stage2_diagnostic_evaluation(e: LocalCandidateEvaluation) -> dict:
     hook seed ever tried, and if so, why did it lose" from this file alone
     (opening_hook_strength/score are soft/diagnostic-only -- see
     Stage2CandidateOutput's docstring -- but still worth recording here).
+
+    segment_count/preferred_segment_range_met/high_segment_count are purely
+    diagnostic (real-machine incident: a 4-segment design used to fail
+    Stage2Output's own schema validation outright -- see config.py's
+    MAX_SEGMENTS_PER_CANDIDATE docstring). high_segment_count flags a
+    design above the preferred 1-3 range for later human/prompt review; it
+    is never itself a reason for accepted to be False.
     """
     last_segment = e.candidate.segments[-1]
+    segment_count = len(e.candidate.segments)
     return {
         "accepted": e.accepted,
         "reason": e.reason,
@@ -2012,6 +2027,9 @@ def _stage2_diagnostic_evaluation(e: LocalCandidateEvaluation) -> dict:
         "semantic_ending_complete": e.candidate.semantic_ending_complete,
         "ending_rationale_code": e.candidate.ending_rationale_code,
         "recomposed_for_duration": e.candidate.recomposed_for_duration,
+        "segment_count": segment_count,
+        "preferred_segment_range_met": segment_count <= config.PREFERRED_MAX_SEGMENTS_PER_CANDIDATE,
+        "high_segment_count": segment_count > config.PREFERRED_MAX_SEGMENTS_PER_CANDIDATE,
     }
 
 

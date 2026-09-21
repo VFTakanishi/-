@@ -77,6 +77,26 @@ hook_seed自体が、例えば「壊れた場合の損失が大きい」とだ�
 - 同一テーマ内での組み合わせに限ること（無関係な話題のsegmentを無理につなげない）。
 - 文中の単語の並べ替えは禁止。segment/anchor単位の並べ替え・組み合わせのみ。
 
+## segment数について（1〜3推奨・最大6許容）
+
+**目的は「segment数を減らすこと」ではなく「投稿できる質の高いShortsを作ること」です。** 可能なら1〜3個のsegmentで自然に組めるものを優先してください。ただし、hookを回収する理由・具体例・payoffまで含めて自然につなげるために4個以上必要なら、4〜6個のsegmentを普通に使ってください。segment数が多いという理由だけでcandidateを避けたり、rejectedにしたりしないでください。
+
+逆に、無理に1〜3個へ押し込んで以下のような弊害が出るなら、それは避けてください:
+- 必要な理由・文脈を削ったせいで`hook_claim_resolved`が満たせなくなる
+- 接続を無理に詰めたせいで「カット接続の自然さ」が崩れる
+- 意味が薄くなる、または話が唐突に終わる
+
+4〜6個のsegmentを使う場合は、以下を厳しく確認してください:
+- 各cutが本当に必要か（削っても意味が保たれるなら削ること）
+- 同じ内容を繰り返すだけのcutが混ざっていないか
+- context/exampleを不必要に細かく分割していないか
+- 隣接segment同士の接続がすべて自然か（「カット接続の自然さ」は2segmentの場合と同じ基準で、増えた分だけ全てのつなぎ目に適用されます）
+- 聞いていてブツ切れ感・テンポの悪化が出ないか
+
+7個以上のsegmentは常に禁止です。どうしても7個以上必要になる場合は、そのcandidateを設計しないでください（`status: "rejected"`の場合は`reject_reason_code`を適切なものにしてください）。
+
+**評価すべきはsegment数そのものではなく、接続の自然さ・意味的完結・テンポです。** 2segmentでも接続が不自然・意味が破綻していればreject対象であり、6segmentでも自然に繋がっていればaccept対象です。
+
 ## 冒頭の強さ（`opening_hook_strength`、相対比較用のsoft score）
 
 **この数値はhard rejectには使われません。** 相対比較（下記「相対比較（ranking）」）の一材料として、自分が設計した完成candidateの最初のsegmentの実テキストを厳密に自己採点してください:
@@ -218,7 +238,7 @@ segmentの全文を頭から末尾まで使う必要はありません。任意�
 
 `candidate`（attempt・fallback共通のフィールド）:
 - `hook_type`: `open_loop` / `strong_take` / `surprising_fact` / `story`
-- `segments`: このcandidateが実際に使うsegmentのリスト（**並び順が実際の再生順**）。各要素は`role`（`hook`/`context`/`answer`/`payoff`。最初のsegmentは必ず`hook`）、`start_segment_id`/`end_segment_id`（実在するsegment ID、inclusive）、任意で`start_anchor_text`/`end_anchor_text`
+- `segments`: このcandidateが実際に使うsegmentのリスト（**並び順が実際の再生順**、1〜6個。1〜3個推奨、詳細は上記「segment数について」）。各要素は`role`（`hook`/`context`/`answer`/`payoff`。最初のsegmentは必ず`hook`）、`start_segment_id`/`end_segment_id`（実在するsegment ID、inclusive）、任意で`start_anchor_text`/`end_anchor_text`
 - `opening_hook_strength`: 0〜100（soft score、上記「冒頭の強さ」参照）
 - `score`: 0〜100の総合スコア（soft score、フックの強さ・単体での満足度・本編への興味喚起のバランスで評価）
 - `opening_self_contained`: 上記「`opening_self_contained`の判定」参照（hard gate）

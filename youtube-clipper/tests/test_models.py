@@ -31,7 +31,22 @@ def test_clip_candidate_accepts_1_to_3_segments():
         assert len(c.segments) == n
 
 
-def test_clip_candidate_rejects_zero_or_more_than_3_segments():
+def test_clip_candidate_accepts_4_to_6_segments():
+    # Segment-count relaxation round: 1-3 stays preferred, but a well-
+    # connected 4-6 segment design (e.g. hook+context+answer+payoff) must
+    # not be rejected for its count alone -- see config.
+    # MAX_SEGMENTS_PER_CANDIDATE's docstring.
+    for n in (4, 5, 6):
+        segs = [_segment(start=i, end=i + 1) for i in range(n)]
+        c = ClipCandidate(
+            id="c1", hook_type="strong_take", segments=segs, hook_text="h",
+            opening_hook_strength=80, title="t", description="d", score=50,
+            reasoning="r", caveats="",
+        )
+        assert len(c.segments) == n
+
+
+def test_clip_candidate_rejects_zero_or_more_than_6_segments():
     with pytest.raises(ValueError):
         ClipCandidate(
             id="c1", hook_type="strong_take", segments=[], hook_text="h",
@@ -41,7 +56,7 @@ def test_clip_candidate_rejects_zero_or_more_than_3_segments():
     with pytest.raises(ValueError):
         ClipCandidate(
             id="c1", hook_type="strong_take",
-            segments=[_segment(start=i, end=i + 1) for i in range(4)],
+            segments=[_segment(start=i, end=i + 1) for i in range(7)],
             hook_text="h", opening_hook_strength=80, title="t", description="d",
             score=50, reasoning="r", caveats="",
         )

@@ -833,9 +833,13 @@ class RawClipCandidate:
     hook_claim_resolved: bool = True
 
     def __post_init__(self) -> None:
-        if not (1 <= len(self.segments) <= 3):
+        # 1-3 segments is the preferred shape; up to 6 is allowed for a
+        # well-connected design that genuinely needs more parts (segment
+        # count alone is never a quality/reject criterion -- see config.py's
+        # MAX_SEGMENTS_PER_CANDIDATE docstring).
+        if not (1 <= len(self.segments) <= 6):
             raise ValueError(
-                f"segments must contain 1-3 entries (got {len(self.segments)})"
+                f"segments must contain 1-6 entries (got {len(self.segments)})"
             )
         if not (0 <= self.score <= 100):
             raise ValueError(f"score must be within 0-100 (got {self.score})")
@@ -984,9 +988,9 @@ class UsedSegment:
 class ClipCandidate:
     """One proposed short clip with resolved (actual-seconds) edit points.
 
-    `segments` is 1-3 entries; the default shape is 2 (hook + answer), with
-    any filler/tangent between them cut out. This is never a single
-    contiguous [start, end] span by design (absolute condition #5).
+    `segments` is 1-6 entries (1-3 preferred; the default shape is 2, hook +
+    answer), with any filler/tangent between them cut out. This is never a
+    single contiguous [start, end] span by design (absolute condition #5).
     """
 
     id: str
@@ -1001,9 +1005,13 @@ class ClipCandidate:
     caveats: str
 
     def __post_init__(self) -> None:
-        if not (1 <= len(self.segments) <= 3):
+        # 1-3 segments is the preferred shape; up to 6 is allowed for a
+        # well-connected design that genuinely needs more parts (segment
+        # count alone is never a quality/reject criterion -- see config.py's
+        # MAX_SEGMENTS_PER_CANDIDATE docstring).
+        if not (1 <= len(self.segments) <= 6):
             raise ValueError(
-                f"segments must contain 1-3 entries (got {len(self.segments)})"
+                f"segments must contain 1-6 entries (got {len(self.segments)})"
             )
         if not (0 <= self.score <= 100):
             raise ValueError(f"score must be within 0-100 (got {self.score})")
